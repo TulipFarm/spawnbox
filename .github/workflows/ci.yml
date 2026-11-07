@@ -24,6 +24,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Lint guest agent (static Linux build)
         if: runner.os == 'Linux'
-        run: cargo clippy -p spawn-guest --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq musl-tools
+          cargo clippy -p spawn-guest --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
