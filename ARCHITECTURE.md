@@ -699,6 +699,16 @@ sequenceDiagram
   it to `release` the stale copy. A failed import aborts the source; if
   the target adopted it anyway, the next heartbeat releases it there.
 
+**Autoscaling.** With `--autoscale-hook`, a task on the primary
+(`fleet/autoscale.rs`) checks every 10 s. Load is the larger of used
+slots and used memory over the primary and ready, undrained workers. A
+pure `decide()` turns the load trend into wait, scale up, scale down or
+cancel a scale down, one change at a time. Scale up makes a join token
+and runs the hook. Scale down drains the emptiest worker with
+migration, and runs the hook and removes the node only when it has no
+sandboxes or volumes. Requests live in `scale_requests`, so a restart
+resumes them.
+
 **Volumes in a fleet.** A volume's file lives on one host, its **home**
 (`node` in its row; empty is the primary). Every sandbox that mounts it
 runs on that home, so the home's database is where the one-writer rule is

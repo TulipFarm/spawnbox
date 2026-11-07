@@ -70,6 +70,11 @@ const METRICS: &[(&str, &str, &str)] = &[
         "gauge",
         "Workers known to the primary, by state.",
     ),
+    (
+        "spawnbox_fleet_load",
+        "gauge",
+        "Part of the slots or memory in use over the primary and its ready workers (0 to 1). Only with --autoscale-hook.",
+    ),
 ];
 
 pub type Labels = Vec<(&'static str, String)>;

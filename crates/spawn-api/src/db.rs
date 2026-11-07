@@ -163,6 +163,18 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX volumes_name ON volumes (tenant, name) WHERE deleted_at IS NULL;
     ALTER TABLE sandboxes ADD COLUMN volumes TEXT;",
     "ALTER TABLE nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker';",
+    "CREATE TABLE scale_requests (
+        id TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        token_hash BLOB,
+        node TEXT,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        ended_at INTEGER,
+        outcome TEXT
+    );
+    CREATE INDEX scale_requests_open ON scale_requests (ended_at);",
 ];
 
 pub mod state {
@@ -1294,6 +1306,22 @@ pub mod node_kind {
     pub const EDGE: &str = "edge";
 }
 
+/// A worker the autoscaler asked for, or is removing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScaleRequest {
+    pub id: String,
+    /// `scale_up` or `scale_down`.
+    pub action: String,
+    /// For a scale-up, the worker that joined with its token.
+    pub node: Option<String>,
+    pub reason: String,
+    pub created_at: i64,
+    /// When a scale-up's join token expires.
+    pub expires_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub outcome: Option<String>,
+}
+
 pub mod node_state {
     pub const READY: &str = "ready";
     /// No heartbeat for a while: no new sandboxes go there.
@@ -1334,6 +1362,100 @@ impl Db {
         conn.execute(
             "INSERT INTO join_tokens (hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
             params![hash, now, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Saves a scale-up request and the join token its new worker uses.
+    pub fn insert_scale_up(
+        &self,
+        id: &str,
+        token_hash: &[u8],
+        reason: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM join_tokens WHERE expires_at < ?1", [now])?;
+        tx.execute(
+            "INSERT INTO join_tokens (hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![token_hash, now, expires_at],
+        )?;
+        tx.execute(
+            "INSERT INTO scale_requests (id, action, token_hash, reason, created_at, expires_at)
+             VALUES (?1, 'scale_up', ?2, ?3, ?4, ?5)",
+            params![id, token_hash, reason, now, expires_at],
+        )?;
+        tx.commit()
+    }
+
+    pub fn insert_scale_down(
+        &self,
+        id: &str,
+        node: &str,
+        reason: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO scale_requests (id, action, node, reason, created_at)
+             VALUES (?1, 'scale_down', ?2, ?3, ?4)",
+            params![id, node, reason, now],
+        )?;
+        Ok(())
+    }
+
+    /// Scale requests, newest first: only those not ended, or the last
+    /// `limit` of all.
+    pub fn scale_requests(&self, open: bool, limit: u32) -> rusqlite::Result<Vec<ScaleRequest>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.action, COALESCE(r.node, t.node), r.reason, r.created_at,
+                    r.expires_at, r.ended_at, r.outcome
+             FROM scale_requests r LEFT JOIN join_tokens t ON t.hash = r.token_hash
+             WHERE ?1 = 0 OR r.ended_at IS NULL
+             ORDER BY r.created_at DESC, r.id LIMIT ?2",
+        )?;
+        stmt.query_map(params![open, limit], |r| {
+            Ok(ScaleRequest {
+                id: r.get(0)?,
+                action: r.get(1)?,
+                node: r.get(2)?,
+                reason: r.get(3)?,
+                created_at: r.get(4)?,
+                expires_at: r.get(5)?,
+                ended_at: r.get(6)?,
+                outcome: r.get(7)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// The scale-up that `node` joined for, if any.
+    pub fn scale_up_of(&self, node: &str) -> rusqlite::Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT r.id FROM scale_requests r
+                 LEFT JOIN join_tokens t ON t.hash = r.token_hash
+                 WHERE r.action = 'scale_up' AND COALESCE(r.node, t.node) = ?1",
+                [node],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Ends a scale request. `node` records the worker a scale-up got.
+    pub fn end_scale_request(
+        &self,
+        id: &str,
+        node: Option<&str>,
+        outcome: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "UPDATE scale_requests SET node = COALESCE(?2, node), outcome = ?3, ended_at = ?4
+             WHERE id = ?1 AND ended_at IS NULL",
+            params![id, node, outcome, now],
         )?;
         Ok(())
     }
@@ -2650,6 +2772,42 @@ mod tests {
             .misplaced("nod_a", &["sbx_a", "sbx_l", "sbx_m", "sbx_here", "sbx_new"])
             .unwrap();
         assert_eq!(wrong, ["sbx_l", "sbx_here"]);
+    }
+
+    #[test]
+    fn scale_up_learns_the_node_that_joined_with_its_token() {
+        let db = Db::memory().unwrap();
+        db.insert_scale_up("scl_1", b"t", "load", 100, 200).unwrap();
+        db.insert_scale_down("scl_2", "nod_old", "idle", 101)
+            .unwrap();
+        let open = db.scale_requests(true, 10).unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[1].node, None);
+        let node = NodeRow {
+            id: "nod_new".into(),
+            url: "https://10.0.0.2:7444".into(),
+            state: node_state::SUSPECT.into(),
+            boot: None,
+            seq: 0,
+            report: None,
+            last_seen: None,
+            created_at: 150,
+            removed_at: None,
+            draining: false,
+            kind: node_kind::WORKER.into(),
+        };
+        assert!(db.join_node(b"t", &node).unwrap());
+        let up = db.scale_requests(true, 10).unwrap().pop().unwrap();
+        assert_eq!(up.node.as_deref(), Some("nod_new"));
+        assert_eq!(db.scale_up_of("nod_new").unwrap().as_deref(), Some("scl_1"));
+        assert_eq!(db.scale_up_of("nod_old").unwrap(), None);
+        db.end_scale_request("scl_1", up.node.as_deref(), "joined", 160)
+            .unwrap();
+        let open = db.scale_requests(true, 10).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].node.as_deref(), Some("nod_old"));
+        let all = db.scale_requests(false, 10).unwrap();
+        assert_eq!(all[1].outcome.as_deref(), Some("joined"));
     }
 
     #[test]

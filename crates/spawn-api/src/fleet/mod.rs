@@ -4,6 +4,7 @@
 //! calls for a worker's sandboxes to that worker over mutual TLS. Edges
 //! join too, but run no sandboxes: they route clients' calls.
 
+pub mod autoscale;
 pub mod edge;
 pub mod forward;
 pub mod migrate;
@@ -76,7 +77,12 @@ pub struct WarmCount {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Capacity {
     pub free_slots: usize,
+    /// `--max-sandboxes`. 0 from hosts older than this field.
+    #[serde(default)]
+    pub slots: usize,
     pub memory_available_mib: u64,
+    #[serde(default)]
+    pub memory_total_mib: u64,
     pub templates: Vec<ReadyTemplate>,
     pub warm: Vec<WarmCount>,
     /// `Templates::fingerprint`. Sandboxes move only between hosts with
@@ -291,7 +297,9 @@ pub fn local_capacity(app: &App) -> Capacity {
         .collect();
     Capacity {
         free_slots: app.sandboxes.free_slots(),
+        slots: app.sandboxes.total_slots(),
         memory_available_mib: memory_available_mib().unwrap_or(0),
+        memory_total_mib: memory_total_mib().unwrap_or(0),
         templates,
         warm,
         fingerprint: app.templates.fingerprint().to_owned(),
@@ -302,8 +310,17 @@ pub fn local_capacity(app: &App) -> Capacity {
 
 /// `MemAvailable` from `/proc/meminfo`.
 pub fn memory_available_mib() -> Option<u64> {
+    meminfo_mib("MemAvailable:")
+}
+
+/// `MemTotal` from `/proc/meminfo`.
+pub fn memory_total_mib() -> Option<u64> {
+    meminfo_mib("MemTotal:")
+}
+
+fn meminfo_mib(field: &str) -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let line = info.lines().find(|l| l.starts_with(field))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib / 1024)
 }

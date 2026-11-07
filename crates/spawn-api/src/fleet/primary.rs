@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tower::ServiceExt;
 
+use super::autoscale::Autoscaler;
 use super::forward::{self, Failure};
 use super::migrate::{self, MigrateInput, Moves};
 use super::pki::{FleetCa, Identity, Peer};
@@ -77,6 +78,8 @@ pub struct Primary {
     pub volume_lock: tokio::sync::RwLock<()>,
     /// The egress CA's certificate and key, which every host uses.
     egress_ca: EgressCa,
+    /// Set when the primary runs with `--autoscale-hook`.
+    pub autoscaler: OnceLock<Arc<Autoscaler>>,
 }
 
 impl Primary {
@@ -96,6 +99,7 @@ impl Primary {
             moves: Moves::default(),
             volume_lock: tokio::sync::RwLock::new(()),
             egress_ca,
+            autoscaler: OnceLock::new(),
         })
     }
 
@@ -1168,6 +1172,13 @@ struct TokenInput {
     ttl_s: Option<u64>,
 }
 
+pub(super) fn new_join_token() -> Result<String, ApiError> {
+    Ok(format!(
+        "sbj_{}",
+        ids::base32(&ids::random::<32>().map_err(ApiError::internal)?)
+    ))
+}
+
 /// `POST /v1/nodes/tokens`: a one-time token a worker joins with.
 pub async fn new_token(
     State(app): State<AppState>,
@@ -1181,10 +1192,7 @@ pub async fn new_token(
             "ttl_s must be 60 to {MAX_TOKEN_TTL_S}"
         )));
     }
-    let token = format!(
-        "sbj_{}",
-        ids::base32(&ids::random::<32>().map_err(ApiError::internal)?)
-    );
+    let token = new_join_token()?;
     let now = now_ms();
     let expires_at = now + i64::try_from(ttl_s * 1000).unwrap_or(i64::MAX);
     app.db
@@ -1260,21 +1268,29 @@ pub async fn remove_node(
     axum::extract::Extension(origin): axum::extract::Extension<Origin>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let p = primary(&app)?;
+    if !remove(&app, &id, &origin)? {
+        return Err(node_not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes a node. False if there is no such node.
+pub(super) fn remove(app: &App, id: &str, origin: &Origin) -> Result<bool, ApiError> {
+    let p = primary(app)?;
     let now = now_ms();
     let edge = app
         .db
-        .get_node(&id)?
+        .get_node(id)?
         .is_some_and(|n| n.kind == node_kind::EDGE);
-    if !app.db.remove_node(&id, now)? {
-        return Err(node_not_found());
+    if !app.db.remove_node(id, now)? {
+        return Ok(false);
     }
-    p.forget(&id);
+    p.forget(id);
     if edge {
         // Workers stop taking its calls with their next config copy.
         p.bump();
     }
-    for (sandbox, tenant) in app.db.end_mirrors(&id, &HashSet::new(), i64::MAX, now)? {
+    for (sandbox, tenant) in app.db.end_mirrors(id, &HashSet::new(), i64::MAX, now)? {
         app.sandboxes.hub.record(
             "sandbox.lost",
             &Origin::system(),
@@ -1285,9 +1301,9 @@ pub async fn remove_node(
     }
     app.sandboxes
         .hub
-        .record("node.removed", &origin, None, None, json!({ "node": id }));
+        .record("node.removed", origin, None, None, json!({ "node": id }));
     eprintln!("node {id} removed");
-    Ok(StatusCode::NO_CONTENT)
+    Ok(true)
 }
 
 #[derive(Deserialize, Default)]

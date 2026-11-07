@@ -770,6 +770,7 @@ Prometheus adds the `instance` label.
 | `spawnbox_warm_pool_ready` (gauge) | `template`, `build`, `network` | Warm VMs ready |
 | `spawnbox_warm_pool_hits_total`, `spawnbox_warm_pool_misses_total` | `build` | Creates that got or did not get a warm VM |
 | `spawnbox_fleet_nodes` (gauge) | `state` | Primary only: workers in each state |
+| `spawnbox_fleet_load` (gauge) | None | Primary only: load of the fleet for the autoscaler, from 0 to 1 |
 
 ## Use more than one host
 
@@ -1070,6 +1071,118 @@ To remove an edge, use `DELETE /v1/nodes/NODE_ID`. After approximately
 
 To add the same host again, remove `/var/lib/spawnbox/fleet/worker/` on
 the worker. Then do [step 3](#step-3-add-a-worker) with a new token.
+
+### Add and remove workers automatically
+
+The primary can start and stop workers for you. It does not know your
+cloud. It calls your hook: a program or a webhook. The hook starts or
+stops a machine on AWS, Azure or any other cloud.
+
+How it decides:
+
+- The load is the larger of the used slots and the used memory, for the
+  primary and the ready workers that are not drained.
+- If the load stays above `--autoscale-up-pct` for
+  `--autoscale-up-after-s`, or there are fewer workers than
+  `--autoscale-min-workers`, the primary asks for one more worker.
+- If the load stays below `--autoscale-down-pct` for
+  `--autoscale-down-after-s`, the primary drains the worker with the
+  fewest sandboxes and moves its sandboxes. When the worker is empty,
+  it calls the hook to stop the machine, then removes the worker.
+- It does one change at a time. It never goes above
+  `--autoscale-max-workers`. If the load goes up while a worker drains,
+  it undrains the worker instead of asking for a new one.
+- A new worker must join within 30 minutes. If it does not, or the hook
+  fails, the primary waits 5 minutes before it asks again.
+
+To use a program:
+
+1. Write the program, for example `/etc/spawnbox/autoscale.sh`. This
+   example uses AWS. Make an EC2 launch template `spawnbox-worker` with
+   an image that has Spawnbox installed (do [step 1](#step-1-prepare-the-hosts)
+   and `deploy/install.sh` once, then make an image). Change `PRIMARY` to
+   the `--fleet-listen` URL of your primary.
+
+   ```sh
+#!/bin/sh
+# /etc/spawnbox/autoscale.sh: starts and stops Spawnbox workers on AWS.
+set -eu
+PRIMARY=https://10.0.0.1:7443
+case "$1" in
+scale_up)
+  boot=$(mktemp)
+  cat > "$boot" <<EOF
+#!/bin/sh
+ip=\$(hostname -I | cut -d' ' -f1)
+cat > /etc/spawnbox/spawnbox.env <<END
+SPAWNBOX_ARGS="--preview-url http://{label}.localhost:8081 --primary $PRIMARY --node-listen \$ip:7444 --advertise https://\$ip:7444 --primary-ca-sha256 $SPAWNBOX_PRIMARY_CA_SHA256"
+SPAWNBOX_JOIN_TOKEN=$SPAWNBOX_JOIN_TOKEN
+END
+systemctl restart spawnbox
+EOF
+  aws ec2 run-instances \
+    --launch-template LaunchTemplateName=spawnbox-worker \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=spawnbox-request,Value=$SPAWNBOX_REQUEST_ID}]" \
+    --user-data "file://$boot"
+  rm -f "$boot"
+  ;;
+scale_down)
+  ip=$(echo "$SPAWNBOX_NODE_URL" | sed 's|https://||; s|:.*||')
+  id=$(aws ec2 describe-instances \
+    --filters "Name=private-ip-address,Values=$ip" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  aws ec2 terminate-instances --instance-ids "$id"
+  ;;
+esac
+   ```
+
+   On Azure, use `az vm create --custom-data` and `az vm delete` in the
+   same way.
+
+2. Make it executable: `sudo chmod 755 /etc/spawnbox/autoscale.sh`.
+3. On the primary, add these flags to `SPAWNBOX_ARGS` and restart:
+   `--autoscale-hook /etc/spawnbox/autoscale.sh --autoscale-max-workers 10`.
+
+The primary runs the program with one argument, `scale_up` or
+`scale_down`. Exit code `0` means success. The program can run for at
+most 10 minutes. Its output goes to the log of the primary. It also gets
+the request as JSON on stdin, and these environment variables:
+
+| Variable | Action | Value |
+|---|---|---|
+| `SPAWNBOX_ACTION` | Both | `scale_up` or `scale_down` |
+| `SPAWNBOX_REQUEST_ID` | Both | ID of the request, for example `scl_...` |
+| `SPAWNBOX_JOIN_TOKEN` | `scale_up` | Join token for the new worker |
+| `SPAWNBOX_PRIMARY_CA_SHA256` | `scale_up` | Value for `--primary-ca-sha256` |
+| `SPAWNBOX_NODE_ID` | `scale_down` | ID of the worker to stop |
+| `SPAWNBOX_NODE_URL` | `scale_down` | `--advertise` URL of the worker |
+| `SPAWNBOX_NODE_SCALE_UP` | `scale_down` | ID of the `scale_up` request that made the worker, or empty |
+
+To use a webhook, give a URL to `--autoscale-hook`, for example
+`--autoscale-hook https://hooks.example.com/spawnbox`. The URL must use
+`https`, or `http` to `localhost`. The primary sends a `POST` with this
+JSON and waits for a `2xx` response for at most 60 seconds:
+
+```json
+{"action":"scale_up","id":"scl_...","reason":"load 82% for 120 s",
+ "join":{"token":"sbj_...","ca_sha256":"...","expires_at":"2026-01-01T00:30:00.000Z"}}
+{"action":"scale_down","id":"scl_...","reason":"load 12% for 1200 s",
+ "node":{"id":"nod_...","url":"https://10.0.0.7:7444","scale_up":"scl_..."}}
+```
+
+With `--autoscale-secret` (or `SPAWNBOX_AUTOSCALE_SECRET`), each request
+has the header `X-Spawnbox-Signature: sha256=<hex>`. The value is the
+HMAC-SHA256 of the body with the secret.
+
+To see the state, type:
+
+```sh
+curl -s -H "$A" http://127.0.0.1:8080/v1/nodes/autoscale
+```
+
+The response has the load, the workers, the settings and the last 20
+requests. The events `autoscale.requested`, `autoscale.done`,
+`autoscale.failed` and `autoscale.cancelled` also show each request.
 
 ## API reference
 
@@ -1372,6 +1485,7 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     `duration_ms`)
   - `secret.injected` (without the value)
   - changes to tenants, keys, secrets and templates
+  - `autoscale.requested`, `.done`, `.failed`, `.cancelled` (primary only)
 - `GET /v1/events` and `GET /v1/sandboxes/{id}/events` get events. These
   are the filters: `tenant`, `sandbox`, `step_id`, `type`, `since`,
   `until`. The type `exec.*` gets all the `exec` events.
@@ -1425,6 +1539,7 @@ These calls operate only on a primary. The key must have the scope
 | --- | --- |
 | `POST /v1/nodes/tokens` | Make a join token. Optional body: `{"ttl_s": 3600}`, from 60 to 604800. The response has `token`, `expires_at` and `ca_sha256`. |
 | `GET /v1/nodes` | List the workers and edges that are not removed |
+| `GET /v1/nodes/autoscale` | Get the state of the autoscaler. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `GET /v1/nodes/{id}` | Get one worker or edge |
 | `DELETE /v1/nodes/{id}` | Remove a worker or an edge. The sandboxes of a worker are marked deleted. |
 | `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes to other hosts. Gives `202` when it moves sandboxes. |
@@ -1513,6 +1628,14 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--advertise` | None | Worker: URL of `--node-listen` for the primary, for example `https://10.0.0.2:7444` |
 | `--join-token` | None | Worker: token from `POST /v1/nodes/tokens`. You can also use `SPAWNBOX_JOIN_TOKEN`. Necessary only for the first start. |
 | `--primary-ca-sha256` | None | Worker: `ca_sha256` from the same response. Necessary only for the first start. |
+| `--autoscale-hook` | None | Primary: program (absolute path) or webhook URL that adds and removes workers. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
+| `--autoscale-secret` | None | Key to sign webhook requests. You can also use `SPAWNBOX_AUTOSCALE_SECRET`. |
+| `--autoscale-min-workers` | 0 | Minimum number of workers |
+| `--autoscale-max-workers` | 10 | Maximum number of workers |
+| `--autoscale-up-pct` | 70 | Add a worker when the load is above this percent |
+| `--autoscale-up-after-s` | 120 | Seconds the load must stay high |
+| `--autoscale-down-pct` | 30 | Remove a worker when the load is below this percent |
+| `--autoscale-down-after-s` | 1200 | Seconds the load must stay low |
 
 To show previews on the internet:
 

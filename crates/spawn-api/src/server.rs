@@ -253,6 +253,58 @@ pub struct Args {
     /// URL the primary reaches `--node-listen` at: `https://host:port`.
     #[arg(long, requires = "primary", value_parser = parse_node_url)]
     advertise: Option<String>,
+    /// Add and remove workers on their own. When the fleet needs a worker,
+    /// or has one too many, run this program (an absolute path) or POST
+    /// to this URL. Needs --fleet-listen.
+    #[arg(long, requires = "fleet_listen")]
+    autoscale_hook: Option<String>,
+    /// Key to sign webhook calls with: `X-Spawnbox-Signature: sha256=` and
+    /// the hex HMAC-SHA256 of the body.
+    #[arg(long, env = "SPAWNBOX_AUTOSCALE_SECRET")]
+    autoscale_secret: Option<String>,
+    /// Fewest workers the autoscaler keeps, not counting the primary.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1000))]
+    autoscale_min_workers: u32,
+    /// Most workers the autoscaler keeps, not counting the primary.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    autoscale_max_workers: u32,
+    /// Add a worker when the fleet uses this percent of its slots or
+    /// memory...
+    #[arg(long, default_value_t = 70, value_parser = clap::value_parser!(u8).range(1..=100))]
+    autoscale_up_pct: u8,
+    /// ...for this many seconds.
+    #[arg(long, default_value_t = 120)]
+    autoscale_up_after_s: u32,
+    /// Remove a worker when the fleet uses this percent or less...
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(0..=99))]
+    autoscale_down_pct: u8,
+    /// ...for this many seconds.
+    #[arg(long, default_value_t = 1200)]
+    autoscale_down_after_s: u32,
+}
+
+/// The autoscaler's settings, if `--autoscale-hook` is set.
+fn autoscale_settings(args: &Args) -> Result<Option<fleet::autoscale::Settings>> {
+    let Some(hook) = &args.autoscale_hook else {
+        return Ok(None);
+    };
+    let hook = fleet::autoscale::Hook::parse(hook, args.autoscale_secret.clone())
+        .map_err(|e| anyhow::anyhow!("--autoscale-hook: {e}"))?;
+    if args.autoscale_down_pct >= args.autoscale_up_pct {
+        bail!("--autoscale-down-pct must be less than --autoscale-up-pct");
+    }
+    if args.autoscale_min_workers > args.autoscale_max_workers {
+        bail!("--autoscale-min-workers must not be more than --autoscale-max-workers");
+    }
+    Ok(Some(fleet::autoscale::Settings {
+        hook,
+        min_workers: args.autoscale_min_workers as usize,
+        max_workers: args.autoscale_max_workers as usize,
+        up_ratio: f64::from(args.autoscale_up_pct) / 100.0,
+        up_after_ms: i64::from(args.autoscale_up_after_s) * 1000,
+        down_ratio: f64::from(args.autoscale_down_pct) / 100.0,
+        down_after_ms: i64::from(args.autoscale_down_after_s) * 1000,
+    }))
 }
 
 pub fn parse_node_url(text: &str) -> Result<String, String> {
@@ -312,6 +364,8 @@ fn secret_attrs(view: &SecretView) -> Value {
 }
 
 pub async fn serve(args: Args) -> Result<()> {
+    // Checked before the host is set up.
+    autoscale_settings(&args)?;
     if !nix::unistd::geteuid().is_root() {
         bail!("run as root: it creates jails, cgroups, network namespaces and firewall rules");
     }
@@ -411,8 +465,10 @@ async fn run(
     sbox: SecretBox,
     ca: Arc<Ca>,
 ) -> Result<()> {
-    // The OTLP exporter's HTTPS client uses the process-wide crypto provider.
+    // The OTLP exporter's and the autoscale webhook's HTTPS clients use the
+    // process-wide crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut autoscale = autoscale_settings(args)?;
     let role = if let Some(url) = &args.primary {
         Role::Worker(
             Worker::start(
@@ -698,6 +754,9 @@ async fn run(
                     }
                 }));
                 background.push(primary::watch(Arc::clone(&app)));
+                if let Some(settings) = autoscale.take() {
+                    background.push(fleet::autoscale::start(Arc::clone(&app), settings)?);
+                }
             }
             let listener = tls::Bound::bind(
                 args.listen,
@@ -763,7 +822,10 @@ async fn metrics_text(
             pool.ready as f64,
         ));
     }
-    if let Role::Primary(_) = &app.role {
+    if let Role::Primary(p) = &app.role {
+        if let Some(load) = p.autoscaler.get().and_then(|a| a.load()) {
+            samples.push(("spawnbox_fleet_load", vec![], load));
+        }
         match app.db.list_nodes() {
             Ok(nodes) => {
                 let mut counts = std::collections::BTreeMap::<String, u32>::new();
@@ -885,6 +947,7 @@ pub fn router(app: AppState) -> Router {
         .route("/v1/warm-pools", get(warm_pools))
         .route("/v1/nodes", get(primary::list_nodes))
         .route("/v1/nodes/tokens", post(primary::new_token))
+        .route("/v1/nodes/autoscale", get(fleet::autoscale::status))
         .route(
             "/v1/nodes/{id}",
             get(primary::get_node)

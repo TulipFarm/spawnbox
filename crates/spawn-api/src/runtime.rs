@@ -706,6 +706,11 @@ impl Sandboxes {
         self.slots.free_count().saturating_add(warm)
     }
 
+    /// `--max-sandboxes`.
+    pub fn total_slots(&self) -> usize {
+        self.slots.total() as usize
+    }
+
     /// The warm pool network (`open`, `restricted` or `closed`) a sandbox
     /// of `tenant` with `egress` gets.
     pub fn network_mode(&self, tenant: &Tenant, egress: Option<&Policy>) -> &'static str {

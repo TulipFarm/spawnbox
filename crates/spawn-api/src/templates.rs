@@ -97,6 +97,7 @@ impl Drop for ClaimGuard {
 /// Jail and network indexes, shared by sandboxes and builds and reused
 /// oldest first.
 pub struct Slots {
+    total: u32,
     free: Mutex<VecDeque<u32>>,
     released: Notify,
 }
@@ -104,6 +105,7 @@ pub struct Slots {
 impl Slots {
     pub fn new(count: u32) -> Self {
         Self {
+            total: count,
             free: Mutex::new((1..=count).collect()),
             released: Notify::new(),
         }
@@ -111,6 +113,10 @@ impl Slots {
 
     fn free(&self) -> MutexGuard<'_, VecDeque<u32>> {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn total(&self) -> u32 {
+        self.total
     }
 
     /// Slots free now.
