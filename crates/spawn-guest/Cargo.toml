@@ -1,0 +1,28 @@
+[package]
+name = "spawn-guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agent that runs as PID 1 inside every Spawnbox VM"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+flate2 = "1.1.11"
+libc = "0.2.191"
+oci-client = { version = "0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
+ruzstd = "0.9.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde_json = "1.0.154"
+tar = "0.4.46"
+nix = { version = "0.31.3", features = ["mount", "process", "signal", "hostname", "time", "fs", "user", "term"] }
+spawn-proto = { path = "../spawn-proto" }
+tokio = { version = "1.54.1", features = ["rt", "macros", "process", "io-util", "sync", "time", "fs", "net"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-vsock = { version = "0.7.3", features = ["tonic014"] }
+tonic = "0.14.9"

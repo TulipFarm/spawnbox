@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# The guest agent ships as a static Linux binary.
+targets = ["x86_64-unknown-linux-musl"]

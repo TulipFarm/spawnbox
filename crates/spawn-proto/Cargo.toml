@@ -1,0 +1,20 @@
+[package]
+name = "spawn-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Protocol definitions shared by Spawnbox hosts and guests"
+publish = false
+
+[dependencies]
+prost = "0.14.4"
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+protox = "0.10.0"
+tonic-prost-build = "0.14.9"

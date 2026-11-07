@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/spawn-api","crates/spawn-bench","crates/spawn-egress","crates/spawn-guest","crates/spawn-node","crates/spawn-proto","crates/spawnbox-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Apache-2.0"
+repository = "https://github.com/TulipFarm/spawnbox"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

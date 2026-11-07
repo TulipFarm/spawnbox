@@ -1,0 +1,266 @@
+syntax = "proto3";
+
+package spawn.guest.v1;
+
+// Spoken between the host and spawn-guest over vsock.
+// The host treats every message from the guest as untrusted input.
+
+service Health {
+  // First call on every connection. The host refuses incompatible guests.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+}
+
+service Identity {
+  // Called after every restore, before the sandbox is reported ready.
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+}
+
+service Process {
+  // Runs a command and streams its output, then one final Exit event.
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+}
+
+// Files inside the guest. Relative paths are under /workspace. Every call
+// runs with the file permissions of `user` (empty means `user`, uid 1000).
+service Files {
+  rpc Stat(PathRequest) returns (FileInfo);
+  // First message is the file's info, then its bytes in chunks of at most
+  // 1 MiB. Fails for anything but a regular file.
+  rpc Read(PathRequest) returns (stream ReadChunk);
+  // First message is a header, then data. The file is replaced only when a
+  // final `commit` arrives; a stream that ends without it changes nothing.
+  rpc Write(stream WriteChunk) returns (FileInfo);
+  rpc List(PathRequest) returns (ListResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+}
+
+// Interactive terminals.
+service Pty {
+  // The first message must be `start`. The stream carries output, then one
+  // exit. Ending the input stream hangs up the terminal.
+  rpc Open(stream PtyInput) returns (stream PtyOutput);
+}
+
+// Connections to TCP ports inside the guest, for preview URLs.
+service Ports {
+  // The first message must be `open`. Then both directions carry the
+  // connection's bytes; ending the input stream closes the connection.
+  rpc Dial(stream PortInput) returns (stream PortOutput);
+}
+
+// Used while building templates.
+service Image {
+  // Flushes the writable disk and freezes it, so the host can use it as a
+  // read-only layer. The VM is stopped right after.
+  rpc Seal(SealRequest) returns (SealResponse);
+  // Pulls an OCI image and unpacks it, bootable, into a mounted empty
+  // disk. Streams progress lines, then the image digest.
+  rpc Unpack(UnpackRequest) returns (stream UnpackEvent);
+}
+
+// Persistent volumes, attached when a sandbox is created.
+service Volumes {
+  // Mounts each volume at its path. Called once, right after Apply.
+  rpc Mount(MountRequest) returns (MountResponse);
+}
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message HelloRequest {
+  ProtocolVersion host_version = 1;
+}
+
+message HelloResponse {
+  ProtocolVersion guest_version = 1;
+  string agent_version = 2;
+}
+
+message ApplyRequest {
+  // Wall-clock time on the host, in nanoseconds since the Unix epoch.
+  int64 wall_clock_unix_nanos = 1;
+  // Fresh random bytes mixed into the guest kernel's entropy pool.
+  bytes entropy = 2;
+  string hostname = 3;
+  string sandbox_id = 4;
+}
+
+message ApplyResponse {}
+
+message VolumeMount {
+  // Slot 0 to 3. In a VM the disk is vdc to vdf, or vdg to vdj when
+  // read-only; under gVisor it is bound at /spawn/vol/<slot>.
+  uint32 slot = 1;
+  // Absolute path in the guest.
+  string path = 2;
+  bool read_only = 3;
+  // The disk's size, which a VM sees once the host swaps it in.
+  uint64 size_bytes = 4;
+}
+
+message MountRequest {
+  repeated VolumeMount volumes = 1;
+}
+
+message MountResponse {}
+
+message ExecRequest {
+  // Run with `bash -lc`.
+  string cmd = 1;
+  // Empty means /workspace.
+  string cwd = 2;
+  map<string, string> env = 3;
+  // Zero means no timeout.
+  uint32 timeout_ms = 4;
+  // Empty means `user` (uid 1000).
+  string user = 5;
+  // Written to standard input, which is then closed. Empty means
+  // /dev/null.
+  bytes stdin = 6;
+}
+
+message ExecEvent {
+  oneof event {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    ExecExit exit = 3;
+  }
+}
+
+message ExecExit {
+  // Set when the process exited normally.
+  optional int32 exit_code = 1;
+  // Set when the process was killed by a signal.
+  optional int32 signal = 2;
+  bool timed_out = 3;
+  uint64 duration_ms = 4;
+}
+
+message PathRequest {
+  string path = 1;
+  string user = 2;
+}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_FILE = 1;
+  FILE_KIND_DIR = 2;
+  FILE_KIND_SYMLINK = 3;
+  FILE_KIND_OTHER = 4;
+}
+
+message FileInfo {
+  // Absolute path for Stat, Read and Write; the entry name for List.
+  string path = 1;
+  FileKind kind = 2;
+  uint64 size = 3;
+  // Permission bits, for example 0644.
+  uint32 mode = 4;
+  int64 modified_unix_ms = 5;
+}
+
+message ReadChunk {
+  oneof chunk {
+    FileInfo info = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteHeader {
+  string path = 1;
+  string user = 2;
+}
+
+message WriteChunk {
+  oneof chunk {
+    WriteHeader header = 1;
+    bytes data = 2;
+    bool commit = 3;
+  }
+}
+
+message ListResponse {
+  string path = 1;
+  repeated FileInfo entries = 2;
+  // Set when the directory has more entries than one response holds.
+  bool truncated = 3;
+}
+
+message RemoveRequest {
+  string path = 1;
+  string user = 2;
+  // Needed to remove a directory that is not empty.
+  bool recursive = 3;
+}
+
+message RemoveResponse {}
+
+message SealRequest {}
+
+message SealResponse {}
+
+message UnpackRequest {
+  // For example docker.io/library/node:22.
+  string reference = 1;
+  // Directory where the empty disk is mounted.
+  string dest = 2;
+  // PEM certificates to trust besides the system ones.
+  string extra_ca_pem = 3;
+}
+
+message UnpackEvent {
+  oneof event {
+    string line = 1;
+    // sha256:... of the manifest that was used.
+    string digest = 2;
+  }
+}
+
+message PtyStart {
+  // Run with `bash -lc`. Empty means an interactive login shell.
+  string cmd = 1;
+  // Empty means /workspace.
+  string cwd = 2;
+  map<string, string> env = 3;
+  // Empty means `user` (uid 1000).
+  string user = 4;
+  uint32 cols = 5;
+  uint32 rows = 6;
+}
+
+message PtySize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message PtyInput {
+  oneof input {
+    PtyStart start = 1;
+    bytes data = 2;
+    PtySize resize = 3;
+  }
+}
+
+message PtyOutput {
+  oneof output {
+    bytes data = 1;
+    ExecExit exit = 2;
+  }
+}
+
+message PortOpen {
+  uint32 port = 1;
+}
+
+message PortInput {
+  oneof input {
+    PortOpen open = 1;
+    bytes data = 2;
+  }
+}
+
+message PortOutput {
+  bytes data = 1;
+}
