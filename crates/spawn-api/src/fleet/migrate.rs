@@ -598,6 +598,7 @@ pub async fn migrate(
     let (from, to) = (source.name().to_owned(), target.name().to_owned());
     let target_node = target.node.clone();
     let source_node = source.node.clone();
+    let _busy = target_node.as_ref().map(|n| p.busy.hold(&n.id));
 
     let _volumes = if row.volumes.is_empty() {
         None
@@ -830,9 +831,15 @@ fn unreachable_or_broken(node: &NodeRow, failure: Failure) -> ApiError {
     }
 }
 
+/// What one pass of `drain` could not move.
+pub struct Drained {
+    pub failed: u32,
+    pub volumes_failed: u32,
+}
+
 /// Moves every sandbox off `node`, running ones first, until it is
 /// undrained.
-pub async fn drain(app: AppState, node: String, origin: Origin) {
+pub async fn drain(app: AppState, node: String, origin: Origin) -> Drained {
     let mut sandboxes = app.db.node_sandboxes(&node).unwrap_or_default();
     sandboxes.sort_by_key(|s| s.state != state::RUNNING);
     let (mut moved, mut failed) = (0u32, 0u32);
@@ -876,8 +883,13 @@ pub async fn drain(app: AppState, node: String, origin: Origin) {
             "failed": failed,
             "volumes_moved": volumes_moved,
             "volumes_failed": volumes_failed,
+            "complete": failed == 0 && volumes_failed == 0,
         }),
     );
+    Drained {
+        failed,
+        volumes_failed,
+    }
 }
 
 #[cfg(test)]

@@ -178,11 +178,25 @@ const MIGRATIONS: &[&str] = &[
         outcome TEXT
     );
     CREATE INDEX scale_requests_open ON scale_requests (ended_at);",
+    "ALTER TABLE scale_requests ADD COLUMN token_sealed BLOB;
+    CREATE TABLE retirements (
+        node TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        migrate INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        ready_at INTEGER,
+        ended_at INTEGER,
+        failed_moves INTEGER NOT NULL DEFAULT 0
+    );",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
 /// later upgrades. Text sorts byte by byte, as in SQLite.
-const PG_MIGRATIONS: &[&str] = &[r#"
+const PG_MIGRATIONS: &[&str] = &[
+    r#"
     CREATE TABLE api_keys (
         id TEXT COLLATE "C" PRIMARY KEY,
         hash BYTEA NOT NULL UNIQUE,
@@ -352,7 +366,22 @@ const PG_MIGRATIONS: &[&str] = &[r#"
         name TEXT PRIMARY KEY,
         data BYTEA NOT NULL,
         updated_at BIGINT NOT NULL
-    );"#];
+    );"#,
+    r#"
+    ALTER TABLE scale_requests ADD COLUMN token_sealed BYTEA;
+    CREATE TABLE retirements (
+        node TEXT COLLATE "C" PRIMARY KEY,
+        id TEXT COLLATE "C" NOT NULL,
+        origin TEXT COLLATE "C" NOT NULL,
+        migrate BIGINT NOT NULL,
+        reason TEXT COLLATE "C" NOT NULL,
+        state TEXT COLLATE "C" NOT NULL,
+        created_at BIGINT NOT NULL,
+        ready_at BIGINT,
+        ended_at BIGINT,
+        failed_moves BIGINT NOT NULL DEFAULT 0
+    );"#,
+];
 
 pub mod state {
     pub const STARTING: &str = "starting";
@@ -1547,6 +1576,57 @@ pub struct ScaleRequest {
     pub outcome: Option<String>,
 }
 
+/// A worker being emptied so that its machine can be stopped. At most one
+/// per node; it cannot be undone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retirement {
+    pub node: String,
+    pub id: String,
+    /// `retire_origin::API` or `retire_origin::AUTOSCALER`.
+    pub origin: String,
+    /// Move its sandboxes away, not wait for them to end.
+    pub migrate: bool,
+    pub reason: String,
+    /// One of `retire_state`.
+    pub state: String,
+    pub created_at: i64,
+    pub ready_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub failed_moves: i64,
+}
+
+pub mod retire_origin {
+    pub const API: &str = "api";
+    pub const AUTOSCALER: &str = "autoscaler";
+}
+
+pub mod retire_state {
+    pub const DRAINING: &str = "draining";
+    /// A full pass to move its sandboxes or volumes left some behind.
+    pub const BLOCKED: &str = "blocked";
+    /// Empty: its machine can be stopped.
+    pub const READY: &str = "ready_to_terminate";
+    pub const REMOVED: &str = "removed";
+}
+
+const RETIREMENT_COLUMNS: &str =
+    "node, id, origin, migrate, reason, state, created_at, ready_at, ended_at, failed_moves";
+
+fn retirement_from_row(row: &Row) -> Result<Retirement> {
+    Ok(Retirement {
+        node: row.get(0)?,
+        id: row.get(1)?,
+        origin: row.get(2)?,
+        migrate: row.get(3)?,
+        reason: row.get(4)?,
+        state: row.get(5)?,
+        created_at: row.get(6)?,
+        ready_at: row.get(7)?,
+        ended_at: row.get(8)?,
+        failed_moves: row.get(9)?,
+    })
+}
+
 pub mod node_state {
     pub const READY: &str = "ready";
     /// No heartbeat for a while: no new sandboxes go there.
@@ -1591,6 +1671,7 @@ impl Db {
         &self,
         id: &str,
         token_hash: &[u8],
+        token_sealed: &[u8],
         reason: &str,
         now: i64,
         expires_at: i64,
@@ -1603,9 +1684,10 @@ impl Db {
             params![token_hash, now, expires_at],
         )?;
         tx.execute(
-            "INSERT INTO scale_requests (id, action, token_hash, reason, created_at, expires_at)
-             VALUES (?1, 'scale_up', ?2, ?3, ?4, ?5)",
-            params![id, token_hash, reason, now, expires_at],
+            "INSERT INTO scale_requests
+                 (id, action, token_hash, token_sealed, reason, created_at, expires_at)
+             VALUES (?1, 'scale_up', ?2, ?3, ?4, ?5, ?6)",
+            params![id, token_hash, token_sealed, reason, now, expires_at],
         )?;
         tx.commit()
     }
@@ -1643,6 +1725,19 @@ impl Db {
             })
         })?
         .collect()
+    }
+
+    /// The sealed join token of scale-up `id`.
+    pub fn scale_up_token(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT token_sealed FROM scale_requests WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// The scale-up that `node` joined for, if any.
@@ -1769,23 +1864,124 @@ impl Db {
         Ok(())
     }
 
-    /// Returns false if no such node is active.
+    /// Returns false if no such node is active, or it is retiring and
+    /// `draining` is false.
     pub fn set_node_draining(&self, id: &str, draining: bool) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE nodes SET draining = ?2 WHERE id = ?1 AND state != 'removed'",
+            "UPDATE nodes SET draining = ?2 WHERE id = ?1 AND state != 'removed'
+             AND (?2 = 1 OR NOT EXISTS
+                 (SELECT 1 FROM retirements WHERE node = ?1 AND ended_at IS NULL))",
             params![id, draining],
         )?;
         Ok(changed > 0)
     }
 
+    /// Starts retiring `r.node` and stops new sandboxes going there, in one
+    /// transaction. If it is already retiring, returns that retirement
+    /// instead. `None` if there is no such active worker.
+    pub fn retire_node(&self, r: &Retirement) -> Result<Option<Retirement>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE nodes SET draining = 1
+             WHERE id = ?1 AND state != 'removed' AND kind = 'worker'",
+            [&r.node],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO retirements ({RETIREMENT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (node) DO NOTHING"
+            ),
+            params![
+                r.node,
+                r.id,
+                r.origin,
+                r.migrate,
+                r.reason,
+                r.state,
+                r.created_at,
+                r.ready_at,
+                r.ended_at,
+                r.failed_moves
+            ],
+        )?;
+        let row = tx.query_row(
+            &format!("SELECT {RETIREMENT_COLUMNS} FROM retirements WHERE node = ?1"),
+            [&r.node],
+            retirement_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(row))
+    }
+
+    /// Every retirement, or only those not ended.
+    pub fn retirements(&self, open: bool) -> Result<Vec<Retirement>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RETIREMENT_COLUMNS} FROM retirements
+             WHERE ?1 = 0 OR ended_at IS NULL ORDER BY created_at, node"
+        ))?;
+        stmt.query_map([open], retirement_from_row)?.collect()
+    }
+
+    pub fn retirement(&self, node: &str) -> Result<Option<Retirement>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {RETIREMENT_COLUMNS} FROM retirements WHERE node = ?1"),
+                [node],
+                retirement_from_row,
+            )
+            .optional()
+    }
+
+    /// Updates an open retirement. `ready_to_terminate` is never left.
+    pub fn set_retirement(
+        &self,
+        node: &str,
+        state: &str,
+        failed_moves: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE retirements SET state = ?2, failed_moves = ?3,
+                 ready_at = CASE WHEN ?2 = 'ready_to_terminate' THEN ?4 ELSE ready_at END
+             WHERE node = ?1 AND ended_at IS NULL AND state != 'ready_to_terminate'",
+            params![node, state, failed_moves, now],
+        )?;
+        Ok(())
+    }
+
+    fn end_retirement(conn: &Conn, node: &str, now: i64) -> Result<()> {
+        conn.execute(
+            "UPDATE retirements SET state = ?3, ended_at = ?2
+             WHERE node = ?1 AND ended_at IS NULL",
+            params![node, now, retire_state::REMOVED],
+        )?;
+        Ok(())
+    }
+
     /// Returns false if no such node is active.
+    /// Also ends its retirement.
     pub fn remove_node(&self, id: &str, now: i64) -> Result<bool> {
-        let changed = self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "UPDATE nodes SET state = 'removed', removed_at = ?2
              WHERE id = ?1 AND state != 'removed'",
             params![id, now],
         )?;
+        Self::end_retirement(&tx, id, now)?;
+        tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Ends the retirement of a node that is gone.
+    pub fn end_retirement_of(&self, node: &str, now: i64) -> Result<()> {
+        Self::end_retirement(&self.conn(), node, now)
     }
 
     /// Records an edge's routes call. Returns false if it is not an active
@@ -2255,6 +2451,7 @@ const IMPORT_TABLES: &[&str] = &[
     "node_usage",
     "volumes",
     "scale_requests",
+    "retirements",
 ];
 
 /// Postgres only: files that every primary of the database uses, and the
@@ -3120,9 +3317,73 @@ mod tests {
     }
 
     #[test]
+    fn retirement_is_kept_once_and_cannot_be_undone() {
+        let db = Db::memory().unwrap();
+        let node = NodeRow {
+            id: "nod_a".into(),
+            url: "https://10.0.0.2:7444".into(),
+            state: node_state::READY.into(),
+            boot: None,
+            seq: 0,
+            report: None,
+            last_seen: None,
+            created_at: 100,
+            removed_at: None,
+            draining: false,
+            kind: node_kind::WORKER.into(),
+        };
+        db.insert_scale_up("scl_1", b"t", b"sealed", "load", 100, 200)
+            .unwrap();
+        assert!(db.join_node(b"t", &node).unwrap());
+        let retire = |id: &str, origin: &str| Retirement {
+            node: "nod_a".into(),
+            id: id.into(),
+            origin: origin.into(),
+            migrate: true,
+            reason: "idle".into(),
+            state: retire_state::DRAINING.into(),
+            created_at: 300,
+            ready_at: None,
+            ended_at: None,
+            failed_moves: 0,
+        };
+        let first = db
+            .retire_node(&retire("ret_1", retire_origin::API))
+            .unwrap()
+            .unwrap();
+        let again = db
+            .retire_node(&retire("ret_2", retire_origin::AUTOSCALER))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.origin, retire_origin::API);
+        assert!(db.list_nodes().unwrap()[0].draining);
+        assert!(!db.set_node_draining("nod_a", false).unwrap());
+        assert!(db.list_nodes().unwrap()[0].draining);
+        db.set_retirement("nod_a", retire_state::READY, 0, 400)
+            .unwrap();
+        db.set_retirement("nod_a", retire_state::BLOCKED, 1, 500)
+            .unwrap();
+        let r = db.retirement("nod_a").unwrap().unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.ready_at),
+            (retire_state::READY, Some(400))
+        );
+        db.end_retirement_of("nod_a", 600).unwrap();
+        assert!(db.retirements(true).unwrap().is_empty());
+        let r = db.retirement("nod_a").unwrap().unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.ended_at),
+            (retire_state::REMOVED, Some(600))
+        );
+        assert!(db.set_node_draining("nod_a", false).unwrap());
+    }
+
+    #[test]
     fn scale_up_learns_the_node_that_joined_with_its_token() {
         let db = Db::memory().unwrap();
-        db.insert_scale_up("scl_1", b"t", "load", 100, 200).unwrap();
+        db.insert_scale_up("scl_1", b"t", b"sealed", "load", 100, 200)
+            .unwrap();
         db.insert_scale_down("scl_2", "nod_old", "idle", 101)
             .unwrap();
         let open = db.scale_requests(true, 10).unwrap();
@@ -3141,6 +3402,10 @@ mod tests {
             draining: false,
             kind: node_kind::WORKER.into(),
         };
+        assert_eq!(
+            db.scale_up_token("scl_1").unwrap().as_deref(),
+            Some(&b"sealed"[..])
+        );
         assert!(db.join_node(b"t", &node).unwrap());
         let up = db.scale_requests(true, 10).unwrap().pop().unwrap();
         assert_eq!(up.node.as_deref(), Some("nod_new"));

@@ -73,7 +73,17 @@ const METRICS: &[(&str, &str, &str)] = &[
     (
         "spawnbox_fleet_load",
         "gauge",
-        "Part of the slots or memory in use over the primary and its ready workers (0 to 1). Only with --autoscale-hook.",
+        "Part of the slots or memory in use over the primary and its ready workers that are not draining (0 to 1).",
+    ),
+    (
+        "spawnbox_fleet_create_refused_total",
+        "counter",
+        "Creates the primary refused because no host had room, by reason.",
+    ),
+    (
+        "spawnbox_fleet_retirements",
+        "gauge",
+        "Workers being retired, by state: draining, blocked or ready_to_terminate.",
     ),
 ];
 

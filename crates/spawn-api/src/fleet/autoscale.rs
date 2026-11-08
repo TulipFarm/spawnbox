@@ -1,11 +1,14 @@
-//! Adds and removes workers on its own. When the fleet is busy, the primary
-//! makes a join token and runs the operator's hook (a program or a webhook),
-//! which starts a machine that joins with it. When the fleet is idle, the
-//! primary drains the least used worker, moves its sandboxes away, runs the
-//! hook to stop the machine, and removes the node. A create that finds no
-//! room asks for a worker at once.
+//! Adds and removes workers through the operator's hook (a program or a
+//! webhook), so any cloud or tool can start and stop the machines. When the
+//! fleet is busy, the primary makes a join token and asks the hook for a
+//! machine that joins with it. If the hook fails, or a new leader does not
+//! know whether it ran, the same request (same ID and token) is sent again,
+//! so the hook can use the ID to start at most one machine. When the fleet
+//! is idle, the primary retires the least used worker (see `retire`), and
+//! once it is empty asks the hook to stop that machine. A create that finds
+//! no room asks for a worker at once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
 use super::primary::{self, Primary};
-use super::{Capacity, hex, local_capacity, migrate};
-use crate::db::{NodeRow, ScaleRequest, node_kind, node_state};
+use super::{Capacity, hex, local_capacity};
+use crate::db::{NodeRow, ScaleRequest, node_kind, node_state, retire_origin, retire_state};
 use crate::events::Origin;
 use crate::ids;
 use crate::model::{ApiError, rfc3339_ms};
@@ -130,7 +133,7 @@ struct Fleet {
     load: Option<f64>,
     /// Workers that are ready and not draining.
     active: usize,
-    /// Workers not removed, and the one asked for.
+    /// Workers not removed or retiring, and the one asked for.
     total: usize,
     pending_up: bool,
     scaling_down: bool,
@@ -143,8 +146,6 @@ enum Decision {
     Wait,
     Up(String),
     Down(String),
-    /// Let the worker being removed take sandboxes again.
-    CancelDown(String),
 }
 
 /// One step at a time: no new request while a worker is still to join.
@@ -167,9 +168,8 @@ fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
         None
     };
     if let Some(reason) = need {
-        if f.scaling_down {
-            return Decision::CancelDown(reason);
-        }
+        // A retiring worker never takes sandboxes again, so a worker is
+        // added even while one is being removed.
         if f.total < s.max_workers {
             return Decision::Up(reason);
         }
@@ -217,16 +217,9 @@ fn fleet_load(hosts: &[Capacity]) -> Option<f64> {
     .map(|r| r.clamp(0.0, 1.0))
 }
 
-/// What `GET /v1/nodes/autoscale` shows.
-#[derive(Clone, Copy, Default)]
-struct Status {
-    fleet: Fleet,
-    trend: Trend,
-}
-
 pub struct Autoscaler {
     settings: Settings,
-    status: Mutex<Status>,
+    status: Mutex<Trend>,
     refused: AtomicBool,
     wake: Notify,
 }
@@ -239,12 +232,8 @@ impl Autoscaler {
         self.wake.notify_one();
     }
 
-    pub fn load(&self) -> Option<f64> {
-        self.status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .fleet
-            .load
+    pub fn wake(&self) {
+        self.wake.notify_one();
     }
 }
 
@@ -252,12 +241,10 @@ impl Autoscaler {
 #[derive(Default)]
 struct Memory {
     trend: Trend,
-    /// No scale-up before this time, after a failed one.
-    up_not_before: i64,
-    /// Scale-downs whose hook failed, and when to try again.
+    /// Requests whose hook failed, and when to try again.
     retry_at: HashMap<String, i64>,
-    /// Drains of scale-downs are running in this process.
-    drains_resumed: bool,
+    /// Scale-ups whose hook ran in this process. Others are sent again.
+    sent: HashSet<String>,
 }
 
 /// Starts the autoscaler on a primary.
@@ -297,13 +284,16 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
     let p = primary::primary(app).map_err(|e| anyhow!(e.message))?;
     let now = now_ms();
     let nodes = app.db.list_nodes()?;
-    let counts = app.db.node_sandbox_counts()?;
     let mut fleet = Fleet {
         refused: scaler.refused.swap(false, Ordering::SeqCst),
         ..Fleet::default()
     };
-    let mut removing: Option<ScaleRequest> = None;
-    for request in app.db.scale_requests(true, 100)? {
+    let open = app.db.scale_requests(true, u32::MAX)?;
+    let open_ids: HashSet<String> = open.iter().map(|r| r.id.clone()).collect();
+    memory.retry_at.retain(|id, _| open_ids.contains(id));
+    memory.sent.retain(|id| open_ids.contains(id));
+    for request in open {
+        let due = memory.retry_at.get(&request.id).is_none_or(|at| now >= *at);
         match request.action.as_str() {
             UP => {
                 if let Some(node) = request.node.as_deref() {
@@ -313,68 +303,80 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
                     end(app, &request, None, why, "autoscale.failed");
                 } else {
                     fleet.pending_up = true;
+                    if due && !memory.sent.contains(&request.id) {
+                        send_up(app, p, s, &request, memory, now).await;
+                    }
                 }
             }
             DOWN => {
+                fleet.scaling_down = true;
                 let id = request.node.clone().unwrap_or_default();
-                match nodes.iter().find(|n| n.id == id) {
-                    None => end(
+                let Some(node) = nodes.iter().find(|n| n.id == id) else {
+                    end(
                         app,
                         &request,
                         None,
                         "the worker was removed",
-                        "autoscale.cancelled",
-                    ),
-                    Some(n) if !n.draining => end(
-                        app,
-                        &request,
-                        None,
-                        "the worker was undrained",
-                        "autoscale.cancelled",
-                    ),
-                    Some(n) => {
-                        let empty = counts.get(&n.id).copied().unwrap_or(0) == 0
-                            && !homes_volumes(app, &n.id)?;
-                        if !empty && !memory.drains_resumed {
-                            // The primary restarted while moving its sandboxes.
-                            let origin = Origin::system();
-                            tokio::spawn(migrate::drain(Arc::clone(app), n.id.clone(), origin));
+                        "autoscale.done",
+                    );
+                    continue;
+                };
+                match app.db.retirement(&id)? {
+                    Some(r) if r.ended_at.is_none() && r.state == retire_state::READY => {
+                        if due && !remove_worker(app, s, &request, node).await {
+                            memory.retry_at.insert(request.id.clone(), now + RETRY_MS);
                         }
-                        let due = memory.retry_at.get(&request.id).is_none_or(|at| now >= *at);
-                        if empty && due && remove_worker(app, s, &request, n).await {
-                            memory.retry_at.remove(&request.id);
-                        } else {
-                            if empty && due {
-                                memory.retry_at.insert(request.id.clone(), now + RETRY_MS);
-                            }
-                            removing = Some(request);
-                        }
+                    }
+                    Some(r) if r.ended_at.is_none() => {}
+                    // From before retirements: retire it now.
+                    _ => {
+                        primary::start_retirement(
+                            app,
+                            &id,
+                            retire_origin::AUTOSCALER,
+                            true,
+                            &request.reason,
+                            &Origin::system(),
+                        )
+                        .map_err(|e| anyhow!(e.message))?;
                     }
                 }
             }
             _ => {}
         }
     }
-    memory.drains_resumed = true;
-    memory
-        .retry_at
-        .retain(|id, _| removing.as_ref().is_some_and(|r| &r.id == id));
-    fleet.scaling_down = removing.is_some();
 
+    // A retirement by the autoscaler whose request was not stored, after a
+    // crash or a database error, gets one so its machine is stopped.
+    let open_retirements = app.db.retirements(true)?;
+    let downs: HashSet<String> = app
+        .db
+        .scale_requests(true, u32::MAX)?
+        .into_iter()
+        .filter(|r| r.action == DOWN)
+        .filter_map(|r| r.node)
+        .collect();
+    for r in &open_retirements {
+        if r.origin == retire_origin::AUTOSCALER && !downs.contains(&r.node) {
+            let id = ids::new_id("scl")?;
+            app.db.insert_scale_down(&id, &r.node, &r.reason, now)?;
+            requested(app, &id, DOWN, Some(&r.node), &r.reason);
+            fleet.scaling_down = true;
+        }
+    }
     let nodes = app.db.list_nodes()?;
+    let counts = app.db.node_sandbox_counts()?;
+    let retiring: HashSet<String> = open_retirements.into_iter().map(|r| r.node).collect();
     let workers: Vec<&NodeRow> = nodes
         .iter()
-        .filter(|n| n.kind == node_kind::WORKER)
+        .filter(|n| n.kind == node_kind::WORKER && !retiring.contains(&n.id))
         .collect();
     let active: Vec<&NodeRow> = workers
         .iter()
         .copied()
         .filter(|n| n.state == node_state::READY && !n.draining)
         .collect();
-    let live: HashMap<String, Capacity> = p.capacities().into_iter().collect();
-    let mut hosts = vec![local_capacity(app)];
-    hosts.extend(active.iter().filter_map(|n| live.get(&n.id).cloned()));
-    fleet.load = fleet_load(&hosts);
+    fleet.load = current_load(app, p)?;
     fleet.active = active.len();
     fleet.total = workers.len() + usize::from(fleet.pending_up);
     memory.trend.update(fleet.load, s, now);
@@ -382,14 +384,8 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
     match decide(s, &fleet, &memory.trend, now) {
         Decision::Wait => {}
         Decision::Up(reason) => {
-            if now >= memory.up_not_before {
-                memory.trend = Trend::default();
-                if scale_up(app, p, s, &reason, now).await? {
-                    fleet.pending_up = true;
-                } else {
-                    memory.up_not_before = now + RETRY_MS;
-                }
-            }
+            memory.trend = Trend::default();
+            scale_up(app, p, s, &reason, memory, now).await?;
         }
         Decision::Down(reason) => {
             memory.trend = Trend::default();
@@ -398,38 +394,61 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
                 .min_by_key(|n| (counts.get(&n.id).copied().unwrap_or(0), -n.created_at));
             if let Some(node) = pick {
                 scale_down(app, &node.id, &reason, now)?;
-                fleet.scaling_down = true;
-            }
-        }
-        Decision::CancelDown(reason) => {
-            memory.trend = Trend::default();
-            if let Some(request) = removing {
-                let id = request.node.clone().unwrap_or_default();
-                app.db.set_node_draining(&id, false)?;
-                app.sandboxes.hub.record(
-                    "node.undrained",
-                    &Origin::system(),
-                    None,
-                    None,
-                    json!({ "node": id, "migrate": false }),
-                );
-                let why = format!("kept the worker: {reason}");
-                end(app, &request, None, &why, "autoscale.cancelled");
-                fleet.scaling_down = false;
             }
         }
     }
-    let trend = memory.trend;
-    *scaler.status.lock().unwrap_or_else(|e| e.into_inner()) = Status { fleet, trend };
+    *scaler.status.lock().unwrap_or_else(|e| e.into_inner()) = memory.trend;
     Ok(())
 }
 
-fn homes_volumes(app: &App, node: &str) -> Result<bool> {
-    Ok(app
+/// Part of the slots or memory in use over the primary and its ready
+/// workers that are not draining, from 0 to 1.
+pub fn current_load(app: &App, p: &Primary) -> Result<Option<f64>> {
+    let live: HashMap<String, Capacity> = p.capacities().into_iter().collect();
+    let mut hosts = vec![local_capacity(app)];
+    for node in app.db.list_nodes()? {
+        if node.kind == node_kind::WORKER
+            && node.state == node_state::READY
+            && !node.draining
+            && let Some(capacity) = live.get(&node.id)
+        {
+            hosts.push(capacity.clone());
+        }
+    }
+    Ok(fleet_load(&hosts))
+}
+
+/// Workers by state, with draining and retiring ones counted apart.
+fn worker_counts(app: &App) -> Result<BTreeMap<&'static str, usize>> {
+    let retiring: HashSet<String> = app
         .db
-        .list_volumes(None)?
-        .iter()
-        .any(|v| v.node.as_deref() == Some(node)))
+        .retirements(true)?
+        .into_iter()
+        .map(|r| r.node)
+        .collect();
+    let mut counts: BTreeMap<&'static str, usize> =
+        ["ready", "suspect", "down", "draining", "retiring"]
+            .into_iter()
+            .map(|k| (k, 0))
+            .collect();
+    for node in app.db.list_nodes()? {
+        if node.kind != node_kind::WORKER {
+            continue;
+        }
+        let key = if retiring.contains(&node.id) {
+            "retiring"
+        } else if node.draining {
+            "draining"
+        } else {
+            match node.state.as_str() {
+                node_state::READY => "ready",
+                node_state::SUSPECT => "suspect",
+                _ => "down",
+            }
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    Ok(counts)
 }
 
 fn end(app: &App, request: &ScaleRequest, node: Option<&str>, outcome: &str, kind: &'static str) {
@@ -466,30 +485,35 @@ fn requested(app: &App, id: &str, action: &str, node: Option<&str>, reason: &str
     );
 }
 
-/// Makes a join token and asks the hook for a machine. False if the hook
-/// failed.
-async fn scale_up(app: &App, p: &Primary, s: &Settings, reason: &str, now: i64) -> Result<bool> {
+fn token_label(id: &str) -> String {
+    format!("scale_up:{id}")
+}
+
+/// Makes a join token and asks the hook for a machine.
+async fn scale_up(
+    app: &App,
+    p: &Primary,
+    s: &Settings,
+    reason: &str,
+    memory: &mut Memory,
+    now: i64,
+) -> Result<()> {
     let id = ids::new_id("scl")?;
     let token = primary::new_join_token().map_err(|e| anyhow!(e.message))?;
     let expires_at = now + JOIN_TTL_MS;
-    let ca_sha256 = p.ca_sha256()?;
-    app.db
-        .insert_scale_up(&id, &ids::hash_key(&token), reason, now, expires_at)?;
+    let sealed = app
+        .secrets
+        .sbox()
+        .seal(&token_label(&id), token.as_bytes())?;
+    app.db.insert_scale_up(
+        &id,
+        &ids::hash_key(&token),
+        &sealed,
+        reason,
+        now,
+        expires_at,
+    )?;
     requested(app, &id, UP, None, reason);
-    let body = json!({
-        "action": UP,
-        "id": id,
-        "reason": reason,
-        "join": {
-            "token": token,
-            "ca_sha256": ca_sha256,
-            "expires_at": rfc3339_ms(expires_at),
-        },
-    });
-    let env = [
-        ("SPAWNBOX_JOIN_TOKEN", token),
-        ("SPAWNBOX_PRIMARY_CA_SHA256", ca_sha256),
-    ];
     let request = ScaleRequest {
         id,
         action: UP.into(),
@@ -500,44 +524,103 @@ async fn scale_up(app: &App, p: &Primary, s: &Settings, reason: &str, now: i64) 
         ended_at: None,
         outcome: None,
     };
-    match call(&s.hook, UP, &request.id, &body, &env).await {
-        Ok(()) => Ok(true),
+    send_up(app, p, s, &request, memory, now).await;
+    Ok(())
+}
+
+/// Asks the hook for the machine of an open scale-up, with its token.
+async fn send_up(
+    app: &App,
+    p: &Primary,
+    s: &Settings,
+    request: &ScaleRequest,
+    memory: &mut Memory,
+    now: i64,
+) {
+    let token = app
+        .db
+        .scale_up_token(&request.id)
+        .ok()
+        .flatten()
+        .and_then(|sealed| app.secrets.sbox().open(&token_label(&request.id), &sealed))
+        .and_then(|plain| String::from_utf8(plain).ok());
+    let Some(token) = token else {
+        let why = "its join token is not stored; it was made by an older version";
+        end(app, request, None, why, "autoscale.failed");
+        return;
+    };
+    let ca_sha256 = match p.ca_sha256() {
+        Ok(ca) => ca,
         Err(error) => {
-            end(
-                app,
-                &request,
-                None,
-                &format!("hook failed: {error}"),
+            eprintln!("autoscale: {UP} {}: {error:#}", request.id);
+            memory.retry_at.insert(request.id.clone(), now + RETRY_MS);
+            return;
+        }
+    };
+    let expires_at = request.expires_at.unwrap_or(now);
+    let body = json!({
+        "action": UP,
+        "id": request.id,
+        "reason": request.reason,
+        "join": {
+            "token": token,
+            "ca_sha256": ca_sha256,
+            "expires_at": rfc3339_ms(expires_at),
+        },
+    });
+    let env = [
+        ("SPAWNBOX_JOIN_TOKEN", token),
+        ("SPAWNBOX_PRIMARY_CA_SHA256", ca_sha256),
+    ];
+    match call(&s.hook, UP, &request.id, &body, &env).await {
+        Ok(()) => {
+            memory.sent.insert(request.id.clone());
+            memory.retry_at.remove(&request.id);
+        }
+        Err(error) => {
+            eprintln!("autoscale: {UP} {}: hook failed: {error}", request.id);
+            app.sandboxes.hub.record(
                 "autoscale.failed",
+                &Origin::system(),
+                None,
+                None,
+                json!({
+                    "id": request.id,
+                    "action": UP,
+                    "outcome": format!(
+                        "hook failed: {error}; sending the same request again in {} s",
+                        RETRY_MS / 1000
+                    ),
+                }),
             );
-            Ok(false)
+            memory.retry_at.insert(request.id.clone(), now + RETRY_MS);
         }
     }
 }
 
-/// Drains `node` and moves its sandboxes away. The node is removed on a
-/// later tick, once it is empty.
+/// Retires `node`. Its machine is stopped on a later tick, once it is
+/// empty.
 fn scale_down(app: &AppState, node: &str, reason: &str, now: i64) -> Result<()> {
-    let id = ids::new_id("scl")?;
-    if !app.db.set_node_draining(node, true)? {
+    let retired = primary::start_retirement(
+        app,
+        node,
+        retire_origin::AUTOSCALER,
+        true,
+        reason,
+        &Origin::system(),
+    )
+    .map_err(|e| anyhow!(e.message))?;
+    if retired.is_none_or(|r| r.origin != retire_origin::AUTOSCALER) {
         return Ok(());
     }
+    let id = ids::new_id("scl")?;
     app.db.insert_scale_down(&id, node, reason, now)?;
-    let origin = Origin::system();
-    app.sandboxes.hub.record(
-        "node.draining",
-        &origin,
-        None,
-        None,
-        json!({ "node": node, "migrate": true }),
-    );
     requested(app, &id, DOWN, Some(node), reason);
-    tokio::spawn(migrate::drain(Arc::clone(app), node.to_owned(), origin));
     Ok(())
 }
 
-/// Asks the hook to stop the machine of an empty, draining worker, then
-/// removes the node. False if the hook failed.
+/// Asks the hook to stop the machine of a worker that is ready to
+/// terminate, then removes the node. False if the hook failed.
 async fn remove_worker(app: &App, s: &Settings, request: &ScaleRequest, node: &NodeRow) -> bool {
     let joined_for = app.db.scale_up_of(&node.id).ok().flatten();
     let body = json!({
@@ -664,7 +747,8 @@ fn request_view(r: &ScaleRequest) -> Value {
     })
 }
 
-/// `GET /v1/nodes/autoscale`.
+/// `GET /v1/nodes/autoscale`: the fleet's load and workers, and the
+/// autoscaler's settings and requests if it runs.
 pub async fn status(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
     let p = primary::primary(&app)?;
     let requests: Vec<Value> = app
@@ -673,13 +757,24 @@ pub async fn status(State(app): State<AppState>) -> Result<Json<Value>, ApiError
         .iter()
         .map(request_view)
         .collect();
+    let load = current_load(&app, p).map_err(ApiError::internal)?;
+    let workers = worker_counts(&app).map_err(ApiError::internal)?;
     let Some(scaler) = p.autoscaler.get() else {
-        return Ok(Json(json!({ "enabled": false, "requests": requests })));
+        return Ok(Json(json!({
+            "enabled": false,
+            "policy": "none",
+            "observed_at": rfc3339_ms(now_ms()),
+            "load": load,
+            "workers": workers,
+            "requests": requests,
+        })));
     };
     let s = &scaler.settings;
-    let Status { fleet, trend } = *scaler.status.lock().unwrap_or_else(|e| e.into_inner());
+    let trend = *scaler.status.lock().unwrap_or_else(|e| e.into_inner());
     Ok(Json(json!({
         "enabled": true,
+        "policy": "hook",
+        "observed_at": rfc3339_ms(now_ms()),
         "hook": match s.hook { Hook::Command(_) => "command", Hook::Webhook { .. } => "webhook" },
         "min_workers": s.min_workers,
         "max_workers": s.max_workers,
@@ -687,8 +782,8 @@ pub async fn status(State(app): State<AppState>) -> Result<Json<Value>, ApiError
         "up_after_s": s.up_after_ms / 1000,
         "down_pct": (s.down_ratio * 100.0).round(),
         "down_after_s": s.down_after_ms / 1000,
-        "load": fleet.load,
-        "workers": fleet.active,
+        "load": load,
+        "workers": workers,
         "high_since": trend.high_since.map(rfc3339_ms),
         "low_since": trend.low_since.map(rfc3339_ms),
         "requests": requests,
@@ -793,10 +888,7 @@ mod tests {
             scaling_down: true,
             ..fleet(0.9, 2)
         };
-        assert!(matches!(
-            after(&s, &busy_again, 120_000),
-            Decision::CancelDown(_)
-        ));
+        assert!(matches!(after(&s, &busy_again, 120_000), Decision::Up(_)));
     }
 
     #[test]

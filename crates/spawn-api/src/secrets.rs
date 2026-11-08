@@ -51,6 +51,11 @@ pub struct Secrets {
 }
 
 impl Secrets {
+    /// The key that seals secrets and other stored values.
+    pub fn sbox(&self) -> &SecretBox {
+        &self.sbox
+    }
+
     /// Decrypts every saved secret into `store`.
     pub fn load(db: Db, sbox: SecretBox, store: SecretStore) -> Result<Self> {
         for row in db.list_secrets()? {

@@ -820,6 +820,7 @@ async fn run(
                     }
                 }));
                 background.push(primary::watch(Arc::clone(&app)));
+                background.push(fleet::retire::start(Arc::clone(&app)));
                 if let Some(settings) = autoscale.take() {
                     background.push(fleet::autoscale::start(Arc::clone(&app), settings)?);
                 }
@@ -889,8 +890,26 @@ async fn metrics_text(
         ));
     }
     if let Role::Primary(p) = &app.role {
-        if let Some(load) = p.autoscaler.get().and_then(|a| a.load()) {
-            samples.push(("spawnbox_fleet_load", vec![], load));
+        match fleet::autoscale::current_load(&app, p) {
+            Ok(Some(load)) => samples.push(("spawnbox_fleet_load", vec![], load)),
+            Ok(None) => {}
+            Err(error) => eprintln!("metrics: fleet load: {error:#}"),
+        }
+        match app.db.retirements(true) {
+            Ok(open) => {
+                let mut counts = std::collections::BTreeMap::<String, u32>::new();
+                for r in open {
+                    *counts.entry(r.state).or_default() += 1;
+                }
+                for (state, count) in counts {
+                    samples.push((
+                        "spawnbox_fleet_retirements",
+                        vec![("state", state)],
+                        count.into(),
+                    ));
+                }
+            }
+            Err(error) => eprintln!("metrics: retirements: {error}"),
         }
         match app.db.list_nodes() {
             Ok(nodes) => {

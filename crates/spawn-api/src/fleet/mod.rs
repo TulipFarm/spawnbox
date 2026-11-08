@@ -10,6 +10,7 @@ pub mod forward;
 pub mod migrate;
 pub mod pki;
 pub mod primary;
+pub mod retire;
 pub mod volumes;
 pub mod worker;
 

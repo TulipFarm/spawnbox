@@ -27,13 +27,16 @@ use super::autoscale::Autoscaler;
 use super::forward::{self, Failure};
 use super::migrate::{self, MigrateInput, Moves};
 use super::pki::{FleetCa, Identity, Peer};
+use super::retire::{self, Busy, Retirer};
 use super::volumes::Need;
 use super::{
     Capacity, Config, ConfigRequest, DOWN_AFTER_MS, EgressCa, EventBatch, EventReply, Heartbeat,
     HeartbeatReply, JoinReply, JoinRequest, KeyCopy, NODE_HEADER, ROUTE_HEADER, Routes,
     SUSPECT_AFTER_MS, SecretPush, SyncReply, TemplateCopy, UsageBatch, check_node_url, hex,
 };
-use crate::db::{self, NodeRow, VolumeRef, node_kind, node_state, state};
+use crate::db::{
+    self, NodeRow, Retirement, VolumeRef, node_kind, node_state, retire_origin, retire_state, state,
+};
 use crate::events::Origin;
 use crate::ids;
 use crate::model::{
@@ -80,6 +83,9 @@ pub struct Primary {
     egress_ca: EgressCa,
     /// Set when the primary runs with `--autoscale-hook`.
     pub autoscaler: OnceLock<Arc<Autoscaler>>,
+    /// Calls that may still put a sandbox on each node.
+    pub busy: Busy,
+    pub retirer: Retirer,
 }
 
 impl Primary {
@@ -100,6 +106,8 @@ impl Primary {
             volume_lock: tokio::sync::RwLock::new(()),
             egress_ca,
             autoscaler: OnceLock::new(),
+            busy: Busy::default(),
+            retirer: Retirer::default(),
         })
     }
 
@@ -712,11 +720,16 @@ pub async fn create(
     let placed = place_any(app, tenant, req, headers, body, origin, &span).await;
     if let Err(error) = &placed {
         span.fail(error.message.clone());
-        if error.code == Code::NoCapacity
-            && let Ok(p) = primary(app)
-            && let Some(scaler) = p.autoscaler.get()
-        {
-            scaler.refused();
+        if error.code == Code::NoCapacity {
+            crate::metrics::inc(
+                "spawnbox_fleet_create_refused_total",
+                vec![("reason", "no_capacity".into())],
+            );
+            if let Ok(p) = primary(app)
+                && let Some(scaler) = p.autoscaler.get()
+            {
+                scaler.refused();
+            }
         }
     }
     placed
@@ -911,6 +924,7 @@ async fn place(
     if let Some(live) = p.live().get_mut(&node.id) {
         live.placing += 1;
     }
+    let busy = p.busy.hold(&node.id);
     let sent = forward::send(tls, &node.url, out).await;
     if let Some(live) = p.live().get_mut(&node.id) {
         live.placing = live.placing.saturating_sub(1);
@@ -952,6 +966,7 @@ async fn place(
             app.db.put_mirror(&node.id, &mirror, now_ms())?;
         }
     }
+    drop(busy);
     Ok(Placed::Done(
         Response::from_parts(parts, Body::from(bytes)),
         false,
@@ -1114,6 +1129,7 @@ async fn forward_fork(app: &App, node: &str, id: &str, req: Request) -> Result<R
             source.memory_mib,
         )?);
     }
+    let busy = primary(app)?.busy.hold(node);
     let resp = forward(
         app,
         node,
@@ -1139,7 +1155,7 @@ async fn forward_fork(app: &App, node: &str, id: &str, req: Request) -> Result<R
             }
         }
     }
-    drop(reservations);
+    drop((reservations, busy));
     Ok(Response::from_parts(parts, Body::from(bytes)))
 }
 
@@ -1216,7 +1232,7 @@ pub async fn new_token(
     ))
 }
 
-fn node_view(p: &Primary, node: &NodeRow, sandboxes: usize) -> Value {
+fn node_view(p: &Primary, node: &NodeRow, sandboxes: usize, retired: Option<&Retirement>) -> Value {
     let report: Value = node
         .report
         .as_deref()
@@ -1233,6 +1249,7 @@ fn node_view(p: &Primary, node: &NodeRow, sandboxes: usize) -> Value {
         "capacity": report.get("capacity"),
         "config_current": report.get("config_version").and_then(Value::as_u64) == Some(p.version()),
         "sandboxes": sandboxes,
+        "retirement": retired.map(|r| retire::view(r, &p.retirer.waiting_for(&r.node))),
     })
 }
 
@@ -1243,11 +1260,20 @@ fn node_not_found() -> ApiError {
 pub async fn list_nodes(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
     let p = primary(&app)?;
     let counts = app.db.node_sandbox_counts()?;
+    let retired: HashMap<String, Retirement> = app
+        .db
+        .retirements(false)?
+        .into_iter()
+        .map(|r| (r.node.clone(), r))
+        .collect();
     let nodes: Vec<Value> = app
         .db
         .list_nodes()?
         .iter()
-        .map(|n| node_view(p, n, counts.get(&n.id).copied().unwrap_or(0)))
+        .map(|n| {
+            let count = counts.get(&n.id).copied().unwrap_or(0);
+            node_view(p, n, count, retired.get(&n.id))
+        })
         .collect();
     Ok(Json(json!({ "nodes": nodes })))
 }
@@ -1262,12 +1288,7 @@ pub async fn get_node(
         .get_node(&id)?
         .filter(|n| n.state != node_state::REMOVED)
         .ok_or_else(node_not_found)?;
-    let counts = app.db.node_sandbox_counts()?;
-    Ok(Json(node_view(
-        p,
-        &node,
-        counts.get(&id).copied().unwrap_or(0),
-    )))
+    Ok(Json(view_of(&app, p, &node)?))
 }
 
 /// `DELETE /v1/nodes/{id}`: the node can no longer call or be called. Its
@@ -1295,6 +1316,7 @@ pub(super) fn remove(app: &App, id: &str, origin: &Origin) -> Result<bool, ApiEr
         return Ok(false);
     }
     p.forget(id);
+    retire::forget(app, id);
     if edge {
         // Workers stop taking its calls with their next config copy.
         p.bump();
@@ -1315,6 +1337,17 @@ pub(super) fn remove(app: &App, id: &str, origin: &Origin) -> Result<bool, ApiEr
     Ok(true)
 }
 
+fn view_of(app: &App, p: &Primary, node: &NodeRow) -> Result<Value, ApiError> {
+    let counts = app.db.node_sandbox_counts()?;
+    let retired = app.db.retirement(&node.id)?;
+    Ok(node_view(
+        p,
+        node,
+        counts.get(&node.id).copied().unwrap_or(0),
+        retired.as_ref(),
+    ))
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct DrainInput {
@@ -1323,8 +1356,23 @@ struct DrainInput {
     migrate: bool,
 }
 
-/// `POST /v1/nodes/{id}:drain` and `POST /v1/nodes/{id}:undrain`. A
-/// draining node gets no new sandboxes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireInput {
+    /// Move its sandboxes away. If false, wait for them to end.
+    #[serde(default = "yes")]
+    migrate: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `POST /v1/nodes/{id}:drain`, `:undrain` and `:retire`. A draining node
+/// gets no new sandboxes. A retiring one also never takes them again: it
+/// is emptied until its machine can be stopped.
 pub async fn node_action(
     State(app): State<AppState>,
     axum::extract::Extension(origin): axum::extract::Extension<Origin>,
@@ -1338,6 +1386,7 @@ pub async fn node_action(
     let draining = match verb {
         "drain" => true,
         "undrain" => false,
+        "retire" => return retire_node(&app, p, id, &body, &origin),
         _ => return Err(ApiError::new(Code::NotFound, "no such endpoint")),
     };
     let input: DrainInput = if body.is_empty() {
@@ -1358,6 +1407,12 @@ pub async fn node_action(
         ));
     }
     if !app.db.set_node_draining(id, draining)? {
+        if app.db.retirement(id)?.is_some_and(|r| r.ended_at.is_none()) {
+            return Err(ApiError::new(
+                Code::Conflict,
+                "the node is retiring; it cannot take sandboxes again",
+            ));
+        }
         return Err(node_not_found());
     }
     let kind = if draining {
@@ -1377,14 +1432,95 @@ pub async fn node_action(
         tokio::spawn(migrate::drain(Arc::clone(&app), id.to_owned(), origin));
     }
     let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
-    let counts = app.db.node_sandbox_counts()?;
-    let view = node_view(p, &node, counts.get(id).copied().unwrap_or(0));
+    let view = view_of(&app, p, &node)?;
     let status = if input.migrate {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
     Ok((status, Json(view)))
+}
+
+fn retire_node(
+    app: &AppState,
+    p: &Primary,
+    id: &str,
+    body: &Bytes,
+    origin: &Origin,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let input: RetireInput = if body.is_empty() {
+        parse(&Bytes::from_static(b"{}"))?
+    } else {
+        parse(body)?
+    };
+    if app
+        .db
+        .get_node(id)?
+        .is_some_and(|n| n.kind == node_kind::EDGE)
+    {
+        return Err(ApiError::invalid(
+            "an edge runs no sandboxes; remove it with DELETE",
+        ));
+    }
+    let retired = start_retirement(
+        app,
+        id,
+        retire_origin::API,
+        input.migrate,
+        input.reason.as_deref().unwrap_or("asked through the API"),
+        origin,
+    )?
+    .ok_or_else(node_not_found)?;
+    let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
+    let counts = app.db.node_sandbox_counts()?;
+    let view = node_view(
+        p,
+        &node,
+        counts.get(id).copied().unwrap_or(0),
+        Some(&retired),
+    );
+    Ok((StatusCode::ACCEPTED, Json(view)))
+}
+
+/// Starts retiring `node`, or returns its retirement if it already is.
+/// `None` if it is not an active worker.
+pub(super) fn start_retirement(
+    app: &App,
+    node: &str,
+    by: &str,
+    migrate: bool,
+    reason: &str,
+    origin: &Origin,
+) -> Result<Option<Retirement>, ApiError> {
+    let p = primary(app)?;
+    let now = now_ms();
+    let new = Retirement {
+        node: node.to_owned(),
+        id: ids::new_id("ret").map_err(ApiError::internal)?,
+        origin: by.to_owned(),
+        migrate,
+        reason: reason.to_owned(),
+        state: retire_state::DRAINING.to_owned(),
+        created_at: now,
+        ready_at: None,
+        ended_at: None,
+        failed_moves: 0,
+    };
+    let Some(retired) = app.db.retire_node(&new)? else {
+        return Ok(None);
+    };
+    if retired.id == new.id {
+        eprintln!("node {node}: retiring ({reason})");
+        app.sandboxes.hub.record(
+            "node.retiring",
+            origin,
+            None,
+            None,
+            json!({ "node": node, "id": retired.id, "origin": by, "migrate": migrate, "reason": reason }),
+        );
+        p.retirer.wake();
+    }
+    Ok(Some(retired))
 }
 
 /// `POST /v1/sandboxes/{id}:migrate`: moves a sandbox to another host.

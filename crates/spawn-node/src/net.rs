@@ -309,6 +309,7 @@ fn ns_rules(guest: &str, dns: Ipv4Addr, mode: NetMode) -> String {
   chain forward {{
     type filter hook forward priority filter; policy drop;
     ct state established,related accept
+    iifname "{guest}" meta nfproto ipv6 drop
     iifname "{guest}" oifname "veth0" ct status dnat accept
     iifname "{guest}" oifname "veth0" ip daddr {{ {BLOCKED} }} drop
     iifname "{guest}" oifname "veth0" tcp dport 25 drop

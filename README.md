@@ -757,7 +757,9 @@ Prometheus adds the `instance` label.
 | `spawnbox_warm_pool_ready` (gauge) | `template`, `build`, `network` | Warm VMs ready |
 | `spawnbox_warm_pool_hits_total`, `spawnbox_warm_pool_misses_total` | `build` | Creates that got or did not get a warm VM |
 | `spawnbox_fleet_nodes` (gauge) | `state` | Primary only: workers in each state |
-| `spawnbox_fleet_load` (gauge) | None | Primary only: load of the fleet for the autoscaler, from 0 to 1 |
+| `spawnbox_fleet_load` (gauge) | None | Primary only: load of the primary and the ready workers that are not drained, from 0 to 1 |
+| `spawnbox_fleet_create_refused_total` (counter) | `reason` | Primary only: creates refused with `no_capacity` |
+| `spawnbox_fleet_retirements` (gauge) | `state` | Primary only: workers that retire, in each state (`draining`, `blocked`, `ready_to_terminate`) |
 
 ## Use more than one host
 
@@ -1108,11 +1110,52 @@ To remove an edge, use `DELETE /v1/nodes/NODE_ID`. After approximately
 To add the same host again, remove `/var/lib/spawnbox/fleet/worker/` on
 the worker. Then do [step 3](#step-3-add-a-worker) with a new token.
 
+### Retire a worker safely
+
+To stop a worker machine without losing sandboxes, retire it first. A
+retired worker takes no new sandboxes and never takes them again. Use
+this before you stop the machine for a spot interruption, an Auto Scaling
+group scale-in or any other reason.
+
+1. On the primary, type:
+
+   ```sh
+   curl -s -H "$A" -X POST http://127.0.0.1:8080/v1/nodes/NODE_ID:retire \
+     -d '{"reason":"spot interruption"}'
+   ```
+
+   The primary moves the sandboxes of the worker to other hosts. With
+   `{"migrate":false}`, it waits for them to end instead.
+
+2. Get the worker until `retirement.state` is `ready_to_terminate`:
+
+   ```sh
+   curl -s -H "$A" http://127.0.0.1:8080/v1/nodes/NODE_ID
+   ```
+
+   `retirement.waiting_for` tells what the primary still waits for:
+   `sandboxes`, `volumes`, `calls` (requests to the worker that are not
+   done), `settle` (3 minutes after the retirement started) or
+   `heartbeat` (a report from the worker after that time). If a sandbox
+   cannot move, the state is `blocked`, and the primary tries again every
+   minute.
+
+3. Stop the machine. Then remove the worker:
+
+   ```sh
+   curl -s -H "$A" -X DELETE http://127.0.0.1:8080/v1/nodes/NODE_ID
+   ```
+
+You cannot undo a retirement. `:undrain` gives `409` while a worker
+retires. Do not use `systemctl stop` or `SIGTERM` to drain a worker: the
+worker stops, and its sandboxes are lost.
+
 ### Add and remove workers automatically
 
-The primary can start and stop workers for you. It does not know your
-cloud. It calls your hook: a program or a webhook. The hook starts or
-stops a machine on AWS, Azure or any other cloud.
+The primary can ask for workers when it is busy, and give them back when
+it is idle. It does not know your cloud. It calls your hook: a program or
+a webhook. The hook starts or stops a machine with the AWS CLI,
+Terraform, Pulumi or any other tool.
 
 How it decides:
 
@@ -1123,65 +1166,67 @@ How it decides:
   worker at once. It does not wait for `--autoscale-up-after-s`.
 - If the load stays above `--autoscale-up-pct` for
   `--autoscale-up-after-s`, or there are fewer workers than
-  `--autoscale-min-workers`, the primary asks for one more worker.
+  `--autoscale-min-workers`, the primary asks for one more worker
+  (`scale_up`).
 - If the load stays below `--autoscale-down-pct` for
-  `--autoscale-down-after-s`, the primary drains the worker with the
-  fewest sandboxes and moves its sandboxes. When the worker is empty,
-  it calls the hook to stop the machine, then removes the worker.
-- It does one change at a time. It never goes above
-  `--autoscale-max-workers`. If the load goes up while a worker drains,
-  it undrains the worker instead of asking for a new one.
-- A new worker must join within 30 minutes. If it does not, or the hook
-  fails, the primary waits 5 minutes before it asks again.
+  `--autoscale-down-after-s`, the primary
+  [retires](#retire-a-worker-safely) the worker with the fewest
+  sandboxes. When it is `ready_to_terminate`, the primary calls the hook
+  to stop the machine (`scale_down`), then removes the worker.
+- It asks for one worker at a time, and never goes above
+  `--autoscale-max-workers`. Retiring workers do not count. If the load
+  goes up while a worker retires, the primary asks for a new worker.
+- A new worker must join within 30 minutes.
+- If the hook fails, the primary sends the same request again after 5
+  minutes. A new primary that takes over also sends the open `scale_up`
+  requests again, because it cannot know if the hook ran. The request ID
+  and the join token stay the same. **Your hook must start at most one
+  machine for each request ID.** On AWS, use the ID as the client token
+  of `run-instances`.
 
-To use a program:
+#### Use the AWS example
 
-1. Write the program, for example `/etc/spawnbox/autoscale.sh`. This
-   example uses AWS. Make an EC2 launch template `spawnbox-worker` with
-   an image that has Spawnbox installed (do [step 1](#step-1-prepare-the-hosts)
-   and the [install command](#step-4-install-spawnbox) once, then make an
-   image). Change `PRIMARY` to
-   the `--fleet-listen` URL of your primary.
+[`deploy/aws/terraform`](deploy/aws/terraform) has the parts for AWS:
+
+- A launch template for workers: Ubuntu 24.04 with nested
+  virtualization (C8i, M8i or R8i), and the metadata service only for
+  the host itself (IMDSv2, hop limit 1).
+- A security group: the primary calls workers on port 7444, and workers
+  call the primary on port 7443.
+- An instance profile for the primary. It can start workers only from
+  the template, and stop only instances with the tag
+  `spawnbox-fleet`.
+- [`aws-hook.sh`](deploy/aws/terraform/aws-hook.sh): the hook. A new
+  worker installs Spawnbox with the
+  [install command](#step-4-install-spawnbox) and joins with its token.
+
+1. Make the parts. Use private subnets in the VPC of the primary:
 
    ```sh
-#!/bin/sh
-# /etc/spawnbox/autoscale.sh: starts and stops Spawnbox workers on AWS.
-set -eu
-PRIMARY=https://10.0.0.1:7443
-case "$1" in
-scale_up)
-  boot=$(mktemp)
-  cat > "$boot" <<EOF
-#!/bin/sh
-ip=\$(hostname -I | cut -d' ' -f1)
-cat > /etc/spawnbox/spawnbox.env <<END
-SPAWNBOX_ARGS="--preview-url http://{label}.localhost:8081 --primary $PRIMARY --node-listen \$ip:7444 --advertise https://\$ip:7444 --primary-ca-sha256 $SPAWNBOX_PRIMARY_CA_SHA256"
-SPAWNBOX_JOIN_TOKEN=$SPAWNBOX_JOIN_TOKEN
-END
-systemctl restart spawnbox
-EOF
-  aws ec2 run-instances \
-    --launch-template LaunchTemplateName=spawnbox-worker \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=spawnbox-request,Value=$SPAWNBOX_REQUEST_ID}]" \
-    --user-data "file://$boot"
-  rm -f "$boot"
-  ;;
-scale_down)
-  ip=$(echo "$SPAWNBOX_NODE_URL" | sed 's|https://||; s|:.*||')
-  id=$(aws ec2 describe-instances \
-    --filters "Name=private-ip-address,Values=$ip" "Name=instance-state-name,Values=running" \
-    --query 'Reservations[].Instances[].InstanceId' --output text)
-  aws ec2 terminate-instances --instance-ids "$id"
-  ;;
-esac
+   cd deploy/aws/terraform
+   terraform init
+   terraform apply -var region=ap-south-1 \
+     -var 'subnet_ids=["subnet-..."]' \
+     -var primary_security_group_id=sg-... \
+     -var primary_url=https://10.0.0.1:7443
    ```
 
-   On Azure, use `az vm create --custom-data` and `az vm delete` in the
-   same way.
+2. Attach the instance profile `primary_instance_profile` to the
+   primary. Install the AWS CLI on the primary.
+3. On the primary, install the hook and its settings:
 
-2. Make it executable: `sudo chmod 755 /etc/spawnbox/autoscale.sh`.
-3. On the primary, add these flags to `SPAWNBOX_ARGS` and restart:
-   `--autoscale-hook /etc/spawnbox/autoscale.sh --autoscale-max-workers 10`.
+   ```sh
+   sudo install -m 755 aws-hook.sh /etc/spawnbox/aws-hook.sh
+   terraform output -raw hook_env | sudo tee /etc/spawnbox/aws-hook.env
+   ```
+
+4. Add these flags to `SPAWNBOX_ARGS` on the primary and restart:
+   `--autoscale-hook /etc/spawnbox/aws-hook.sh --autoscale-max-workers 10`.
+
+With Pulumi or another tool, make the same parts and use the same hook.
+On Azure or GCP, change the `aws` commands in the hook.
+
+#### Write your own hook
 
 The primary runs the program with one argument, `scale_up` or
 `scale_down`. Exit code `0` means success. The program can run for at
@@ -1191,12 +1236,14 @@ the request as JSON on stdin, and these environment variables:
 | Variable | Action | Value |
 |---|---|---|
 | `SPAWNBOX_ACTION` | Both | `scale_up` or `scale_down` |
-| `SPAWNBOX_REQUEST_ID` | Both | ID of the request, for example `scl_...` |
+| `SPAWNBOX_REQUEST_ID` | Both | ID of the request, for example `scl_...`. The same request can come again. |
 | `SPAWNBOX_JOIN_TOKEN` | `scale_up` | Join token for the new worker |
 | `SPAWNBOX_PRIMARY_CA_SHA256` | `scale_up` | Value for `--primary-ca-sha256` |
 | `SPAWNBOX_NODE_ID` | `scale_down` | ID of the worker to stop |
 | `SPAWNBOX_NODE_URL` | `scale_down` | `--advertise` URL of the worker |
 | `SPAWNBOX_NODE_SCALE_UP` | `scale_down` | ID of the `scale_up` request that made the worker, or empty |
+
+A `scale_down` for a machine that is already gone must also exit `0`.
 
 To use a webhook, give a URL to `--autoscale-hook`, for example
 `--autoscale-hook https://hooks.example.com/spawnbox`. The URL must use
@@ -1214,15 +1261,28 @@ With `--autoscale-secret` (or `SPAWNBOX_AUTOSCALE_SECRET`), each request
 has the header `X-Spawnbox-Signature: sha256=<hex>`. The value is the
 HMAC-SHA256 of the body with the secret.
 
+#### Use your own autoscaler
+
+Without `--autoscale-hook`, the primary does not start or stop machines,
+but it still shows what an autoscaler needs. Your tool can read these and
+start machines, then retire workers with `:retire` before it stops them:
+
+- `GET /v1/nodes/autoscale`: the load, the number of workers in each
+  state (`ready`, `suspect`, `down`, `draining`, `retiring`) and recent
+  requests. With a hook, also the settings.
+- The metrics `spawnbox_fleet_load`,
+  `spawnbox_fleet_create_refused_total` and
+  `spawnbox_fleet_retirements`. Refer to
+  [See metrics in Prometheus](#see-metrics-in-prometheus).
+
 To see the state, type:
 
 ```sh
 curl -s -H "$A" http://127.0.0.1:8080/v1/nodes/autoscale
 ```
 
-The response has the load, the workers, the settings and the last 20
-requests. The events `autoscale.requested`, `autoscale.done`,
-`autoscale.failed` and `autoscale.cancelled` also show each request.
+The events `autoscale.requested`, `autoscale.done`, `autoscale.failed`,
+`node.retiring` and `node.retired` show each request and retirement.
 
 ## API reference
 
@@ -1595,19 +1655,23 @@ These calls operate only on a primary. The key must have the scope
 | --- | --- |
 | `POST /v1/nodes/tokens` | Make a join token. Optional body: `{"ttl_s": 3600}`, from 60 to 604800. The response has `token`, `expires_at` and `ca_sha256`. |
 | `GET /v1/nodes` | List the workers and edges that are not removed |
-| `GET /v1/nodes/autoscale` | Get the state of the autoscaler. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
+| `GET /v1/nodes/autoscale` | Get the load, the workers in each state and the autoscaler requests. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `GET /v1/nodes/{id}` | Get one worker or edge |
 | `DELETE /v1/nodes/{id}` | Remove a worker or an edge. The sandboxes of a worker are marked deleted. |
 | `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes to other hosts. Gives `202` when it moves sandboxes. |
-| `POST /v1/nodes/{id}:undrain` | Put new sandboxes on the worker again |
+| `POST /v1/nodes/{id}:undrain` | Put new sandboxes on the worker again. Gives `409` if the worker retires. |
+| `POST /v1/nodes/{id}:retire` | Retire the worker before you stop its machine. Optional body: `{"migrate":true,"reason":"..."}`. Gives `202`. Refer to [Retire a worker safely](#retire-a-worker-safely). |
 | `POST /v1/sandboxes/{id}:migrate` | Move one sandbox to a different host. Optional body: `{"node":"nod_..."}` or `{"node":"primary"}`. |
 
 Each node has `id`, `kind` (`worker` or `edge`), `url`, `state` (`ready`, `suspect`, `down`),
-`draining`, `last_seen`, `sandboxes`, `config_current` and `capacity`
+`draining`, `last_seen`, `sandboxes`, `config_current`, `retirement` and `capacity`
 (free slots, free memory, reserved memory and its limit, whether memory is
 short, ready templates,
 warm VMs, CPU model and `fingerprint`). Sandboxes move only between hosts with the same
-`fingerprint` and CPU model.
+`fingerprint` and CPU model. `retirement` is `null`, or has `id`,
+`origin` (`api` or `autoscaler`), `state` (`draining`, `blocked`,
+`ready_to_terminate` or `removed`), `migrate`, `reason`, `created_at`,
+`ready_at`, `ended_at`, `failed_moves` and `waiting_for`.
 
 Each sandbox has the field `node`: the ID of the worker that runs it, or
 `null` for the primary.
