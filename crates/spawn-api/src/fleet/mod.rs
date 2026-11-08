@@ -373,9 +373,93 @@ pub fn check_node_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The primary's fleet URLs: the leader's and its standbys'. Standbys do
+/// not listen, so calls go to the URL that answered last and move to the
+/// next when it cannot be reached.
+pub struct Primaries {
+    urls: Vec<String>,
+    current: std::sync::atomic::AtomicUsize,
+}
+
+impl Primaries {
+    /// One URL, or several separated by commas.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let urls: Vec<String> = text.split(',').map(|u| u.trim().to_owned()).collect();
+        for url in &urls {
+            check_node_url(url).map_err(|e| format!("{url}: {e}"))?;
+        }
+        Ok(Self {
+            urls,
+            current: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The URL that answered last.
+    pub fn current(&self) -> &str {
+        let i = self.current.load(std::sync::atomic::Ordering::Relaxed);
+        &self.urls[i % self.urls.len()]
+    }
+
+    /// Moves on from `url`, which could not be reached.
+    pub fn unreachable(&self, url: &str) {
+        if let Some(i) = self.urls.iter().position(|u| u == url) {
+            let next = (i + 1) % self.urls.len();
+            let _ = self.current.compare_exchange(
+                i,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Tries each URL once, from the current one, until one is reached.
+    pub async fn call<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        tls: &Arc<rustls::ClientConfig>,
+        path: &str,
+        node: Option<&str>,
+        body: &T,
+    ) -> Result<R, forward::Failure> {
+        let mut last = None;
+        for _ in 0..self.urls.len() {
+            let url = self.current().to_owned();
+            match forward::call(Arc::clone(tls), &url, path, node, body).await {
+                Err(forward::Failure::Unreachable(error)) => {
+                    self.unreachable(&url);
+                    last = Some(error);
+                }
+                result => return result,
+            }
+        }
+        Err(forward::Failure::Unreachable(
+            last.unwrap_or_else(|| anyhow::anyhow!("no primary URL")),
+        ))
+    }
+}
+
+impl std::fmt::Display for Primaries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.urls.join(","))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primaries_move_on_when_unreachable() {
+        let p = Primaries::parse("https://a:1, https://b:2").unwrap();
+        assert_eq!(p.current(), "https://a:1");
+        p.unreachable("https://b:2");
+        assert_eq!(p.current(), "https://a:1");
+        p.unreachable("https://a:1");
+        assert_eq!(p.current(), "https://b:2");
+        p.unreachable("https://b:2");
+        assert_eq!(p.current(), "https://a:1");
+        assert!(Primaries::parse("https://a:1,http://b:2").is_err());
+    }
 
     #[test]
     fn hex_round_trips() {

@@ -1059,8 +1059,8 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-impl From<rusqlite::Error> for ApiError {
-    fn from(error: rusqlite::Error) -> Self {
+impl From<crate::db::Error> for ApiError {
+    fn from(error: crate::db::Error) -> Self {
         Self::internal(format!("database: {error}"))
     }
 }

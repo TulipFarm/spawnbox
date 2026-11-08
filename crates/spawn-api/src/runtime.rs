@@ -418,7 +418,7 @@ impl Sandboxes {
     }
 
     /// Counts every sandbox's usage up to now and writes what is collected.
-    pub fn flush_usage(&self) -> rusqlite::Result<()> {
+    pub fn flush_usage(&self) -> crate::db::Result<()> {
         {
             let now = now_ms();
             let mut inner = self.inner();
@@ -494,7 +494,7 @@ impl Sandboxes {
     }
 
     /// `tenant`'s egress bytes this UTC month.
-    pub fn month_egress(&self, tenant: &str) -> rusqlite::Result<u64> {
+    pub fn month_egress(&self, tenant: &str) -> crate::db::Result<u64> {
         self.meter.month_egress(tenant, now_ms())
     }
 

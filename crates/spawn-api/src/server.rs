@@ -182,6 +182,21 @@ pub struct Args {
     /// secrets cannot be read. Default: <data-dir>/secrets.key.
     #[arg(long)]
     secrets_key_file: Option<PathBuf>,
+    /// Keep state in this Postgres database instead of SQLite in the data
+    /// directory: `postgres://user:password@host:5432/spawnbox`. Primaries
+    /// that share it fail over: one serves, the others wait and take over
+    /// about 15 s after it stops. They need the same secrets key.
+    #[arg(long, env = "SPAWNBOX_DATABASE_URL", conflicts_with = "primary")]
+    database_url: Option<String>,
+    /// PEM CA certificates the database's TLS certificate must come from.
+    /// Without it, TLS is used when the server offers it, with any
+    /// certificate.
+    #[arg(long, requires = "database_url")]
+    database_ca_file: Option<PathBuf>,
+    /// On the first start, copy this SQLite database (such as
+    /// <data-dir>/spawnbox.db) into the empty `--database-url` database.
+    #[arg(long, requires = "database_url")]
+    import_sqlite: Option<PathBuf>,
     /// Address the preview proxy listens on. It routes by host name, so
     /// point a wildcard DNS name at it.
     #[arg(long, default_value = "127.0.0.1:8081")]
@@ -253,8 +268,9 @@ pub struct Args {
     fleet_listen: Option<SocketAddr>,
     /// Run as a fleet worker of the primary at this URL, which is its
     /// `--fleet-listen` address: `https://host:port`. A worker serves only
-    /// `--node-listen`; clients call the primary.
-    #[arg(long, requires_all = ["node_listen", "advertise"], value_parser = parse_node_url)]
+    /// `--node-listen`; clients call the primary. With primaries that fail
+    /// over, list each one, separated by commas.
+    #[arg(long, requires_all = ["node_listen", "advertise"], value_parser = parse_primaries)]
     primary: Option<String>,
     /// One-time token from `POST /v1/nodes/tokens` on the primary. Needed
     /// only for the first start.
@@ -323,6 +339,12 @@ fn autoscale_settings(args: &Args) -> Result<Option<fleet::autoscale::Settings>>
     }))
 }
 
+/// One URL, or the leader's and standbys' URLs separated by commas.
+pub fn parse_primaries(text: &str) -> Result<String, String> {
+    fleet::Primaries::parse(text)?;
+    Ok(text.to_owned())
+}
+
 pub fn parse_node_url(text: &str) -> Result<String, String> {
     fleet::check_node_url(text)?;
     Ok(text.to_owned())
@@ -386,12 +408,33 @@ pub async fn serve(args: Args) -> Result<()> {
         bail!("run as root: it creates jails, cgroups, network namespaces and firewall rules");
     }
     let data = crate::open_data_dir(&args.data_dir)?;
-    let db = Db::open(&data.join(crate::DB_FILE)).context("open database")?;
+    let db = crate::leader::open(
+        &data,
+        args.database_url.as_deref(),
+        args.database_ca_file.as_deref(),
+    )?;
     let key_file = args
         .secrets_key_file
         .clone()
         .unwrap_or_else(|| data.join("secrets.key"));
     let sbox = SecretBox::open_or_create(&key_file).context("open secrets key")?;
+    if let Some(url) = &args.database_url {
+        let target = crate::leader::target(url, args.database_ca_file.as_deref())?;
+        crate::leader::lead(target, crate::leader::host_id(&data)?).await?;
+        if let Some(path) = &args.import_sqlite {
+            match db
+                .import_sqlite(path)
+                .context("import the SQLite database")?
+            {
+                Some(rows) => eprintln!("copied {rows} rows from {}", path.display()),
+                None => eprintln!(
+                    "the database already has data; not importing {}",
+                    path.display()
+                ),
+            }
+        }
+        crate::leader::pull_shared(&db, &data, &sbox)?;
+    }
     let ca = Arc::new(secrets::egress_ca(&data, &sbox).context("load egress CA")?);
     let backend = match args.backend {
         BackendArg::Auto => Backend::detect(),
@@ -512,6 +555,9 @@ async fn run(
         _ => crate::session::Sessions::load(&data.join("session.key"))
             .context("open the session key")?,
     };
+    if db.is_postgres() {
+        crate::leader::push_shared(&db, data, &sbox).context("store the shared files")?;
+    }
     // Every host of a fleet uses the primary's egress CA, so sandboxes can
     // move between them.
     let ca = match &role {

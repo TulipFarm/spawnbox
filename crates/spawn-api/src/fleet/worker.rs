@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::forward::{self, Failure};
+use super::forward::Failure;
 use super::migrate;
 use super::pki::{self, Identity, Peer};
 use super::{
@@ -45,7 +45,7 @@ const EVENT_BATCH: usize = 500;
 
 pub struct Worker {
     pub node: String,
-    primary: String,
+    primary: super::Primaries,
     /// Our URL, sent with each heartbeat.
     advertise: String,
     identity: Identity,
@@ -87,7 +87,7 @@ impl Worker {
             };
             join(
                 &dir,
-                primary,
+                &super::Primaries::parse(primary).map_err(anyhow::Error::msg)?,
                 advertise,
                 token,
                 ca_sha256,
@@ -107,7 +107,7 @@ impl Worker {
         eprintln!("fleet worker {node}; primary {primary}");
         Ok(Arc::new(Self {
             node,
-            primary: primary.to_owned(),
+            primary: super::Primaries::parse(primary).map_err(anyhow::Error::msg)?,
             advertise: advertise.to_owned(),
             identity,
             tls,
@@ -154,21 +154,16 @@ impl Worker {
         path: &str,
         body: &T,
     ) -> Result<R, Failure> {
-        forward::call(
-            Arc::clone(&self.tls),
-            &self.primary,
-            path,
-            Some(&self.node),
-            body,
-        )
-        .await
+        self.primary
+            .call(&self.tls, path, Some(&self.node), body)
+            .await
     }
 }
 
 /// Joins the fleet as a `kind` node and saves the identity in `dir`.
 pub(super) async fn join(
     dir: &Path,
-    primary: &str,
+    primary: &super::Primaries,
     advertise: &str,
     token: &str,
     ca_sha256: &str,
@@ -182,7 +177,8 @@ pub(super) async fn join(
         url: advertise.to_owned(),
         kind: kind.to_owned(),
     };
-    let reply: JoinReply = forward::call(tls, primary, "/fleet/v1/join", None, &req)
+    let reply: JoinReply = primary
+        .call(&tls, "/fleet/v1/join", None, &req)
         .await
         .map_err(Failure::error)
         .context("join the fleet")?;

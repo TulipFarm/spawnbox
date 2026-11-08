@@ -42,7 +42,7 @@ enum Msg {
     Remote {
         node: String,
         events: Vec<Event>,
-        reply: oneshot::Sender<rusqlite::Result<i64>>,
+        reply: oneshot::Sender<crate::db::Result<i64>>,
     },
     /// Stores everything queued before it, then stops the writer.
     Close(oneshot::Sender<()>),
@@ -384,7 +384,7 @@ impl Hub {
 
     /// Stores a worker's events and sends the new ones to followers.
     /// Returns the newest of its event IDs stored here.
-    pub async fn ingest(&self, node: &str, events: Vec<Event>) -> rusqlite::Result<i64> {
+    pub async fn ingest(&self, node: &str, events: Vec<Event>) -> crate::db::Result<i64> {
         let (reply, rx) = oneshot::channel();
         let msg = Msg::Remote {
             node: node.to_owned(),
@@ -392,13 +392,17 @@ impl Hub {
             reply,
         };
         if self.queue.send(msg).await.is_err() {
-            return Err(rusqlite::Error::InvalidQuery);
+            return Err(crate::db::Error::Connection(
+                "the database task stopped".into(),
+            ));
         }
-        rx.await.unwrap_or(Err(rusqlite::Error::InvalidQuery))
+        rx.await.unwrap_or(Err(crate::db::Error::Connection(
+            "the database task stopped".into(),
+        )))
     }
 
     /// The newest stored event's ID.
-    pub fn latest(&self) -> rusqlite::Result<i64> {
+    pub fn latest(&self) -> crate::db::Result<i64> {
         self.db.latest_event_id()
     }
 }
@@ -503,14 +507,14 @@ async fn store_remote(
     node: String,
     events: Vec<Event>,
     feed: &broadcast::Sender<Arc<Event>>,
-) -> rusqlite::Result<i64> {
+) -> crate::db::Result<i64> {
     let db = db.clone();
     let stored = tokio::task::spawn_blocking(move || {
         let stored = db.insert_remote_events(&node, &events)?;
-        Ok::<_, rusqlite::Error>((stored, db.remote_event_cursor(&node)?))
+        Ok::<_, crate::db::Error>((stored, db.remote_event_cursor(&node)?))
     })
     .await
-    .map_err(|_| rusqlite::Error::InvalidQuery)??;
+    .map_err(|_| crate::db::Error::Connection("the database task stopped".into()))??;
     let (stored, cursor) = stored;
     for event in stored {
         let _ = feed.send(Arc::new(event));

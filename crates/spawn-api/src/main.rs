@@ -7,6 +7,7 @@
 mod db;
 mod events;
 mod ids;
+mod leader;
 mod metering;
 mod metrics;
 mod model;
@@ -77,6 +78,12 @@ enum Cli {
         /// A label to tell keys apart.
         #[arg(long)]
         name: Option<String>,
+        /// The server's Postgres database, if it uses one.
+        #[arg(long, env = "SPAWNBOX_DATABASE_URL")]
+        database_url: Option<String>,
+        /// PEM CA certificates for the database's TLS certificate.
+        #[arg(long, requires = "database_url")]
+        database_ca_file: Option<PathBuf>,
     },
 }
 
@@ -90,13 +97,17 @@ fn main() -> Result<()> {
             data_dir,
             tenant,
             name,
-        } => create_key(&data_dir, tenant.as_deref(), name.as_deref()),
+            database_url,
+            database_ca_file,
+        } => {
+            let data = open_data_dir(&data_dir)?;
+            let db = leader::open(&data, database_url.as_deref(), database_ca_file.as_deref())?;
+            create_key(&db, tenant.as_deref(), name.as_deref())
+        }
     }
 }
 
-fn create_key(data_dir: &Path, tenant: Option<&str>, name: Option<&str>) -> Result<()> {
-    let data = open_data_dir(data_dir)?;
-    let db = db::Db::open(&data.join(DB_FILE)).context("open database")?;
+fn create_key(db: &db::Db, tenant: Option<&str>, name: Option<&str>) -> Result<()> {
     if let Some(tenant) = tenant
         && db.get_tenant(tenant)?.is_none()
     {

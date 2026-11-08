@@ -898,6 +898,55 @@ certificate in `/var/lib/spawnbox/fleet/worker/`.
   [drain the worker](#drain-a-worker-and-move-its-sandboxes) before you
   restart it.
 
+### Keep the API up when the primary stops
+
+With one primary, the API stops when the primary stops. To prevent this,
+run two or more primaries on one Postgres database. One primary is the
+**leader** and serves the API. The others are **standbys**: they wait and
+do not listen on any port. When the leader stops, a standby becomes the
+leader in about 15 seconds.
+
+1. Make a Postgres 15 (or later) database, for example on Amazon RDS.
+2. Copy `/var/lib/spawnbox/secrets.key` from the primary to the same path
+   on each standby host. All primaries must use the same key.
+3. On each primary, add the database to `/etc/spawnbox/spawnbox.env`:
+
+   ```sh
+   SPAWNBOX_DATABASE_URL=postgres://spawnbox:PASSWORD@db.internal:5432/spawnbox
+   ```
+
+   Also add `--fleet-listen` to `SPAWNBOX_ARGS`, as in
+   [step 2](#step-2-make-the-primary).
+4. To keep the data of an existing primary, add
+   `--import-sqlite /var/lib/spawnbox/spawnbox.db` on that primary for its
+   first start. It copies the data only when the database is empty.
+5. Start the primaries. The first one to start becomes the leader.
+6. Put a load balancer in front of the primaries, with a health check on
+   `GET /healthz`. Only the leader passes it.
+7. On workers and edges, give each primary in `--primary`, separated by
+   commas:
+
+   ```sh
+   --primary https://10.0.0.1:7443,https://10.0.0.5:7443
+   ```
+
+The leader keeps the fleet CA, the egress CA and the browser session key
+in the database, encrypted with the secrets key. A new leader uses the
+same ones, so workers and browser sessions continue to operate.
+
+When a standby becomes the leader:
+
+- Sandboxes on workers continue to run.
+- Sandboxes that ran on the old leader are lost. Paused sandboxes whose
+  files were on the old leader are marked `failed`.
+- Volumes whose file was on the old leader are lost.
+- If the leader cannot reach the database for 8 seconds, it stops, so
+  that two primaries never serve at the same time.
+
+To use TLS with a certificate check, give the CA of the database in
+`--database-ca-file`. Without it, the connection uses TLS if the server
+offers it, but accepts any certificate.
+
 ### Drain a worker and move its sandboxes
 
 Do these steps before you update, restart or remove a worker. Type the
@@ -1625,6 +1674,9 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--dns` | `1.1.1.1` | DNS server that the DNS forwarder sends queries to |
 | `--dns-port` | 15053 | Host port (UDP and TCP) of the DNS forwarder. Only sandboxes can connect to it. |
 | `--secrets-key-file` | `<data-dir>/secrets.key` | Key that encrypts secrets |
+| `--database-url` | None | Keep the state in this Postgres database, not in SQLite. Primaries on the same database fail over. You can also use `SPAWNBOX_DATABASE_URL`. Refer to [Keep the API up when the primary stops](#keep-the-api-up-when-the-primary-stops). |
+| `--database-ca-file` | None | PEM CA certificates for the TLS certificate of the database |
+| `--import-sqlite` | None | On the first start, copy this SQLite database into the empty Postgres database |
 | `--events-retention-s` | 604800 | Time to keep events. `0` means always. |
 | `--events-output-bytes` | 65536 | Bytes of output kept in `exec.finished` |
 | `--warm-pool-memory-pct` | 10 | Percent of host memory for warm VMs. `0` turns warm pools off. |
@@ -1634,7 +1686,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--otlp-endpoint` | None | OpenTelemetry collector for events and traces. You can also use `OTEL_EXPORTER_OTLP_ENDPOINT`. |
 | `--metrics-listen` | None | Address for Prometheus metrics at `/metrics`, for example `127.0.0.1:9464`. It has no authentication. Refer to [See metrics in Prometheus](#see-metrics-in-prometheus). |
 | `--fleet-listen` | None | Make this host a primary. Workers connect to this address. Refer to [Use more than one host](#use-more-than-one-host). |
-| `--primary` | None | Make this host a worker of the primary at this URL, for example `https://10.0.0.1:7443` |
+| `--primary` | None | Make this host a worker of the primary at this URL, for example `https://10.0.0.1:7443`. For primaries that fail over, give each URL, separated by commas. |
 | `--node-listen` | None | Worker: address for requests from the primary |
 | `--advertise` | None | Worker: URL of `--node-listen` for the primary, for example `https://10.0.0.2:7444` |
 | `--join-token` | None | Worker: token from `POST /v1/nodes/tokens`. You can also use `SPAWNBOX_JOIN_TOKEN`. Necessary only for the first start. |

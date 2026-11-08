@@ -36,8 +36,9 @@ const NODE_FILE: &str = "id";
 #[derive(clap::Args)]
 pub struct Args {
     /// Run as an edge of the primary at this URL, which is its
-    /// `--fleet-listen` address: `https://host:port`.
-    #[arg(long, value_parser = server::parse_node_url)]
+    /// `--fleet-listen` address: `https://host:port`. With primaries that
+    /// fail over, list each one, separated by commas.
+    #[arg(long, value_parser = server::parse_primaries)]
     primary: String,
     /// One-time token from `POST /v1/nodes/tokens` on the primary. Needed
     /// only for the first start.
@@ -83,7 +84,7 @@ struct Table {
 
 struct Edge {
     node: String,
-    primary: String,
+    primary: super::Primaries,
     identity: Identity,
     to_primary: Arc<ClientConfig>,
     clients: Mutex<HashMap<String, Arc<ClientConfig>>>,
@@ -152,7 +153,7 @@ impl Edge {
         let (tls, url, name) = match target {
             Target::Primary => (
                 Arc::clone(&self.to_primary),
-                self.primary.clone(),
+                self.primary.current().to_owned(),
                 "the primary".to_owned(),
             ),
             Target::Worker { node, url } => (
@@ -181,6 +182,8 @@ impl Edge {
             Ok(resp) => Ok(resp),
             Err(Failure::Unreachable(e)) => {
                 eprintln!("edge: {name}: {e:#}");
+                // The next call tries a standby, which may lead by then.
+                self.primary.unreachable(&url);
                 Err(ApiError::new(
                     Code::NodeUnreachable,
                     format!("{name} cannot be reached; try again later"),
@@ -197,19 +200,25 @@ impl Edge {
 
     /// Copies the routing table from the primary.
     async fn poll(&self) -> Result<()> {
+        let url = self.primary.current().to_owned();
         let req = Request::builder()
             .method(Method::POST)
             .uri("/fleet/v1/routes")
             .header(
                 header::HOST,
-                self.primary.strip_prefix("https://").unwrap_or_default(),
+                url.strip_prefix("https://").unwrap_or_default(),
             )
             .header(header::CONTENT_TYPE, "application/json")
             .header(NODE_HEADER, &self.node)
             .body(Body::from("{}"))?;
-        let resp = forward::send(Arc::clone(&self.to_primary), &self.primary, req)
-            .await
-            .map_err(Failure::error)?;
+        let resp = match forward::send(Arc::clone(&self.to_primary), &url, req).await {
+            Ok(resp) => resp,
+            Err(Failure::Unreachable(e)) => {
+                self.primary.unreachable(&url);
+                return Err(e);
+            }
+            Err(Failure::Broken(e)) => return Err(e),
+        };
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), MAX_ROUTES).await?;
         if status == StatusCode::FORBIDDEN {
@@ -273,7 +282,8 @@ async fn start(args: &Args, data: &Path) -> Result<Edge> {
                  --primary-ca-sha256 from POST /v1/nodes/tokens on the primary"
             );
         };
-        super::worker::join(&dir, &args.primary, "", token, ca_sha256, node_kind::EDGE).await?;
+        let primaries = super::Primaries::parse(&args.primary).map_err(anyhow::Error::msg)?;
+        super::worker::join(&dir, &primaries, "", token, ca_sha256, node_kind::EDGE).await?;
     } else if args.join_token.is_some() {
         eprintln!("already joined; --join-token is not used");
     }
@@ -286,7 +296,7 @@ async fn start(args: &Args, data: &Path) -> Result<Edge> {
     eprintln!("fleet edge {node}; primary {}", args.primary);
     Ok(Edge {
         node,
-        primary: args.primary.clone(),
+        primary: super::Primaries::parse(&args.primary).map_err(anyhow::Error::msg)?,
         identity,
         to_primary,
         clients: Mutex::default(),

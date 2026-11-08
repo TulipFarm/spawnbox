@@ -99,7 +99,7 @@ impl Meter {
 
     /// Adds what was collected to the database. On failure, keeps it for
     /// the next try.
-    pub fn flush(&self) -> rusqlite::Result<()> {
+    pub fn flush(&self) -> crate::db::Result<()> {
         let rows = std::mem::take(&mut *self.pending());
         if rows.is_empty() {
             return Ok(());
@@ -113,7 +113,7 @@ impl Meter {
     }
 
     /// `tenant`'s egress bytes this UTC month, written or not.
-    pub fn month_egress(&self, tenant: &str, now_ms: i64) -> rusqlite::Result<u64> {
+    pub fn month_egress(&self, tenant: &str, now_ms: i64) -> crate::db::Result<u64> {
         let since = month_start(now_ms);
         let stored = self.db.egress_since(tenant, since)?;
         let pending: u64 = self
