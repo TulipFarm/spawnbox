@@ -155,39 +155,20 @@ Type all the commands in steps 3 to 7 on **the host**.
    Firecracker microVMs, use a different host, or turn on nested
    virtualization for this host.
 
-### Step 4: Get the Spawnbox code
+### Step 4: Install Spawnbox
 
-1. Install Git:
-
-   ```sh
-   sudo apt-get update
-   sudo apt-get install -y git
-   ```
-
-2. Download the code:
-
-   ```sh
-   git clone https://github.com/TulipFarm/spawnbox.git
-   ```
-
-3. Go into the directory:
-
-   ```sh
-   cd spawnbox
-   ```
-
-### Step 5: Install Spawnbox
-
-> **CAUTION:** Run the installer as your usual user. Do not type
-> `sudo deploy/install.sh`. The installer uses `sudo` when it must.
+> **CAUTION:** Run the installer as your usual user, not with `sudo`. The
+> installer uses `sudo` when it must.
 
 1. Type this command:
 
    ```sh
-   deploy/install.sh
+   curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh
    ```
 
-   The installer does these tasks:
+   The command installs Git if it is not installed, downloads the code
+   into `~/spawnbox` and runs `deploy/install.sh`. The installer does
+   these tasks:
 
    - It installs the build tools and Rust, if they are not installed.
    - It compiles Spawnbox, a Linux kernel for the sandboxes and a Debian
@@ -196,6 +177,11 @@ Type all the commands in steps 3 to 7 on **the host**.
    - It downloads Firecracker and gVisor (`runsc`) and checks their
      checksums.
    - It installs and starts the `spawnbox` systemd service.
+
+   To upgrade later, type the same command again. To use a different
+   directory or a tag, set `SPAWNBOX_DIR` or `SPAWNBOX_REF`, for example
+   `curl -fsSL ... | SPAWNBOX_REF=v0.1.0 sh`. If you prefer, clone the
+   repository yourself and type `deploy/install.sh`.
 
 2. Wait until the installer stops. The last lines of the output must look
    like this:
@@ -221,7 +207,7 @@ The installer puts files in these locations:
 | `/etc/spawnbox/spawnbox.env` | Server settings |
 | `/var/lib/spawnbox` | Database, templates, paused sandboxes and secrets |
 
-### Step 6: Make sure that Spawnbox operates
+### Step 5: Make sure that Spawnbox operates
 
 1. Type this command:
 
@@ -240,7 +226,7 @@ The installer puts files in these locations:
    The output shows `sandboxes run in firecracker` or
    `sandboxes run in gvisor`.
 
-### Step 7: Create your first sandbox
+### Step 6: Create your first sandbox
 
 1. Keep the server address and your API key in two variables. Put your
    key in place of `<your-key>`:
@@ -278,7 +264,7 @@ The installer puts files in these locations:
 Commands in a sandbox run as `user` in the directory `/workspace`. The
 user `user` can use `sudo`.
 
-### Step 8 (optional): Use Spawnbox from your computer
+### Step 7 (optional): Use Spawnbox from your computer
 
 The API listens only on the host (`127.0.0.1`). To use it from your
 computer, make an SSH tunnel.
@@ -346,7 +332,7 @@ spawnbox usage
 To see all the options of a command, type `spawnbox <command> --help`. To
 get JSON output, add `--json`. To use the CLI from your computer, build it
 with `cargo build --release -p spawnbox-cli` and use the SSH tunnel from
-step 8.
+step 7.
 
 You can also set the server address and the key with the environment
 variables `SPAWNBOX_URL` and `SPAWNBOX_API_KEY`.
@@ -354,7 +340,7 @@ variables `SPAWNBOX_URL` and `SPAWNBOX_API_KEY`.
 ## How to use Spawnbox
 
 Type these commands on the host, or on your computer with the SSH tunnel
-from step 8. The examples use the variables `A`, `B` and `S` from step 7.
+from step 7. The examples use the variables `A`, `B` and `S` from step 6.
 
 ### Run commands
 
@@ -1100,7 +1086,8 @@ To use a program:
 1. Write the program, for example `/etc/spawnbox/autoscale.sh`. This
    example uses AWS. Make an EC2 launch template `spawnbox-worker` with
    an image that has Spawnbox installed (do [step 1](#step-1-prepare-the-hosts)
-   and `deploy/install.sh` once, then make an image). Change `PRIMARY` to
+   and the [install command](#step-4-install-spawnbox) once, then make an
+   image). Change `PRIMARY` to
    the `--fleet-listen` URL of your primary.
 
    ```sh
@@ -1674,8 +1661,8 @@ spawnbox doctor
 Firecracker if KVM operates, or gVisor if it does not. Exit code `0`
 means that all checks passed.
 
-To remove Spawnbox, type `deploy/install.sh --uninstall`. This keeps your
-data. To remove the data too, type `deploy/install.sh --purge`.
+To remove Spawnbox, type `~/spawnbox/deploy/install.sh --uninstall`. This keeps your
+data. To remove the data too, type `~/spawnbox/deploy/install.sh --purge`.
 
 ## How Spawnbox works
 
@@ -1750,6 +1737,7 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `crates/spawn-bench` | The boot and restore benchmark |
 | `crates/spawnbox-cli` | The `spawnbox` CLI |
 | `guest/` | The guest kernel settings and the Debian base image |
+| `install.sh` | Downloads the code and runs `deploy/install.sh`, for `curl ... \| sh` |
 | `deploy/install.sh` | The installer for one server |
 | `scripts/` | Build scripts and end-to-end tests |
 | `docs/spec.md` | The full design and the plan |
