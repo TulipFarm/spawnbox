@@ -1,0 +1,28 @@
+---
+// Isometric box. Grid units: i runs right-down, j runs left-down, k runs up.
+interface Props {
+  i: number;
+  j: number;
+  k?: number;
+  w?: number;
+  d?: number;
+  h?: number;
+  s?: number;
+  tone?: "solid" | "wire" | "deep" | "pale";
+  class?: string;
+  style?: string;
+}
+const { i, j, k = 0, w = 1, d = 1, h = 1, s = 20, tone = "solid", class: cls = "", style } = Astro.props;
+const C = Math.cos(Math.PI / 6);
+const p = (a: number, b: number, c: number) => `${((a - b) * C * s).toFixed(1)},${((a + b) * 0.5 * s - c * s).toFixed(1)}`;
+const top = [p(i, j, k + h), p(i + w, j, k + h), p(i + w, j + d, k + h), p(i, j + d, k + h)].join(" ");
+const left = [p(i, j + d, k), p(i + w, j + d, k), p(i + w, j + d, k + h), p(i, j + d, k + h)].join(" ");
+const right = [p(i + w, j, k), p(i + w, j + d, k), p(i + w, j + d, k + h), p(i + w, j, k + h)].join(" ");
+---
+
+<g class={`iso iso-${tone} ${cls}`} style={style}>
+  <polygon class="f-left" points={left}></polygon>
+  <polygon class="f-right" points={right}></polygon>
+  <polygon class="f-top" points={top}></polygon>
+  <slot />
+</g>

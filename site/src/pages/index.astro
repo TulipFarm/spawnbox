@@ -1,0 +1,2779 @@
+---
+import Box from "../components/Box.astro";
+
+const repo = "https://github.com/TulipFarm/spawnbox";
+const install = "curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh";
+
+const C = Math.cos(Math.PI / 6);
+const pt = (i: number, j: number, k: number, s: number) => [(i - j) * C * s, (i + j) * 0.5 * s - k * s];
+const xy = (i: number, j: number, k: number, s: number) => pt(i, j, k, s).map((n) => n.toFixed(1)).join(",");
+
+// hero scene, in grid units
+const S = 24;
+const vms = [
+  { i: 1, j: 1, tone: "solid" },
+  { i: 4, j: 1, tone: "solid" },
+  { i: 1, j: 4, tone: "solid" },
+  { i: 7, j: 1, tone: "solid" },
+  { i: 4, j: 4, tone: "solid" },
+  { i: 7, j: 4, tone: "wire" },
+] as const;
+const agent = [-1.3, -1.3, 6] as const;
+const packets = vms
+  .filter((v) => v.tone === "solid")
+  .map((v, n) => ({
+    d: `M${xy(agent[0], agent[1], agent[2], S)} L${xy(v.i + 1, v.j + 1, 2.4, S)}`,
+    delay: `${(n * 0.55).toFixed(2)}s`,
+  }));
+const at = (i: number, j: number, k: number) => pt(i, j, k, S);
+
+const metrics = [
+  { n: 8, pre: "≈", unit: "ms", label: "Start a new sandbox" },
+  { n: 75, pre: "60–", unit: "ms", label: "Start from a saved copy" },
+  { n: 65, pre: "≈", unit: "ms", label: "Wake up a paused sandbox" },
+  { n: 16, pre: "", unit: "copies", label: "Copies of one sandbox, made in under 1 s" },
+];
+
+const groups = [
+  {
+    name: "Run code",
+    shape: "cube",
+    items: [
+      ["Sandboxes", "Start, list, look at and delete sandboxes. Give each one a time limit, settings and labels."],
+      ["Commands", "Run any command. Get the result at the end, or watch it live. Type input into it."],
+      ["Files", "Read, write, list and delete files and folders."],
+      ["Terminals", "Open a live terminal into the sandbox."],
+      ["Browser sessions", "Share a short-lived link to one sandbox's terminal and web apps. No API key needed."],
+      ["Git", "Download code from Git. Private repos work with a saved secret."],
+    ],
+  },
+  {
+    name: "Get ready",
+    shape: "stack",
+    items: [
+      ["Templates", "Save a starting setup with your tools already installed. Start from Debian, a Docker image or devcontainer.json."],
+      ["Spare sandboxes", "Keep spares ready and waiting. A new sandbox starts in about 8 ms. The number of spares grows and shrinks with use."],
+      ["Build store", "Store templates in S3-compatible storage. Build each one only once. A sandbox can start before the whole template has downloaded."],
+      ["Volumes", "Keep files after a sandbox ends. Share one read-only folder with many sandboxes."],
+    ],
+  },
+  {
+    name: "Save and copy",
+    shape: "pair",
+    items: [
+      ["Pause and resume", "Pause a sandbox and save everything to disk. Wake it up in about 65 ms. Idle sandboxes pause by themselves."],
+      ["Copy and save", "Make up to 16 copies of a running sandbox in under 1 s. Save it as a template without stopping it."],
+    ],
+  },
+  {
+    name: "Internet",
+    shape: "gate",
+    items: [
+      ["Preview links", "Open a web app that runs in a sandbox from a link. The link can be public, need a token, or be private."],
+      ["Site rules", "Choose which websites a sandbox can reach: all, some or none. Limit its speed. Log every connection."],
+      ["Secrets", "Your API keys stay locked outside the sandbox. They are added to requests only for sites you allow."],
+    ],
+  },
+  {
+    name: "Grow",
+    shape: "row",
+    items: [
+      ["More servers", "Add servers when you need room. Each new sandbox goes to the server with the most space. Empty a server before you remove it."],
+      ["Two backends", "Uses Firecracker on servers with KVM, and gVisor on servers without it. You can require Firecracker for a customer."],
+      ["Many customers", "Serve many customers from one install. Each gets its own keys, limits, templates, secrets and site rules."],
+    ],
+  },
+  {
+    name: "Watch and manage",
+    shape: "slab",
+    items: [
+      ["Activity log", "A log of everything an agent does: commands, file changes, connections and key use. Watch it live or send it to OpenTelemetry."],
+      ["Metrics", "Numbers for each server, ready for Prometheus: start times, errors, connections and free space."],
+      ["Usage", "See how much CPU, memory, disk and network each customer and sandbox used, hour by hour."],
+      ["CLI", "One spawnbox command does it all: sandboxes, files, templates, secrets, customers and logs."],
+      ["Easy to run", "Install with one script. Runs as a normal system service with HTTPS. Comes back by itself after a crash."],
+    ],
+  },
+];
+let fid = 0;
+
+type Mark = "yes" | "part" | "no" | "unk";
+const providers = ["Spawnbox", "E2B", "Daytona", "microsandbox", "CubeSandbox", "InstaVM"];
+const compare: { row: string; cells: [Mark, string][] }[] = [
+  {
+    row: "Open source",
+    cells: [
+      ["yes", "Apache-2.0"],
+      ["yes", "Apache-2.0"],
+      ["no", "Repo archived Oct 2026; core moved private"],
+      ["yes", "Apache-2.0"],
+      ["yes", "Apache-2.0"],
+      ["unk", "Not stated"],
+    ],
+  },
+  {
+    row: "Run it on your own server",
+    cells: [
+      ["yes", "One install script"],
+      ["yes", "Docker Compose or Terraform"],
+      ["no", "Open-source repo no longer maintained"],
+      ["part", "Runs locally as a child process; beta"],
+      ["yes", "KVM x86_64 host"],
+      ["no", "Cloud service; local tool for development"],
+    ],
+  },
+  {
+    row: "How sandboxes are kept apart",
+    cells: [
+      ["yes", "Firecracker microVM"],
+      ["yes", "Firecracker microVM"],
+      ["unk", "Dedicated kernel; technology not named"],
+      ["yes", "microVM"],
+      ["yes", "KVM microVM (RustVMM)"],
+      ["yes", "microVM"],
+    ],
+  },
+  {
+    row: "Works on servers without KVM",
+    cells: [
+      ["yes", "Uses gVisor instead"],
+      ["no", "KVM required"],
+      ["unk", "Not stated"],
+      ["part", "Needs KVM, Apple Silicon or Windows WHP"],
+      ["no", "KVM required"],
+      ["unk", "Not stated"],
+    ],
+  },
+  {
+    row: "Many customers, each with own keys and limits",
+    cells: [
+      ["yes", "Own keys, limits, secrets, site rules"],
+      ["part", "Auth and quotas"],
+      ["part", "Organizations, API keys, limits"],
+      ["unk", "Not stated"],
+      ["part", "Per-sandbox traffic tokens"],
+      ["part", "API keys, volume quotas"],
+    ],
+  },
+  {
+    row: "API keys stay outside the sandbox",
+    cells: [
+      ["yes", "Added outside the sandbox"],
+      ["unk", "Not stated"],
+      ["unk", "Not stated"],
+      ["yes", "Never enter the VM"],
+      ["yes", "Credential vault via egress proxy"],
+      ["yes", "Injected via a proxy"],
+    ],
+  },
+  {
+    row: "Pause and resume",
+    cells: [
+      ["yes", "Pauses by itself, wakes in ≈65 ms"],
+      ["yes", "Auto-pause"],
+      ["part", "Snapshots"],
+      ["yes", "Stop, start, snapshots"],
+      ["yes", "Auto-pause and resume"],
+      ["yes", "Pause, snapshot, resume"],
+    ],
+  },
+  {
+    row: "Copy a running sandbox",
+    cells: [
+      ["yes", "Up to 16 copies, < 1 s"],
+      ["yes", "Up to 100 per request"],
+      ["unk", "Not stated"],
+      ["yes", "msb fork"],
+      ["part", "Fork from a checkpoint"],
+      ["part", "Clone a VM"],
+    ],
+  },
+  {
+    row: "Also sold as a hosted cloud",
+    cells: [
+      ["no", "None, by design"],
+      ["yes", "E2B Cloud, BYOC"],
+      ["yes", "Daytona cloud"],
+      ["unk", "Not stated"],
+      ["unk", "Not stated"],
+      ["yes", "InstaVM cloud"],
+    ],
+  },
+];
+const sources = [
+  ["E2B", "https://e2b.dev/open-source"],
+  ["E2B runtime", "https://github.com/e2b-dev/infra"],
+  ["Daytona", "https://github.com/daytonaio/daytona"],
+  ["microsandbox", "https://github.com/superradcompany/microsandbox"],
+  ["CubeSandbox", "https://github.com/TencentCloud/CubeSandbox"],
+  ["InstaVM", "https://instavm.io"],
+];
+const markGlyph: Record<Mark, string> = { yes: "●", part: "◐", no: "○", unk: "?" };
+const markLabel: Record<Mark, string> = { yes: "Yes", part: "Partly", no: "No", unk: "Not stated" };
+
+const fits = [
+  {
+    tag: "YOUR AGENT",
+    title: "Your agent asks for a sandbox.",
+    sub: "One API call or one command. A fresh, empty computer is ready in about 8 ms.",
+    rows: [
+      ["From code", "POST /v1/sandboxes"],
+      ["From a terminal", "spawnbox create"],
+    ],
+  },
+  {
+    tag: "THE SANDBOX",
+    title: "Each agent gets its own small computer.",
+    sub: "It is a tiny virtual machine. If the agent breaks something, only its own sandbox breaks.",
+    rows: [
+      ["Pause it", "spawnbox pause $S"],
+      ["Show a web app", "spawnbox ports publish $S 3000"],
+      ["Copy files in", "spawnbox cp ./src $S:/workspace/src"],
+      ["Watch what it does", "spawnbox events --follow"],
+    ],
+  },
+  {
+    tag: "KEYS AND INTERNET",
+    title: "Your API keys never go inside.",
+    sub: "The agent sees a fake key. When it calls OpenAI, Spawnbox puts the real key in on the way out. Other sites get only the fake one.",
+    rows: [
+      ["The agent sees", "sbx_ph_... (a fake key)"],
+      ["Allowed sites", "github.com, *.pypi.org"],
+      ["Every other site", "blocked"],
+    ],
+  },
+  {
+    tag: "YOUR SERVER",
+    title: "It all runs on your own server.",
+    sub: "Install it with one script on a Linux machine. Nothing goes to our cloud.",
+    rows: [
+      ["Works best on", "Linux with KVM"],
+      ["Also works on", "machines without KVM"],
+      ["Need more room?", "add more servers"],
+    ],
+  },
+];
+
+const events = [
+  ["sandbox.created", "sbx_c7mty9fysaf0t3d5"],
+  ["exec.started", "python3 main.py"],
+  ["net.dns", "pypi.org"],
+  ["net.connection", "github.com:443"],
+  ["secret.injected", "api.openai.com"],
+  ["file.written", "/workspace/out.txt"],
+  ["net.blocked", "example.org"],
+  ["exec.finished", "exit 0"],
+  ["sandbox.paused", "idle"],
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Spawnbox — self-hosted sandboxes for AI agents</title>
+    <meta
+      name="description"
+      content="Spawnbox is an open-source sandbox server for AI agent platforms. Firecracker microVMs on your own Linux servers, with a gVisor fallback."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="sheet">
+      <header class="topbar">
+        <a class="mark" href="/" aria-label="Spawnbox home">
+          <svg viewBox="-22 -26 44 48" width="30" height="30" aria-hidden="true">
+            <Box i={-0.5} j={-0.5} s={20} />
+          </svg>
+          <span>SPAWNBOX</span>
+        </a>
+        <nav>
+          <a href="#uses">Use cases</a>
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#compare">Compare</a>
+          <a href="#install">Install</a>
+          <a class="btn-line" href={repo}>GitHub ↗</a>
+        </nav>
+      </header>
+
+      <section class="hero">
+        <div class="hero-copy">
+                    <h1 class="reveal">
+            Sandboxes for AI agents,
+            <span class="hl">on your own servers.</span>
+          </h1>
+          <p class="lede reveal">
+            Spawnbox gives each AI agent its own small, safe computer to run code in. It is open source and runs
+            on your own servers. A new one is ready in less than 100&nbsp;ms. Your API keys never go inside.
+          </p>
+          <div class="cta reveal">
+            <a class="btn" href="#install">Install on your server</a>
+            <a class="btn-line" href={repo}>Read the source</a>
+          </div>
+          <div class="typer reveal" aria-hidden="true">
+            <span class="p">$</span> <span id="typed"></span><span class="caret"></span>
+          </div>
+        </div>
+
+        <figure class="scene hero-scene" aria-label="Drawing: an agent sends work to microVMs on one host">
+          <svg viewBox="-200 -250 440 480" role="img">
+            <defs>
+              <pattern id="isogrid" width="41.57" height="24" patternUnits="userSpaceOnUse">
+                <path d="M0 12 20.78 0 41.57 12 20.78 24z" fill="none" class="gridline"></path>
+              </pattern>
+            </defs>
+            <rect x="-200" y="-250" width="440" height="480" fill="url(#isogrid)"></rect>
+
+            <g class="drop" style="--d:0s">
+              <Box i={0} j={0} w={10} d={7} h={0.6} s={S} tone="deep" />
+            </g>
+            {
+              vms.map((v, n) => (
+                <g class="drop" style={`--d:${0.15 + n * 0.12}s`}>
+                  <g class={v.tone === "wire" ? "blinkbox" : "bob"} style={`--b:${n * 0.4}s`}>
+                    <Box i={v.i} j={v.j} k={0.6} w={2} d={2} h={1.8} s={S} tone={v.tone} />
+                  </g>
+                </g>
+              ))
+            }
+
+            {packets.map((p) => <path d={p.d} class="wire-path" />)}
+            {
+              packets.map((p) => (
+                <circle r="3.5" class="packet">
+                  <animateMotion dur="2.6s" begin={p.delay} repeatCount="indefinite" path={p.d} />
+                </circle>
+              ))
+            }
+
+            <g class="float">
+              <Box i={-2} j={-2} k={6} w={1.4} d={1.4} h={1.4} s={S} tone="pale" />
+            </g>
+
+            <g>
+              <path d={`M${xy(-1.3, -1.3, 7.6, S)} v-18 h-60`} class="leader"></path>
+              <text x={at(-1.3, -1.3, 7.6)[0] - 64} y={at(-1.3, -1.3, 7.6)[1] - 14} class="lbl end">YOUR AGENT</text>
+              <path d={`M${xy(9, 5, 1.2, S)} l30 30 h30`} class="leader"></path>
+              <text x={at(9, 5, 1.2)[0] + 64} y={at(9, 5, 1.2)[1] + 34} class="lbl">SPARES</text>
+              <text x={at(9, 5, 1.2)[0] + 64} y={at(9, 5, 1.2)[1] + 48} class="lbl mut">READY ≈ 8 ms</text>
+              <path d={`M${xy(2, 2, 2.4, S)} l-40 -50 h-30`} class="leader"></path>
+              <text x={at(2, 2, 2.4)[0] - 74} y={at(2, 2, 2.4)[1] - 46} class="lbl end">ONE SANDBOX</text>
+              <path d={`M${xy(0, 7, 0.3, S)} v90`} class="leader"></path>
+              <text x={at(0, 7, 0.3)[0]} y={at(0, 7, 0.3)[1] + 104} class="lbl">YOUR SERVER</text>
+            </g>
+          </svg>
+          <figcaption class="status">
+            <span><b class="live">●</b> RUNNING · sbx_c7mty9fysaf0t3d5</span>
+            <span>UPTIME <span id="uptime">00:00:00</span></span>
+          </figcaption>
+        </figure>
+      </section>
+
+      <section class="metrics" aria-label="Measured timings">
+        {
+          metrics.map((m) => (
+            <div class="metric reveal">
+              <svg class="ruler" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">
+                <path d="M0.5 0v10M99.5 0v10M0 5h100" />
+              </svg>
+              <p class="m-n">
+                {m.pre}
+                <span data-count={m.n}>{m.n}</span>
+                <small>{m.unit}</small>
+              </p>
+              <p class="m-l">{m.label}</p>
+            </div>
+          ))
+        }
+        <p class="note">Measured on the Spawnbox test server.</p>
+      </section>
+
+      <section id="fits">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 1"><b>01</b><small>06</small></span>
+          <h2>Every agent gets its own box.<br /><span class="hl">Scroll to see how it works.</span></h2>
+        </header>
+        <div class="fits">
+          <div class="stack-wrap">
+            <svg class="stack" viewBox="0 0 460 440" role="img" aria-label="Section drawing of one sandbox: your agent above, the microVM wall, the proxy in the wall, the host below">
+              <defs>
+                <pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                  <path d="M0 0 V7" class="hatch-line"></path>
+                </pattern>
+              </defs>
+              <text x="12" y="20" class="lbl mut">HOW ONE SANDBOX WORKS</text>
+
+              <g class="ly" data-l="0">
+                <rect x="115" y="40" width="180" height="44" class="part"></rect>
+                <text x="205" y="60" class="lbl mid">YOUR AI AGENT</text>
+                <text x="205" y="75" class="lbl mid mut">asks for a sandbox</text>
+                <path d="M205 84 V120" class="draw flow" pathLength="1"></path>
+                <path d="M199 112 L205 120 L211 112" class="arrow"></path>
+                <text x="215" y="106" class="lbl small">start one</text>
+              </g>
+
+              <g class="ly" data-l="1">
+                <path d="M80 120 H330 V330 H80 Z M96 136 V314 H314 V136 Z" class="wall" fill-rule="evenodd"></path>
+                <rect x="80" y="120" width="250" height="210" class="draw edge" pathLength="1"></rect>
+                <text x="306" y="156" class="lbl end small">ITS OWN SMALL COMPUTER</text>
+                {
+                  ["START/STOP", "INTERNET", "FILES", "LOG"].map((t, n) => (
+                    <>
+                      <rect x="76" y={164 + n * 38} width="24" height="12" class="port-notch" />
+                      <text x="70" y={174 + n * 38} class="lbl end small">{t}</text>
+                    </>
+                  ))
+                }
+                <path d="M80 352 H330 M80 346 V358 M330 346 V358" class="dim"></path>
+                <text x="205" y="346" class="lbl mid small">READY IN ABOUT 8 ms</text>
+              </g>
+
+              <g class="ly" data-l="1 2">
+                <rect x="112" y="190" width="172" height="100" class="ws"></rect>
+                <text x="122" y="208" class="lbl small mut">agent's code runs here</text>
+                <text x="122" y="236" class="code">API key:</text>
+                <text x="122" y="252" class="code mut">fake-key (not real)</text>
+                {[0, 1, 2].map((n) => <rect x={122 + n * 34} y="272" width="28" height="10" class="proc" style={`--p:${n * 0.4}s`} />)}
+              </g>
+
+              <g class="ly" data-l="2">
+                <rect x="314" y="176" width="16" height="40" class="proxy"></rect>
+                <path d="M284 236 H322 V216" class="draw flow" pathLength="1"></path>
+                <path d="M330 196 H452" class="draw flow" pathLength="1"></path>
+                <circle r="4" class="packet">
+                  <animateMotion dur="2.4s" repeatCount="indefinite" path="M284 236 H322 V196 H452" />
+                </circle>
+                <text x="452" y="188" class="lbl end small">openai.com</text>
+                <text x="452" y="212" class="lbl end small blue">real key added ✓</text>
+                <path d="M284 280 H452" class="draw flow" pathLength="1"></path>
+                <text x="452" y="272" class="lbl end small">github.com allowed ✓</text>
+                <path d="M284 300 H312" class="blocked"></path>
+                <path d="M306 294 L318 306 M318 294 L306 306" class="x"></path>
+                <text x="452" y="312" class="lbl end small mut">the rest blocked ✕</text>
+              </g>
+
+              <g class="ly" data-l="3">
+                <rect x="20" y="372" width="420" height="44" class="foundation"></rect>
+                <rect x="20" y="372" width="420" height="44" class="draw edge" pathLength="1"></rect>
+                <text x="36" y="398" class="lbl">YOUR OWN SERVER</text>
+                <text x="424" y="398" class="lbl end mut">NOT OUR CLOUD</text>
+                <path d="M205 330 V340 M205 358 V372" class="dim"></path>
+              </g>
+            </svg>
+          </div>
+          <div class="steps-col">
+            {
+              fits.map((f, n) => (
+                <div class="fit-step" data-step={n}>
+                  <p class="eyebrow">STEP {n + 1} — {f.tag}</p>
+                  <h3>{f.title}</h3>
+                  <p class="fit-sub">{f.sub}</p>
+                  <dl>
+                    {f.rows.map(([k, v]) => (
+                      <>
+                        <dt>{k}</dt>
+                        <dd>
+                          <code>{v}</code>
+                        </dd>
+                      </>
+                    ))}
+                  </dl>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      </section>
+
+      <section id="uses">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 2"><b>02</b><small>06</small></span>
+          <h2>What you can run</h2>
+          <p class="sec-sub">A sandbox is a full Linux computer. If it runs on Linux, it runs in Spawnbox.</p>
+        </header>
+        <div class="uses">
+          <article class="use reveal">
+            <div class="win">
+              <div class="win-bar"><span>TERMINAL</span><span class="who"><b>claude</b><b>codex</b><b>copilot</b></span></div>
+              <div class="win-body diff">
+                <p class="dim-t">› fix the failing test</p>
+                <p class="minus">- return total</p>
+                <p class="plus">+ return round(total, 2)</p>
+                <p class="ok">✓ 14 tests passed</p>
+              </div>
+            </div>
+            <h3>Coding agents</h3>
+            <p>Run Claude Code, Codex or Copilot CLI on a real repo. Let them install packages and run tests. If they break something, only the sandbox breaks. Your API keys stay outside.</p>
+          </article>
+
+          <article class="use reveal">
+            <div class="win">
+              <div class="win-bar"><span>DESKTOP · CHROMIUM</span><span></span></div>
+              <div class="win-body page">
+                <span class="dock"><i></i><i></i><i></i><i></i></span>
+                <span class="sk w60"></span>
+                <span class="sk w90"></span>
+                <span class="sk w75"></span>
+                <span class="field"></span>
+                <span class="go">Book</span>
+                <svg class="cursor" viewBox="0 0 12 16" aria-hidden="true"><path d="M0 0 L0 13 L3.5 9.5 L6 15 L8 14 L5.5 8.5 L10 8.5 Z"></path></svg>
+              </div>
+            </div>
+            <h3>Browser and computer use</h3>
+            <p>Give an agent its own browser, or a whole desktop you add to its template. It clicks, types, fills forms and uses apps. It can only reach the sites you allow, and every visit is logged.</p>
+          </article>
+
+          <article class="use reveal">
+            <div class="win">
+              <div class="win-bar url-bar"><span class="lock">●</span><span>https://my-app.preview.example.com</span></div>
+              <div class="win-body app">
+                <span class="nav-sk"></span>
+                <span class="hero-sk"></span>
+                <span class="card-sk"></span><span class="card-sk"></span><span class="card-sk"></span>
+              </div>
+            </div>
+            <h3>Real web apps</h3>
+            <p>Run the Next.js or Vite app you ship to Vercel, or one you made in Lovable. Start it with <code>npm run dev</code>, publish port 3000, and open the link.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="features">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 3"><b>03</b><small>06</small></span>
+          <h2>Everything it can do today</h2>
+          <p class="sec-sub">23 features in six groups. Coming later: TypeScript and Python SDKs, an MCP server and disk speed limits.</p>
+        </header>
+        {
+          groups.map((g) => (
+            <div class="group">
+              <h3 class="group-name reveal">
+                <span>{g.name}</span>
+              </h3>
+              <div class="cards">
+                {g.items.map(([name, desc]) => {
+                  fid += 1;
+                  return (
+                    <article class="card reveal">
+                      <svg class="icon" viewBox="-40 -46 80 80" aria-hidden="true">
+                        {g.shape === "cube" && <Box i={-0.5} j={-0.5} s={30} class="lift" />}
+                        {g.shape === "stack" && (
+                          <>
+                            <Box i={-0.6} j={-0.6} w={1.2} d={1.2} h={0.35} s={26} tone="deep" />
+                            <Box i={-0.5} j={-0.5} k={0.45} h={0.35} s={26} class="lift" />
+                            <Box i={-0.4} j={-0.4} k={0.9} w={0.8} d={0.8} h={0.35} s={26} tone="pale" class="lift2" />
+                          </>
+                        )}
+                        {g.shape === "pair" && (
+                          <>
+                            <Box i={-1} j={-0.2} w={0.8} d={0.8} h={0.8} s={26} tone="wire" />
+                            <Box i={0} j={-0.6} w={0.8} d={0.8} h={0.8} s={26} class="slide" />
+                          </>
+                        )}
+                        {g.shape === "gate" && (
+                          <>
+                            <Box i={-0.9} j={-0.5} w={0.3} d={1} h={1.2} s={26} />
+                            <Box i={0.6} j={-0.5} w={0.3} d={1} h={1.2} s={26} />
+                            <Box i={-0.9} j={-0.5} k={1.2} w={1.8} d={1} h={0.25} s={26} tone="deep" class="lift" />
+                          </>
+                        )}
+                        {g.shape === "row" && (
+                          <>
+                            <Box i={-1.2} j={-0.3} w={0.7} d={0.7} h={0.7} s={24} />
+                            <Box i={-0.35} j={-0.3} w={0.7} d={0.7} h={1.1} s={24} class="lift" />
+                            <Box i={0.5} j={-0.3} w={0.7} d={0.7} h={0.7} s={24} />
+                          </>
+                        )}
+                        {g.shape === "slab" && (
+                          <>
+                            <Box i={-0.8} j={-0.8} w={1.6} d={1.6} h={0.3} s={24} tone="deep" />
+                            <Box i={-0.3} j={-0.3} k={0.3} w={0.6} d={0.6} h={0.9} s={24} tone="pale" class="lift" />
+                          </>
+                        )}
+                      </svg>
+                      <p class="fid">SB-{String(fid).padStart(2, "0")}</p>
+                      <h4>{name}</h4>
+                      <p>{desc}</p>
+                    </article>
+                  );
+                })}
+              </div>
+            </div>
+          ))
+        }
+      </section>
+
+      <section id="how">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 4"><b>04</b><small>06</small></span>
+          <h2>Everything your agent needs</h2>
+          <p class="sec-sub">Inside its sandbox, an agent can run code, use the internet, keep files and use your keys safely. You can watch it, pause it or copy it.</p>
+        </header>
+
+        <div class="bento">
+          <article class="cell c3 reveal">
+            <div class="pty">
+              <div class="pty-bar"><span><i></i><i></i></span><span>TERMINAL</span><span></span></div>
+              <div class="pty-body">
+                <p><span class="chev">›</span> <span id="pty-typed"></span><span class="caret"></span></p>
+                <span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span>
+              </div>
+            </div>
+            <h3>Run code</h3>
+            <p>Run any command and watch the output live. Or open a full terminal.</p>
+          </article>
+
+          <article class="cell c3 reveal">
+            <div class="ports">
+              <div class="port on"><span class="pn">:3000</span><span class="link"></span><span class="url"><b>●</b> https://&#123;label&#125;.preview.example.com</span></div>
+              <div class="port"><span class="pn">:8080</span><span class="link"></span><span class="url">you choose who can open it</span></div>
+            </div>
+            <dl class="egress">
+              <dt>SITES IT CAN REACH</dt>
+              <dd><b>allow</b>github.com</dd>
+              <dd><b>allow</b>*.pypi.org</dd>
+              <dd class="deny"><b>block</b>every other site</dd>
+            </dl>
+            <h3>Internet</h3>
+            <p>Share a web app with a link. Pick which sites the agent can reach. Every connection is logged.</p>
+          </article>
+
+          <article class="cell c2 reveal">
+            <ul class="tree">
+              <li class="root">/workspace</li>
+              <li>src/</li>
+              <li class="in2">main.py</li>
+              <li class="in2 fresh">out.txt <em>● written · now</em></li>
+              <li class="root vol">/data <span>⟶ kept after the end</span></li>
+            </ul>
+            <h3>Files</h3>
+            <p>Put files in and take files out. Keep a folder after the sandbox is gone.</p>
+          </article>
+
+          <article class="cell c2 reveal">
+            <div class="ticker" aria-hidden="true">
+              <ul>
+                {
+                  [...events, ...events].map(([t, d]) => (
+                    <li>
+                      <b>{t}</b>
+                      <span>{d}</span>
+                    </li>
+                  ))
+                }
+              </ul>
+            </div>
+            <h3>Activity log</h3>
+            <p>See every step the agent takes, live. Send it to your own tools with OpenTelemetry.</p>
+          </article>
+
+          <article class="cell c2 reveal">
+            <div class="vault">
+              <div class="req">
+                <small>IN THE SANDBOX</small>
+                <code>API key = <span class="ph">fake-key</span></code>
+              </div>
+              <div class="pipe"><i></i></div>
+              <div class="req out">
+                <small>SENT TO openai.com</small>
+                <code>API key = <span class="real">real key ••••</span></code>
+              </div>
+            </div>
+            <h3>Safe API keys</h3>
+            <p>The agent only sees a fake key. Spawnbox swaps in the real one on the way to sites you allow.</p>
+          </article>
+
+          <article class="cell c6 reveal">
+            <svg class="life" viewBox="0 0 1000 170" role="img" aria-label="Lifecycle: run, pause, resume, snapshot, fork">
+              <path d="M60 85 H260" class="lf-line"></path>
+              <path d="M260 85 H460" class="lf-line dotted"></path>
+              <path d="M460 85 H660" class="lf-line"></path>
+              {
+                [25, 65, 105, 145].map((y, n) => (
+                  <path d={`M670 85 C 760 85, 760 ${y}, 850 ${y} H 990`} class="lf-branch" style={`--bd:${n * 0.15}s`} />
+                ))
+              }
+              <circle r="5" class="packet">
+                <animateMotion dur="4s" repeatCount="indefinite" path="M60 85 H660" />
+              </circle>
+              <circle cx="60" cy="85" r="7" class="lf-node"></circle>
+              <circle cx="260" cy="85" r="7" class="lf-node"></circle>
+              <circle cx="460" cy="85" r="7" class="lf-node"></circle>
+              <rect x="652" y="77" width="16" height="16" class="lf-snap"></rect>
+              <text x="60" y="122" class="lbl mid">RUNNING</text>
+              <text x="260" y="122" class="lbl mid">PAUSED</text>
+              <text x="260" y="138" class="lbl mid mut">SAVED TO DISK</text>
+              <text x="460" y="122" class="lbl mid">AWAKE AGAIN</text>
+              <text x="460" y="138" class="lbl mid mut">≈ 65 ms</text>
+              <text x="660" y="122" class="lbl mid">SAVED COPY</text>
+              <text x="990" y="14" class="lbl end">COPIES · UP TO 16</text>
+            </svg>
+            <h3>Pause, wake, copy</h3>
+            <p>Idle sandboxes pause by themselves to save room. Wake one up, save it, or make copies.</p>
+          </article>
+
+          <figure class="cell c3 scene-cell reveal">
+            <svg viewBox="-160 -110 320 200" role="img" aria-label="One sandbox forks into copies">
+              <Box i={-1} j={-1} w={9} d={2.5} h={0.3} s={20} tone="deep" />
+              <Box i={-0.5} j={-0.5} k={0.3} w={1.6} d={1.6} h={1.6} s={20} />
+              {
+                [1, 2, 3].map((n) => (
+                  <g class="fork" style={`--dx:${(C * 20 * 2.2 * n).toFixed(1)}px;--dy:${(0.5 * 20 * 2.2 * n).toFixed(1)}px;--fd:${n * 0.25}s`}>
+                    <Box i={-0.5} j={-0.5} k={0.3} w={1.6} d={1.6} h={1.6} s={20} tone="pale" />
+                  </g>
+                ))
+              }
+              <text x="-150" y="-80" class="lbl">spawnbox fork $S --count 3</text>
+            </svg>
+            <h3>Copy a sandbox</h3>
+            <p>Make up to 16 copies of a running sandbox, with everything in it, in under 1&nbsp;s.</p>
+          </figure>
+
+          <figure class="cell c3 scene-cell reveal">
+            <svg viewBox="-160 -110 320 200" role="img" aria-label="A primary places sandboxes on worker hosts">
+              <Box i={-5} j={-2} w={2.4} d={2.4} h={1.2} s={18} tone="deep" />
+              {
+                [-3, 0, 3].map((jj, n) => (
+                  <g class="drop" style={`--d:${n * 0.15}s`}>
+                    <Box i={2} j={jj} w={2.2} d={2} h={0.5} s={18} tone={n === 2 ? "wire" : "solid"} />
+                    <g class="bob" style={`--b:${n * 0.5}s`}>
+                      <Box i={2.5} j={jj + 0.5} k={0.5} w={0.9} d={0.9} h={0.9} s={18} tone="pale" />
+                    </g>
+                  </g>
+                ))
+              }
+              {
+                [-3, 0, 3].map((jj, n) => {
+                  const d = `M${xy(-2.6, -0.8, 1.2, 18)} L${xy(2, jj + 1, 0.5, 18)}`;
+                  return (
+                    <>
+                      <path d={d} class="wire-path" />
+                      <circle r="3" class="packet">
+                        <animateMotion dur="2.2s" begin={`${n * 0.7}s`} repeatCount="indefinite" path={d} />
+                      </circle>
+                    </>
+                  );
+                })
+              }
+              <text x="-150" y="-80" class="lbl">MAIN SERVER</text>
+              <text x="150" y="-80" class="lbl end">MORE SERVERS</text>
+              <text x="150" y="86" class="lbl end mut">BEING EMPTIED</text>
+            </svg>
+            <h3>Add more servers</h3>
+            <p>You talk to one main server. It puts each sandbox where there is the most room.</p>
+          </figure>
+        </div>
+      </section>
+
+      <section id="compare">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 5"><b>05</b><small>06</small></span>
+          <h2>How it compares</h2>
+          <p class="sec-sub">
+            We checked each project's own website on 8 Nov 2026. Spawnbox is not the cheapest cloud or the fastest
+            start. It is made to be easy to run yourself, to serve many customers, and to log everything agents do.
+          </p>
+        </header>
+        <div class="legend reveal">
+          <span><i class="m yes">●</i> Yes</span>
+          <span><i class="m part">◐</i> Partly</span>
+          <span><i class="m no">○</i> No</span>
+          <span><i class="m unk">?</i> Not stated</span>
+        </div>
+        <div class="table-wrap reveal">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col"></th>
+                {providers.map((p, n) => <th scope="col" class={n === 0 ? "us" : ""}>{p}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {
+                compare.map((r) => (
+                  <tr>
+                    <th scope="row">{r.row}</th>
+                    {r.cells.map(([m, t], n) => (
+                      <td class={n === 0 ? "us" : ""}>
+                        <i class={`m ${m}`} role="img" aria-label={markLabel[m]}>
+                          {markGlyph[m]}
+                        </i>
+                        <span>{t}</span>
+                      </td>
+                    ))}
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+        <p class="sources reveal">
+          Sources:
+          {sources.map(([n, u]) => <a href={u}>{n}</a>)}
+        </p>
+      </section>
+
+      <section id="install">
+        <header class="sec-head reveal">
+          <span class="sec-no" aria-label="Section 6"><b>06</b><small>06</small></span>
+          <h2>Install</h2>
+          <p class="sec-sub">You need a Linux server: Ubuntu 22.04+ or Debian 12+, x86_64. KVM is best, but not required.</p>
+        </header>
+        <div class="install-grid">
+          <div class="term reveal">
+            <div class="term-bar"><span><i></i><i></i><i></i></span><span>host:~</span></div>
+            <pre><code><span class="p">$</span> {install}
+<span class="p">$</span> S=$(spawnbox create --timeout 600)
+<span class="p">$</span> spawnbox exec $S -- uname -a</code></pre>
+          </div>
+          <ol class="steps reveal">
+            <li><b>Get a server.</b> At least 4 GiB memory and 40 GiB disk. A physical server, or a cloud VM that can run VMs inside it.</li>
+            <li><b>Run the install script.</b> It downloads Spawnbox, checks the download is not changed, and starts it as a service.</li>
+            <li><b>Start a sandbox.</b> Use the <code>spawnbox</code> command or the HTTP API.</li>
+          </ol>
+        </div>
+        <p class="warn reveal">
+          <b>WARNING</b> Sandboxes run code you do not trust. Use a separate server, not your own laptop or a live
+          production server.
+        </p>
+      </section>
+
+      <footer class="title-block">
+        <div class="tb-cell tb-name"><span class="k">PROJECT</span><span class="v big">SPAWNBOX</span></div>
+        <div class="tb-cell"><span class="k">RUNTIME</span><span class="v">FIRECRACKER · gVISOR</span></div>
+        <div class="tb-cell"><span class="k">LICENSE</span><span class="v">APACHE-2.0</span></div>
+        <div class="tb-cell"><span class="k">SOURCE</span><a class="v" href={repo}>TulipFarm/spawnbox ↗</a></div>
+      </footer>
+    </div>
+
+    <script>
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      function countUp(el: HTMLElement) {
+        const end = Number(el.dataset.count);
+        const t0 = performance.now();
+        const tick = (t: number) => {
+          const k = Math.min(1, (t - t0) / 900);
+          el.textContent = String(Math.round(end * (1 - Math.pow(1 - k, 3))));
+          if (k < 1) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }
+
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (!e.isIntersecting) continue;
+            e.target.classList.add("in");
+            if (!reduce) e.target.querySelectorAll<HTMLElement>("[data-count]").forEach(countUp);
+            io.unobserve(e.target);
+          }
+        },
+        { threshold: 0.15 },
+      );
+      document.querySelectorAll<HTMLElement>(".reveal").forEach((el, n) => {
+        el.style.setProperty("--rd", `${(n % 4) * 70}ms`);
+        io.observe(el);
+      });
+
+
+      const marks = document.querySelectorAll<SVGElement>(".stack [data-l]");
+      const stepIo = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (!e.isIntersecting) continue;
+            const n = (e.target as HTMLElement).dataset.step!;
+            document.querySelectorAll(".fit-step").forEach((s) => s.classList.toggle("on", s === e.target));
+            marks.forEach((m) => m.classList.toggle("on", m.dataset.l!.split(" ").includes(n)));
+          }
+        },
+        { rootMargin: "-45% 0px -45% 0px" },
+      );
+      document.querySelectorAll(".fit-step").forEach((el) => stepIo.observe(el));
+
+      const up = document.getElementById("uptime")!;
+      const t0 = Date.now();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const clock = () => {
+        const s = Math.floor((Date.now() - t0) / 1000);
+        up.textContent = `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+      };
+      if (!reduce) setInterval(clock, 1000);
+
+      const pty = document.getElementById("pty-typed")!;
+      const cmd = "python3 main.py";
+      if (reduce) pty.textContent = cmd;
+      else {
+        let pi = 0;
+        const ptyStep = () => {
+          pi = (pi + 1) % (cmd.length + 25);
+          pty.textContent = cmd.slice(0, pi);
+          setTimeout(ptyStep, 90);
+        };
+        ptyStep();
+      }
+
+      const lines = [
+        "spawnbox create --timeout 600",
+        "spawnbox exec $S -- python3 main.py",
+        "spawnbox ports publish $S 3000",
+        "spawnbox fork $S --count 3",
+        "spawnbox pause $S",
+      ];
+      const typed = document.getElementById("typed")!;
+      if (reduce) {
+        typed.textContent = lines[0];
+        document.querySelectorAll("svg").forEach((s) => s.pauseAnimations());
+      } else {
+        let li = 0;
+        let ci = 0;
+        let del = false;
+        const step = () => {
+          const line = lines[li];
+          ci += del ? -1 : 1;
+          typed.textContent = line.slice(0, ci);
+          let wait = del ? 25 : 55;
+          if (!del && ci === line.length) {
+            del = true;
+            wait = 1600;
+          } else if (del && ci === 0) {
+            del = false;
+            li = (li + 1) % lines.length;
+            wait = 300;
+          }
+          setTimeout(step, wait);
+        };
+        step();
+      }
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  :root {
+    --paper: #fbfcfe;
+    --ink: #0a1f4d;
+    --muted: #4a5f86;
+    --blue: #1d4ed8;
+    --blue-2: #3b82f6;
+    --sky: #e8f0ff;
+    --line: rgba(29, 78, 216, 0.22);
+    --grid-minor: rgba(29, 78, 216, 0.05);
+    --grid-major: rgba(29, 78, 216, 0.1);
+    --top: #f2f6ff;
+    --left: #c9dafd;
+    --right: #93b4fb;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+    --sans: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    margin: 0;
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.55;
+    background-color: var(--paper);
+    background-image:
+      linear-gradient(var(--grid-major) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+      linear-gradient(var(--grid-minor) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-minor) 1px, transparent 1px);
+    background-size:
+      100px 100px,
+      100px 100px,
+      20px 20px,
+      20px 20px;
+  }
+  a {
+    color: inherit;
+  }
+  a:focus-visible {
+    outline: 2px dashed var(--blue);
+    outline-offset: 3px;
+  }
+
+  .sheet {
+    max-width: 1200px;
+    margin: 24px auto;
+    padding: 0 36px;
+    border: 1.5px solid var(--ink);
+    outline: 1px solid var(--line);
+    outline-offset: 6px;
+    background: rgba(251, 252, 254, 0.6);
+    position: relative;
+  }
+  .sheet::before,
+  .sheet::after {
+    content: "";
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid var(--blue);
+  }
+  .sheet::before {
+    top: -10px;
+    left: -10px;
+    border-right: 0;
+    border-bottom: 0;
+  }
+  .sheet::after {
+    bottom: -10px;
+    right: -10px;
+    border-left: 0;
+    border-top: 0;
+  }
+
+  .iso polygon {
+    stroke: var(--blue);
+    stroke-width: 1.2;
+    stroke-linejoin: round;
+  }
+  .f-top {
+    fill: var(--top);
+  }
+  .f-left {
+    fill: var(--left);
+  }
+  .f-right {
+    fill: var(--right);
+  }
+  .iso-deep .f-top {
+    fill: #dbe7ff;
+  }
+  .iso-deep .f-left {
+    fill: #7ea3f5;
+  }
+  .iso-deep .f-right {
+    fill: #4f7fe8;
+  }
+  .iso-pale polygon {
+    fill: #fff;
+  }
+  .iso-pale .f-right {
+    fill: var(--sky);
+  }
+  .iso-wire polygon {
+    fill: rgba(255, 255, 255, 0.5);
+    stroke-dasharray: 4 3;
+  }
+  .gridline {
+    stroke: rgba(29, 78, 216, 0.08);
+    stroke-width: 1;
+  }
+
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 18px 0;
+    border-bottom: 1px solid var(--line);
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .mark {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+    font-family: var(--mono);
+    font-weight: 600;
+    letter-spacing: 0.2em;
+  }
+  nav {
+    display: flex;
+    gap: 22px;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  nav a:not(.btn-line) {
+    text-decoration: none;
+    color: var(--muted);
+    position: relative;
+  }
+  nav a:not(.btn-line)::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 100%;
+    bottom: -4px;
+    border-bottom: 1.5px solid var(--blue);
+    transition: right 0.25s;
+  }
+  nav a:not(.btn-line):hover {
+    color: var(--ink);
+  }
+  nav a:not(.btn-line):hover::after {
+    right: 0;
+  }
+
+  .btn,
+  .btn-line {
+    font-family: var(--mono);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-decoration: none;
+    padding: 11px 18px;
+    border: 1.5px solid var(--ink);
+    display: inline-block;
+    box-shadow: 4px 4px 0 var(--blue);
+    transition:
+      transform 0.15s,
+      box-shadow 0.15s;
+    background: #fff;
+  }
+  .btn {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 4px 4px 0 var(--ink);
+  }
+  .btn:hover,
+  .btn-line:hover {
+    transform: translate(-2px, -2px);
+    box-shadow: 6px 6px 0 var(--ink);
+  }
+  .btn:active,
+  .btn-line:active {
+    transform: translate(2px, 2px);
+    box-shadow: 1px 1px 0 var(--ink);
+  }
+
+  .hero {
+    display: grid;
+    grid-template-columns: 1fr 1.1fr;
+    gap: 40px;
+    align-items: center;
+    padding: 64px 0 48px;
+  }
+  .tag {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    color: var(--blue);
+    margin: 0 0 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .blink {
+    width: 8px;
+    height: 8px;
+    flex: none;
+    background: var(--blue);
+    animation: blink 1.2s steps(2, start) infinite;
+  }
+  @keyframes blink {
+    to {
+      visibility: hidden;
+    }
+  }
+  h1 {
+    font-size: clamp(42px, 5.6vw, 70px);
+    line-height: 1.02;
+    margin: 0 0 22px;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+  }
+  .hl {
+    display: block;
+    color: var(--blue);
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 19px;
+    max-width: 52ch;
+    margin: 0 0 28px;
+  }
+  .cta {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .typer {
+    margin-top: 28px;
+    font-family: var(--mono);
+    font-size: 14px;
+    border: 1px dashed var(--line);
+    background: #fff;
+    padding: 10px 14px;
+    min-height: 44px;
+    max-width: 440px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .p {
+    color: var(--blue);
+    user-select: none;
+  }
+  .caret {
+    display: inline-block;
+    width: 8px;
+    height: 16px;
+    background: var(--blue);
+    vertical-align: -3px;
+    margin-left: 2px;
+    animation: blink 1s steps(2, start) infinite;
+  }
+
+  .scene {
+    margin: 0;
+    border: 1px solid var(--line);
+    background: #fff;
+    padding: 14px;
+    min-width: 0;
+  }
+  .scene svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+  .scene figcaption {
+    font-size: 15px;
+    color: var(--muted);
+    border-top: 1px solid var(--line);
+    padding-top: 10px;
+    margin-top: 10px;
+  }
+  .scene figcaption b {
+    color: var(--ink);
+  }
+  .hero-scene svg {
+    overflow: hidden;
+  }
+  .hero-scene figcaption {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+  }
+  .lbl {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    fill: var(--ink);
+    font-weight: 500;
+  }
+  .end {
+    text-anchor: end;
+  }
+  .mid {
+    text-anchor: middle;
+  }
+  .lbl.mut {
+    fill: var(--muted);
+  }
+  .code {
+    font-family: var(--mono);
+    font-size: 12px;
+    fill: var(--ink);
+  }
+  .code.real {
+    fill: var(--blue);
+    animation: reveal-key 3s infinite;
+  }
+  @keyframes reveal-key {
+    0%,
+    55% {
+      opacity: 0.15;
+    }
+    70%,
+    100% {
+      opacity: 1;
+    }
+  }
+  .leader {
+    fill: none;
+    stroke: var(--ink);
+    stroke-width: 0.8;
+  }
+  .wire-path {
+    fill: none;
+    stroke: var(--blue-2);
+    stroke-width: 1.2;
+    stroke-dasharray: 3 4;
+    animation: march 1s linear infinite;
+  }
+  @keyframes march {
+    to {
+      stroke-dashoffset: -14;
+    }
+  }
+  .packet {
+    fill: var(--blue);
+    stroke: #fff;
+    stroke-width: 1.5;
+  }
+
+  .drop {
+    animation: drop 0.8s cubic-bezier(0.2, 1.4, 0.4, 1) var(--d, 0s) both;
+  }
+  @keyframes drop {
+    from {
+      opacity: 0;
+      transform: translateY(-60px);
+    }
+  }
+  .bob {
+    animation: bob 3.2s ease-in-out var(--b, 0s) infinite;
+  }
+  @keyframes bob {
+    50% {
+      transform: translateY(-5px);
+    }
+  }
+  .float {
+    animation: bob 2.6s ease-in-out infinite;
+  }
+  .blinkbox {
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  .fork {
+    animation: fork 3.6s cubic-bezier(0.6, 0, 0.2, 1) var(--fd) infinite;
+  }
+  @keyframes fork {
+    0%,
+    10% {
+      transform: none;
+      opacity: 0;
+    }
+    35%,
+    80% {
+      transform: translate(var(--dx), var(--dy));
+      opacity: 1;
+    }
+    100% {
+      transform: translate(var(--dx), var(--dy));
+      opacity: 0;
+    }
+  }
+
+  .pause-solid,
+  .state-run {
+    animation: phase-a 4s infinite;
+  }
+  .pause-wire,
+  .state-pause {
+    animation: phase-b 4s infinite;
+  }
+  .disk {
+    animation: disk 4s infinite;
+  }
+  @keyframes phase-a {
+    0%,
+    40%,
+    100% {
+      opacity: 1;
+    }
+    50%,
+    90% {
+      opacity: 0;
+    }
+  }
+  @keyframes phase-b {
+    0%,
+    40%,
+    100% {
+      opacity: 0;
+    }
+    50%,
+    90% {
+      opacity: 1;
+    }
+  }
+  @keyframes disk {
+    50%,
+    90% {
+      transform: translateY(-8px);
+    }
+  }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    position: relative;
+  }
+  .metric {
+    padding: 26px 20px;
+    border-left: 1px solid var(--line);
+  }
+  .metric:first-child {
+    border-left: 0;
+  }
+  .ruler {
+    width: 100%;
+    height: 10px;
+    display: block;
+    margin-bottom: 14px;
+  }
+  .ruler path {
+    stroke: var(--blue);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+    fill: none;
+    stroke-dasharray: 200;
+    stroke-dashoffset: 200;
+    transition: stroke-dashoffset 1.2s ease-out 0.2s;
+  }
+  .metric.in .ruler path {
+    stroke-dashoffset: 0;
+  }
+  .m-n {
+    font-family: var(--mono);
+    font-size: 42px;
+    font-weight: 500;
+    margin: 0;
+    line-height: 1.1;
+    color: var(--blue);
+  }
+  .m-n small {
+    font-size: 15px;
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .m-l {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  .note {
+    position: absolute;
+    right: 0;
+    bottom: -28px;
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  section:not(.hero):not(.metrics) {
+    padding: 88px 0 16px;
+  }
+  .sec-head {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 18px;
+    align-items: baseline;
+    margin-bottom: 36px;
+  }
+  .sec-no {
+    font-family: var(--mono);
+    width: 46px;
+    height: 46px;
+    border: 1.5px solid var(--ink);
+    border-radius: 50%;
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    place-items: center;
+    background: linear-gradient(transparent calc(50% - 0.75px), var(--ink) 0 calc(50% + 0.75px), transparent 0);
+    align-self: center;
+  }
+  .sec-no b {
+    font-size: 13px;
+    color: var(--blue);
+    align-self: end;
+    padding-bottom: 1px;
+  }
+  .sec-no small {
+    font-size: 9px;
+    color: var(--muted);
+    align-self: start;
+    padding-top: 2px;
+  }
+  h2 {
+    margin: 0;
+    font-size: clamp(28px, 3.4vw, 38px);
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  .sec-sub {
+    grid-column: 2;
+    margin: 8px 0 0;
+    color: var(--muted);
+    max-width: 70ch;
+  }
+
+  .group {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 24px;
+    padding: 22px 0;
+    border-top: 1px solid var(--line);
+  }
+  .group-name {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--blue);
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid var(--line);
+    padding: 16px 18px 18px;
+    transition:
+      transform 0.2s,
+      box-shadow 0.2s,
+      border-color 0.2s,
+      opacity 0.6s;
+  }
+  .card:hover {
+    transform: translate(-3px, -3px);
+    box-shadow: 6px 6px 0 var(--sky);
+    border-color: var(--blue);
+  }
+  .card .icon {
+    width: 56px;
+    height: 56px;
+    float: right;
+    margin: -4px -6px 0 8px;
+    overflow: visible;
+  }
+  .card .lift,
+  .card .lift2,
+  .card .slide {
+    transition: transform 0.35s cubic-bezier(0.2, 1.4, 0.4, 1);
+  }
+  .card:hover .lift {
+    transform: translateY(-6px);
+  }
+  .card:hover .lift2 {
+    transform: translateY(-12px);
+  }
+  .card:hover .slide {
+    transform: translate(-14px, 8px);
+  }
+  .fid {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--blue);
+    margin: 0 0 4px;
+    letter-spacing: 0.08em;
+  }
+  h4 {
+    margin: 0 0 6px;
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .card p:last-child {
+    margin: 0;
+    font-size: 15px;
+    color: var(--muted);
+  }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    background: #fff;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 900px;
+    font-size: 14px;
+  }
+  th,
+  td {
+    text-align: left;
+    vertical-align: top;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  tbody tr:last-child > * {
+    border-bottom: 0;
+  }
+  thead th {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--sky);
+  }
+  tbody th {
+    font-weight: 600;
+    width: 190px;
+    position: sticky;
+    left: 0;
+    background: #fff;
+    z-index: 1;
+  }
+  td {
+    color: var(--muted);
+  }
+  td span {
+    display: block;
+  }
+  .us {
+    background: #f3f7ff;
+    color: var(--ink);
+    box-shadow: inset 2px 0 0 var(--blue);
+  }
+  thead th.us {
+    background: var(--blue);
+    color: #fff;
+  }
+  tbody tr:hover td:not(.us) {
+    background: #fafcff;
+  }
+  .m {
+    font-style: normal;
+    font-size: 14px;
+    display: inline-block;
+    margin-bottom: 2px;
+  }
+  .m.yes {
+    color: var(--blue);
+  }
+  .m.part {
+    color: var(--blue-2);
+  }
+  .m.no,
+  .m.unk {
+    color: #8a9bbd;
+  }
+  .m.unk {
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .sources {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .install-grid {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  .term {
+    border: 1.5px solid var(--ink);
+    background: var(--ink);
+    color: #e8f0ff;
+    box-shadow: 8px 8px 0 var(--sky);
+    min-width: 0;
+  }
+  .term-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: #9fb5e0;
+    padding: 9px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  }
+  .term-bar i {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border: 1px solid #9fb5e0;
+    margin-right: 5px;
+  }
+  .term pre {
+    margin: 0;
+    padding: 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .term .p {
+    color: #7fb0ff;
+  }
+  .steps {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: s;
+  }
+  .steps li {
+    counter-increment: s;
+    position: relative;
+    padding: 0 0 18px 46px;
+    color: var(--muted);
+  }
+  .steps li::before {
+    content: counter(s, decimal-leading-zero);
+    position: absolute;
+    left: 0;
+    top: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: #fff;
+    background: var(--blue);
+    padding: 2px 6px;
+  }
+  .steps b {
+    color: var(--ink);
+  }
+  .steps code {
+    font-family: var(--mono);
+    font-size: 14px;
+    background: var(--sky);
+    padding: 1px 5px;
+  }
+  .warn {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+    border: 1px dashed var(--blue);
+    background: #fff;
+    padding: 12px 16px;
+    margin: 24px 0 0;
+  }
+  .warn b {
+    color: #fff;
+    background: var(--blue);
+    padding: 1px 6px;
+    margin-right: 8px;
+  }
+
+  .title-block {
+    margin: 80px -36px 0;
+    display: grid;
+    grid-template-columns: 2fr repeat(3, 1fr);
+    border-top: 1.5px solid var(--ink);
+    background: #fff;
+  }
+  .tb-cell {
+    padding: 12px 16px;
+    border-left: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .tb-cell:first-child {
+    border-left: 0;
+  }
+  .k {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    color: var(--muted);
+  }
+  .v {
+    font-family: var(--mono);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .v.big {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: var(--blue);
+  }
+
+  .reveal {
+    opacity: 0;
+    translate: 0 18px;
+    transition:
+      opacity 0.6s ease var(--rd, 0ms),
+      translate 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) var(--rd, 0ms),
+      transform 0.2s,
+      box-shadow 0.2s,
+      border-color 0.2s;
+  }
+  .reveal.in {
+    opacity: 1;
+    translate: none;
+  }
+
+
+  .fits {
+    display: grid;
+    grid-template-columns: 1.05fr 1fr;
+    gap: 48px;
+  }
+  .stack-wrap {
+    position: sticky;
+    top: 84px;
+    align-self: start;
+    border: 1px solid var(--line);
+    background: #fff;
+    padding: 18px;
+  }
+  .stack {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+  .ly {
+    opacity: 0.22;
+    transition: opacity 0.5s;
+  }
+  .ly.on {
+    opacity: 1;
+  }
+  .draw {
+    fill: none;
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+  }
+  .ly.on .draw {
+    animation: draw 1.1s cubic-bezier(0.3, 0, 0.2, 1) forwards;
+  }
+  .hatch-line {
+    stroke: var(--blue-2);
+    stroke-width: 1;
+  }
+  .part {
+    fill: #fff;
+    stroke: var(--ink);
+    stroke-width: 1.5;
+  }
+  .wall {
+    fill: url(#hatch);
+    stroke: var(--blue);
+    stroke-width: 1;
+  }
+  .edge {
+    stroke: var(--ink);
+    stroke-width: 2;
+  }
+  .flow {
+    stroke: var(--blue);
+    stroke-width: 1.5;
+  }
+  .arrow {
+    fill: none;
+    stroke: var(--blue);
+    stroke-width: 1.5;
+  }
+  .port-notch {
+    fill: #fff;
+    stroke: var(--ink);
+    stroke-width: 1.2;
+  }
+  .ly.on .port-notch {
+    fill: var(--blue);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .dim {
+    fill: none;
+    stroke: var(--muted);
+    stroke-width: 0.8;
+  }
+  .ws {
+    fill: #fff;
+    stroke: var(--blue-2);
+    stroke-dasharray: 4 3;
+  }
+  .proc {
+    fill: var(--sky);
+    stroke: var(--blue-2);
+    animation: pulse 1.8s ease-in-out var(--p) infinite;
+  }
+  .proxy {
+    fill: var(--blue);
+  }
+  .blocked {
+    stroke: var(--muted);
+    stroke-dasharray: 3 3;
+  }
+  .x {
+    stroke: var(--ink);
+    stroke-width: 1.5;
+  }
+  .foundation {
+    fill: url(#hatch);
+  }
+  .lbl.small {
+    font-size: 10px;
+  }
+  .lbl.blue {
+    fill: var(--blue);
+  }
+  .code.mut {
+    fill: var(--muted);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: var(--blue);
+    margin: 0 0 10px;
+  }
+  .fit-step {
+    min-height: 68vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    opacity: 0.35;
+    transition: opacity 0.4s;
+  }
+  .fit-step.on {
+    opacity: 1;
+  }
+  .fit-step h3 {
+    font-size: clamp(24px, 2.6vw, 30px);
+    margin: 0;
+    line-height: 1.15;
+  }
+  .fit-sub {
+    color: var(--muted);
+    margin: 8px 0 18px;
+  }
+  .fit-step dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    margin: 0;
+    border-top: 1px solid var(--line);
+  }
+  .fit-step dt,
+  .fit-step dd {
+    margin: 0;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .fit-step dt {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    padding-right: 20px;
+  }
+  .fit-step code,
+  .cell code {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
+  .bento {
+    counter-reset: fig;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 16px;
+  }
+  .cell {
+    position: relative;
+    counter-increment: fig;
+    margin: 0;
+    border: 1px solid var(--line);
+    background:
+      linear-gradient(var(--ink), var(--ink)) top left / 12px 1.5px no-repeat,
+      linear-gradient(var(--ink), var(--ink)) top left / 1.5px 12px no-repeat,
+      linear-gradient(var(--ink), var(--ink)) bottom right / 12px 1.5px no-repeat,
+      linear-gradient(var(--ink), var(--ink)) bottom right / 1.5px 12px no-repeat,
+      #fff;
+    padding: 30px 18px 18px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .cell::after {
+    content: "FIG. 3." counter(fig);
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+  }
+  .c2 {
+    grid-column: span 2;
+  }
+  .c3 {
+    grid-column: span 3;
+  }
+  .c6 {
+    grid-column: span 6;
+  }
+  .cell h3 {
+    margin: auto 0 4px;
+    padding-top: 16px;
+    font-size: 19px;
+  }
+  .cell > p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  .cell svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+  .pty {
+    border: 1px solid var(--ink);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .pty-bar {
+    display: flex;
+    justify-content: space-between;
+    background: var(--ink);
+    color: #fff;
+    padding: 6px 10px;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+  }
+  .pty-bar i {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border: 1px solid #fff;
+    margin-right: 5px;
+  }
+  .pty-body {
+    padding: 12px;
+    min-height: 120px;
+    background-image: linear-gradient(var(--sky) 1px, transparent 1px);
+    background-size: 100% 22px;
+  }
+  .pty-body p {
+    margin: 0 0 10px;
+  }
+  .chev {
+    color: var(--blue);
+  }
+  .caret {
+    display: inline-block;
+    width: 7px;
+    height: 14px;
+    background: var(--blue);
+    vertical-align: -2px;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  .bar {
+    display: block;
+    height: 8px;
+    background: var(--sky);
+    margin-top: 8px;
+    transform-origin: left;
+    animation: bar 3.2s ease-in-out infinite;
+  }
+  .b1 {
+    width: 80%;
+  }
+  .b2 {
+    width: 55%;
+    animation-delay: 0.3s;
+  }
+  .b3 {
+    width: 68%;
+    background: var(--blue-2);
+    animation-delay: 0.6s;
+  }
+  @keyframes bar {
+    0%,
+    15% {
+      transform: scaleX(0);
+    }
+    45%,
+    100% {
+      transform: scaleX(1);
+    }
+  }
+  .ports {
+    display: grid;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .port {
+    display: grid;
+    grid-template-columns: auto 40px 1fr;
+    align-items: center;
+    gap: 8px;
+  }
+  .pn {
+    border: 1px solid var(--ink);
+    padding: 3px 6px;
+  }
+  .port.on .pn {
+    background: var(--blue);
+    color: #fff;
+    border-color: var(--blue);
+  }
+  .link {
+    height: 0;
+    border-top: 1.5px dashed var(--blue-2);
+  }
+  .port.on .link {
+    border-top-style: solid;
+  }
+  .url {
+    overflow-wrap: anywhere;
+    color: var(--muted);
+  }
+  .port.on .url {
+    color: var(--ink);
+  }
+  .url b {
+    color: var(--blue);
+    animation: pulse 1.6s infinite;
+  }
+  .egress {
+    margin: 14px 0 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .egress dt {
+    color: var(--muted);
+    letter-spacing: 0.14em;
+    padding: 8px 0 4px;
+  }
+  .egress dd {
+    margin: 0;
+    padding: 4px 0;
+  }
+  .egress dd b {
+    display: inline-block;
+    width: 56px;
+    color: var(--blue);
+  }
+  .egress .deny {
+    color: var(--muted);
+    text-decoration: line-through;
+  }
+  .egress .deny b {
+    color: var(--muted);
+  }
+  .tree {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .tree li {
+    padding: 4px 0 4px 18px;
+    border-left: 1px solid var(--line);
+  }
+  .tree .in2 {
+    margin-left: 18px;
+  }
+  .tree .root {
+    border-left: 0;
+    padding-left: 0;
+    font-weight: 600;
+  }
+  .tree .vol {
+    margin-top: 10px;
+  }
+  .tree .vol span {
+    color: var(--blue);
+    font-weight: 400;
+  }
+  .tree .fresh em {
+    font-style: normal;
+    font-size: 11px;
+    color: var(--blue);
+    animation: pulse 1.6s infinite;
+  }
+  .ticker {
+    height: 150px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    mask-image: linear-gradient(transparent, #000 20%, #000 80%, transparent);
+  }
+  .ticker ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    animation: tick 18s linear infinite;
+  }
+  .ticker li {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .ticker b {
+    color: var(--blue);
+    font-weight: 500;
+  }
+  .ticker span {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  @keyframes tick {
+    to {
+      transform: translateY(-50%);
+    }
+  }
+  .vault {
+    display: grid;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .req {
+    border: 1px solid var(--line);
+    padding: 8px 10px;
+  }
+  .req small {
+    display: block;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .req.out {
+    border-color: var(--blue);
+  }
+  .ph {
+    color: var(--muted);
+  }
+  .real {
+    color: var(--blue);
+    animation: reveal-key 3s infinite;
+  }
+  .pipe {
+    position: relative;
+    height: 34px;
+    margin-left: 22px;
+    border-left: 1.5px dashed var(--blue-2);
+  }
+  .pipe i {
+    position: absolute;
+    left: -5px;
+    top: 0;
+    width: 8px;
+    height: 8px;
+    background: var(--blue);
+    animation: drip 3s ease-in infinite;
+  }
+  @keyframes drip {
+    0%,
+    20% {
+      top: 0;
+      opacity: 0;
+    }
+    30% {
+      opacity: 1;
+    }
+    55%,
+    100% {
+      top: 26px;
+      opacity: 0;
+    }
+  }
+  .lf-line {
+    fill: none;
+    stroke: var(--ink);
+    stroke-width: 1.5;
+  }
+  .lf-line.dotted {
+    stroke-dasharray: 2 5;
+    stroke: var(--muted);
+  }
+  .lf-branch {
+    fill: none;
+    stroke: var(--blue-2);
+    stroke-width: 1.5;
+    stroke-dasharray: 400;
+    stroke-dashoffset: 400;
+  }
+  .in .lf-branch {
+    animation: draw 1.4s cubic-bezier(0.3, 0, 0.2, 1) var(--bd) forwards;
+  }
+  @keyframes draw {
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+  .lf-node {
+    fill: #fff;
+    stroke: var(--ink);
+    stroke-width: 1.5;
+  }
+  .lf-snap {
+    fill: var(--blue);
+  }
+  .scene-cell svg {
+    max-height: 220px;
+  }
+
+  /* hero status bar */
+  .hero-scene figcaption.status {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .live {
+    color: var(--blue);
+    animation: pulse 1.6s infinite;
+  }
+
+  .uses {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+  .use {
+    border: 1px solid var(--line);
+    background: #fff;
+    padding: 18px;
+    min-width: 0;
+  }
+  .use h3 {
+    margin: 18px 0 4px;
+    font-size: 21px;
+  }
+  .use > p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  .use code {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+  }
+  .win {
+    border: 1px solid var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .win-bar {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--ink);
+    color: #fff;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .url-bar {
+    justify-content: flex-start;
+    background: var(--sky);
+    color: var(--ink);
+    letter-spacing: 0.02em;
+    text-overflow: ellipsis;
+  }
+  .lock {
+    color: var(--blue);
+    animation: pulse 1.6s infinite;
+  }
+  .who b {
+    font-weight: 500;
+    margin-left: 8px;
+    opacity: 0.35;
+    animation: who 6s infinite;
+  }
+  .who b:nth-child(2) {
+    animation-delay: 2s;
+  }
+  .who b:nth-child(3) {
+    animation-delay: 4s;
+  }
+  @keyframes who {
+    0%,
+    30% {
+      opacity: 1;
+      color: #93b4ff;
+    }
+    34%,
+    100% {
+      opacity: 0.35;
+    }
+  }
+  .win-body {
+    position: relative;
+    height: 140px;
+    padding: 12px;
+    overflow: hidden;
+  }
+  .diff p {
+    margin: 0 0 8px;
+    opacity: 0;
+    animation: line-in 6s infinite;
+  }
+  .diff p:nth-child(2) {
+    animation-delay: 0.6s;
+  }
+  .diff p:nth-child(3) {
+    animation-delay: 1.2s;
+  }
+  .diff p:nth-child(4) {
+    animation-delay: 2s;
+  }
+  @keyframes line-in {
+    0% {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+    8%,
+    85% {
+      opacity: 1;
+      transform: none;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+  .dim-t {
+    color: var(--muted);
+  }
+  .minus {
+    background: #fdecec;
+    color: #9b1c1c;
+  }
+  .plus {
+    background: var(--sky);
+    color: var(--blue);
+  }
+  .ok {
+    color: var(--blue);
+    font-weight: 600;
+  }
+  .sk,
+  .field,
+  .nav-sk,
+  .hero-sk,
+  .card-sk {
+    display: block;
+    background: var(--sky);
+  }
+  .sk {
+    height: 8px;
+    margin-bottom: 8px;
+  }
+  .w60 {
+    width: 60%;
+  }
+  .w90 {
+    width: 90%;
+  }
+  .w75 {
+    width: 75%;
+  }
+  .field {
+    height: 22px;
+    width: 70%;
+    margin-top: 14px;
+    background: #fff;
+    border: 1px solid var(--line);
+    position: relative;
+  }
+  .field::after {
+    content: "";
+    position: absolute;
+    inset: 6px auto 6px 6px;
+    width: 0;
+    background: var(--ink);
+    animation: fill 4s steps(8) infinite;
+  }
+  @keyframes fill {
+    0%,
+    10% {
+      width: 0;
+    }
+    45%,
+    100% {
+      width: 55%;
+    }
+  }
+  .page {
+    padding-left: 44px;
+  }
+  .dock {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 30px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+    padding-top: 10px;
+    border-right: 1px solid var(--line);
+    background: var(--sky);
+  }
+  .dock i {
+    width: 14px;
+    height: 14px;
+    border: 1px solid var(--blue);
+    background: #fff;
+  }
+  .dock i:nth-child(2) {
+    animation: app 4s infinite;
+  }
+  @keyframes app {
+    0%,
+    12% {
+      background: #fff;
+    }
+    18%,
+    100% {
+      background: var(--blue);
+    }
+  }
+  .go {
+    position: absolute;
+    left: 44px;
+    bottom: 14px;
+    padding: 4px 12px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 11px;
+    animation: press 4s infinite;
+  }
+  @keyframes press {
+    0%,
+    68%,
+    78%,
+    100% {
+      transform: none;
+    }
+    72% {
+      transform: scale(0.92);
+      background: var(--ink);
+    }
+  }
+  .cursor {
+    position: absolute;
+    width: 12px;
+    fill: var(--ink);
+    stroke: #fff;
+    left: 0;
+    top: 0;
+    animation: cursor 4s ease-in-out infinite;
+  }
+  @keyframes cursor {
+    0% {
+      transform: translate(200px, 20px);
+    }
+    12%,
+    18% {
+      transform: translate(14px, 38px);
+    }
+    32%,
+    48% {
+      transform: translate(92px, 62px);
+    }
+    65%,
+    80% {
+      transform: translate(66px, 116px);
+    }
+    100% {
+      transform: translate(200px, 20px);
+    }
+  }
+  .app {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: 10px 52px 1fr;
+    gap: 8px;
+  }
+  .nav-sk {
+    grid-column: 1 / -1;
+  }
+  .hero-sk {
+    grid-column: 1 / -1;
+    background: linear-gradient(90deg, var(--blue-2), var(--blue));
+  }
+  .nav-sk,
+  .hero-sk,
+  .card-sk {
+    transform-origin: left;
+    animation: build 5s infinite;
+  }
+  .hero-sk {
+    animation-delay: 0.3s;
+  }
+  .card-sk:nth-of-type(3) {
+    animation-delay: 0.6s;
+  }
+  .card-sk:nth-of-type(4) {
+    animation-delay: 0.8s;
+  }
+  .card-sk:nth-of-type(5) {
+    animation-delay: 1s;
+  }
+  @keyframes build {
+    0% {
+      opacity: 0;
+      transform: scaleY(0.2);
+    }
+    12%,
+    88% {
+      opacity: 1;
+      transform: none;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation: none !important;
+      transition: none !important;
+    }
+    .reveal {
+      opacity: 1;
+      translate: none;
+    }
+    .pause-wire,
+    .state-pause,
+    .fork {
+      opacity: 0;
+    }
+    html {
+      scroll-behavior: auto;
+    }
+  }
+
+  @media (max-width: 1000px) {
+    .hero {
+      grid-template-columns: 1fr;
+    }
+    .cards {
+      grid-template-columns: 1fr 1fr;
+    }
+    .group {
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .metrics {
+      grid-template-columns: 1fr 1fr;
+    }
+    .metric:nth-child(3) {
+      border-left: 0;
+    }
+    .metric:nth-child(n + 3) {
+      border-top: 1px solid var(--line);
+    }
+    .install-grid,
+    .uses,
+    .fits {
+      grid-template-columns: 1fr;
+    }
+    .stack-wrap {
+      position: static;
+    }
+    .fit-step {
+      min-height: 0;
+      opacity: 1;
+      padding: 24px 0;
+    }
+    .c2 {
+      grid-column: span 3;
+    }
+    .title-block {
+      grid-template-columns: 1fr 1fr;
+    }
+    .tb-name {
+      grid-column: 1 / -1;
+    }
+    .tb-cell {
+      border-top: 1px solid var(--line);
+    }
+    .tb-cell:nth-child(2n) {
+      border-left: 0;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .sheet {
+      margin: 12px;
+      padding: 0 16px;
+      outline: 0;
+    }
+    nav a:not(.btn-line) {
+      display: none;
+    }
+    .cards,
+    .metrics {
+      grid-template-columns: 1fr;
+    }
+    .metric {
+      border-left: 0 !important;
+      border-top: 1px solid var(--line);
+    }
+    .metric:first-child {
+      border-top: 0;
+    }
+    .note {
+      position: static;
+      padding: 10px 0;
+    }
+    .sec-head {
+      grid-template-columns: 1fr;
+      row-gap: 8px;
+    }
+    .sec-no {
+      justify-self: start;
+    }
+    .sec-sub {
+      grid-column: 1;
+    }
+    tbody th {
+      width: 140px;
+    }
+    .c2,
+    .c3 {
+      grid-column: span 6;
+    }
+    .title-block {
+      margin: 64px -16px 0;
+    }
+  }
+</style>
