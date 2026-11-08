@@ -11,7 +11,7 @@ fallback. The initial runtime target is Linux x86_64.
 
 # Development
 
-- Follow `docs/spec.md`, but do not describe planned features as implemented.
+- Do not describe planned features as implemented.
 - Keep the README's current capabilities and limitations accurate.
 - Use the pinned Rust toolchain and the existing Cargo workspace.
 - Choose the latest stable Rust and dependency releases when adding or updating

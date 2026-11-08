@@ -1,8 +1,7 @@
 # Contributing
 
-Spawnbox is in M2. Keep changes small and tied to
-the [technical spec](docs/spec.md). The spec describes planned behavior;
-the README describes what is implemented.
+Spawnbox is in M2. Keep changes small. The README describes what is
+implemented.
 
 ## Local checks
 

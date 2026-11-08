@@ -11,8 +11,8 @@ than 100 ms. It can connect only to the internet hosts that you allow.
 Your API keys do not go into the sandbox.
 
 > **Status: early development (milestone M3 of M4).** Do not use Spawnbox
-> for production work or for code that you do not trust. The [technical spec](docs/spec.md) shows the full design. This
-> README shows only the functions that operate now.
+> for production work or for code that you do not trust. This README
+> shows only the functions that operate now.
 
 ## Contents
 
@@ -1884,7 +1884,6 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `deploy/install.sh` | The installer for one server, from a release bundle or the code |
 | `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |
 | `scripts/` | Build scripts and end-to-end tests |
-| `docs/spec.md` | The full design and the plan |
 
 ## Contributing
 
@@ -1892,7 +1891,7 @@ We welcome contributions. First, read [CONTRIBUTING.md](CONTRIBUTING.md).
 Then do these steps:
 
 1. For a large change, open an issue first.
-2. Keep each change small. Connect it to the [spec](docs/spec.md).
+2. Keep each change small.
 3. Run fmt, Clippy and the tests in [Development](#development).
 4. If you change the VM, network or API code, run `scripts/m1-smoke.sh`
    on a KVM host. If you change `spawn-node` or the guest, also run
