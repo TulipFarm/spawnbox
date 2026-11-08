@@ -89,6 +89,10 @@ pub struct Capacity {
     pub memory_reserved_mib: u64,
     #[serde(default)]
     pub memory_limit_mib: u64,
+    /// The host is short of memory and pausing idle sandboxes; it takes
+    /// no new ones.
+    #[serde(default)]
+    pub memory_pressure: bool,
     pub templates: Vec<ReadyTemplate>,
     pub warm: Vec<WarmCount>,
     /// `Templates::fingerprint`. Sandboxes move only between hosts with
@@ -105,6 +109,9 @@ pub struct Capacity {
 impl Capacity {
     /// Memory that sandboxes may still reserve. No limit from older hosts.
     pub fn memory_unreserved_mib(&self) -> u64 {
+        if self.memory_pressure {
+            return 0;
+        }
         if self.memory_limit_mib == 0 {
             return u64::MAX;
         }
@@ -324,6 +331,7 @@ pub fn local_capacity(app: &App) -> Capacity {
         memory_total_mib: memory_total_mib().unwrap_or(0),
         memory_reserved_mib,
         memory_limit_mib,
+        memory_pressure: app.sandboxes.under_pressure(),
         templates,
         warm,
         fingerprint: app.templates.fingerprint().to_owned(),

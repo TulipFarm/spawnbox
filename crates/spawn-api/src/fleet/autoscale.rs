@@ -191,7 +191,11 @@ fn fleet_load(hosts: &[Capacity]) -> Option<f64> {
     let (mut used, mut slots, mut mem_used, mut mem_total) = (0u64, 0u64, 0u64, 0u64);
     let (mut reserved, mut limit) = (0u64, 0u64);
     for host in hosts {
-        reserved += host.memory_reserved_mib;
+        reserved += if host.memory_pressure {
+            host.memory_limit_mib
+        } else {
+            host.memory_reserved_mib
+        };
         limit += host.memory_limit_mib;
         let total = host.slots as u64;
         slots += total;
@@ -816,6 +820,13 @@ mod tests {
         };
         let load = fleet_load(&[reserved]).unwrap();
         assert!((load - 0.95).abs() < 1e-9);
+        let pressured = Capacity {
+            memory_reserved_mib: 0,
+            memory_limit_mib: 1500,
+            memory_pressure: true,
+            ..host(10, 1000)
+        };
+        assert_eq!(fleet_load(&[pressured]), Some(1.0));
         let old = Capacity {
             free_slots: 3,
             memory_available_mib: 500,

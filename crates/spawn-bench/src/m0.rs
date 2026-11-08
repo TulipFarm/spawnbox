@@ -74,6 +74,7 @@ pub async fn run(args: Args) -> Result<()> {
         firecracker: absolute(&args.firecracker)?,
         jails: work.join("jails"),
         logs: work.join("logs"),
+        ksm: false,
     };
     net::remove_stale_namespaces().await?;
     host.remove_all().await;

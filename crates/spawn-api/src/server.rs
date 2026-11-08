@@ -217,6 +217,17 @@ pub struct Args {
     /// their memory share it. A create past it gets `503 no_capacity`.
     #[arg(long, default_value_t = 150, value_parser = clap::value_parser!(u16).range(10..=1000))]
     memory_overcommit_pct: u16,
+    /// Pauses the longest-idle sandboxes to disk when free host memory
+    /// drops below this percent of host memory, or when processes stall
+    /// waiting for memory (PSI) for over this percent of the last 10
+    /// seconds. Creates are refused meanwhile. 0 turns it off.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
+    memory_pressure_pct: u8,
+    /// Lets the kernel merge equal memory pages across Firecracker VMs
+    /// (KSM). Saves memory, but one sandbox may learn what another holds
+    /// by timing; use it only when all sandboxes trust each other.
+    #[arg(long)]
+    ksm: bool,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
@@ -403,6 +414,7 @@ pub async fn serve(args: Args) -> Result<()> {
         firecracker: PathBuf::new(),
         jails: data.join("jails"),
         logs: data.join("logs"),
+        ksm: args.ksm,
     };
     let (runsc, inputs) = match backend {
         Backend::Firecracker => {
@@ -649,6 +661,7 @@ async fn run(
                 warm_min: usize::try_from(args.warm_pool_min)?,
                 warm_reserve: usize::try_from(args.max_builds)?,
                 memory_limit_mib: host_memory_mib()? * u64::from(args.memory_overcommit_pct) / 100,
+                memory_pressure_pct: args.memory_pressure_pct,
             },
         ),
         templates,
@@ -677,6 +690,7 @@ async fn run(
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 app.sandboxes.expire();
                 app.sandboxes.pause_idle();
+                app.sandboxes.relieve_pressure();
                 app.sandboxes.refill_warm();
                 if Instant::now() >= next_meter {
                     next_meter = Instant::now() + METER_EVERY;

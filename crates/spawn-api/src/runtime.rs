@@ -37,6 +37,7 @@ use crate::volumes::Volumes;
 use crate::warm::{self, PoolView};
 
 mod fork;
+mod pressure;
 
 pub use fork::MAX_FORK;
 
@@ -124,6 +125,9 @@ enum PauseReason {
     Idle,
     /// To move it to another host. Not held to the snapshot quota.
     Migrate,
+    /// Host memory is short. Only if no call is running; not held to the
+    /// snapshot quota.
+    Pressure,
 }
 
 /// A paused sandbox ready to be copied to another host.
@@ -312,6 +316,8 @@ pub struct Settings {
     /// Memory that running sandboxes may reserve together. A create, fork
     /// or resume past it gets `no_capacity`.
     pub memory_limit_mib: u64,
+    /// `--memory-pressure-pct`. 0 turns pausing for memory off.
+    pub memory_pressure_pct: u8,
 }
 
 #[derive(Clone)]
@@ -330,6 +336,7 @@ pub struct Shared {
     settings: Settings,
     inner: Arc<Mutex<Inner>>,
     warm: Warm,
+    pressure: pressure::State,
     closing: AtomicBool,
 }
 
@@ -382,6 +389,7 @@ impl Sandboxes {
             hub,
             meter,
             warm: Warm::new(settings.warm_memory_mib),
+            pressure: pressure::State::default(),
             settings,
             inner: Arc::new(Mutex::new(Inner {
                 records: HashMap::new(),
@@ -713,6 +721,9 @@ impl Sandboxes {
         let mut usage = inner.usage(tenant);
         usage.merge(self.db.mirror_usage(tenant)?);
         quotas.admit(usage, u64::from(limits.vcpus), u64::from(limits.memory_mib))?;
+        if here && self.under_pressure() {
+            return Err(Self::pressure_error());
+        }
         if here
             && inner.reserved_mib() + u64::from(limits.memory_mib) > self.settings.memory_limit_mib
         {
@@ -1382,10 +1393,14 @@ impl Sandboxes {
             if only_if_idle && !is_idle(record) {
                 return Ok(());
             }
+            if why == PauseReason::Pressure && record.busy > 0 {
+                return Ok(());
+            }
             // Its memory snapshot is at most its memory size.
             let asked = u64::from(record.limits.memory_mib) * (1 << 20) + record.disk_bytes;
             if let VmState::Running(_) = record.vm
                 && why != PauseReason::Migrate
+                && why != PauseReason::Pressure
                 && let Err(error) = quotas.admit_snapshot(stored, asked)
             {
                 if !only_if_idle {
@@ -1489,6 +1504,7 @@ impl Sandboxes {
                     PauseReason::Api => "api",
                     PauseReason::Idle => "idle",
                     PauseReason::Migrate => "migrate",
+                    PauseReason::Pressure => "memory_pressure",
                 },
                 "duration_ms": u64::try_from(total_ms).unwrap_or(u64::MAX),
             }),

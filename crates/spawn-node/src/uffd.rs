@@ -7,6 +7,7 @@
 //! until the handler copies data in. The handler copies the whole part
 //! that holds the page, so nearby touches do not fault again.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{IoSliceMut, Read};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -168,7 +169,7 @@ fn serve(
         bail!("bad part size {part}");
     }
     let mut done = vec![false; usize::try_from(size.div_ceil(part))?];
-    let mut removed: Vec<(u64, u64)> = Vec::new();
+    let mut removed = Removed::default();
     let mut buf = vec![0; usize::try_from(part)?];
     let mut events = [0u8; MSG_BYTES * 16];
     loop {
@@ -194,7 +195,7 @@ fn serve(
                 EVENT_PAGEFAULT => {
                     let page = word(16) & !(PAGE - 1);
                     let fd = uffd.as_raw_fd();
-                    if removed.iter().any(|&(s, e)| (s..e).contains(&page)) {
+                    if removed.contains(page) {
                         // The guest gave the page back; it reads as zeros.
                         fill(fd, page, PAGE, None)?;
                         continue;
@@ -237,11 +238,42 @@ fn serve(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(index);
                 }
-                EVENT_REMOVE => removed.push((word(8), word(16))),
+                EVENT_REMOVE => removed.add(word(8), word(16)),
                 // Firecracker uses no other events.
                 _ => {}
             }
         }
+    }
+}
+
+/// Guest memory ranges the guest gave back, merged. The balloon reports
+/// free pages all the time, so there can be many.
+#[derive(Default)]
+struct Removed(BTreeMap<u64, u64>);
+
+impl Removed {
+    fn add(&mut self, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
+        }
+        if let Some((&s, &e)) = self.0.range(..=start).next_back()
+            && e >= start
+        {
+            start = s;
+            end = end.max(e);
+        }
+        while let Some((&s, &e)) = self.0.range(start..=end).next() {
+            end = end.max(e);
+            self.0.remove(&s);
+        }
+        self.0.insert(start, end);
+    }
+
+    fn contains(&self, at: u64) -> bool {
+        self.0
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(_, &end)| at < end)
     }
 }
 
@@ -379,4 +411,25 @@ fn wake(fd: RawFd, start: u64, len: u64) -> Result<()> {
     // SAFETY: the ioctl only reads the range.
     unsafe { uffdio_wake(fd, &raw mut range) }.context("wake faulting threads")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Removed;
+
+    #[test]
+    fn removed_ranges_merge() {
+        let mut removed = Removed::default();
+        removed.add(0x3000, 0x4000);
+        removed.add(0x1000, 0x2000);
+        removed.add(0x2000, 0x3000);
+        removed.add(0x8000, 0x9000);
+        removed.add(0x1800, 0x3800);
+        assert_eq!(removed.0.len(), 2);
+        assert!(removed.contains(0x1000) && removed.contains(0x3fff));
+        assert!(!removed.contains(0x4000) && !removed.contains(0x0fff));
+        assert!(removed.contains(0x8000) && !removed.contains(0x9000));
+        removed.add(0x0, 0x10000);
+        assert_eq!(removed.0.len(), 1);
+    }
 }

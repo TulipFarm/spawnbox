@@ -679,6 +679,18 @@ impl Node {
             json!({ "guest_cid": GUEST_CID, "uds_path": "v.sock" }),
         )
         .await?;
+        // The guest hands pages it frees back to the host. Snapshots keep
+        // the device, so sandboxes restored from this build do too.
+        vm.put(
+            "/balloon",
+            json!({
+                "amount_mib": 0,
+                "deflate_on_oom": true,
+                "stats_polling_interval_s": 0,
+                "free_page_reporting": true,
+            }),
+        )
+        .await?;
 
         let boot = Instant::now();
         vm.put("/actions", json!({ "action_type": "InstanceStart" }))

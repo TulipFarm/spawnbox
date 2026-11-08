@@ -26,6 +26,8 @@ pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub(crate) const CGROUP_PARENT: &str = "spawnbox";
 /// Firecracker's (or gVisor's) own memory on top of guest memory.
 pub(crate) const VMM_OVERHEAD_MIB: u64 = 256;
+const KSM_RUN: &str = "/sys/kernel/mm/ksm/run";
+const PR_SET_MEMORY_MERGE: nix::libc::c_int = 67;
 
 #[derive(Clone)]
 pub struct Host {
@@ -34,6 +36,10 @@ pub struct Host {
     /// Jails are built in `<jails>/firecracker/<id>/root`.
     pub jails: PathBuf,
     pub logs: PathBuf,
+    /// Lets the kernel merge equal memory pages across VMs (KSM). Saves
+    /// memory, but a guest can time page writes to guess what another
+    /// guest holds, so use it only when all guests trust each other.
+    pub ksm: bool,
 }
 
 impl Host {
@@ -51,6 +57,9 @@ impl Host {
         std::fs::create_dir_all(&parent)?;
         std::fs::write(parent.join("cgroup.subtree_control"), "+cpu +memory +pids")
             .context("enable cgroup controllers")?;
+        if self.ksm {
+            std::fs::write(KSM_RUN, "1").context("turn on KSM")?;
+        }
         std::fs::create_dir_all(&self.logs)?;
         Ok(())
     }
@@ -210,7 +219,20 @@ impl Vm {
             "memory.max={}",
             (u64::from(limits.memory_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024
         );
-        let child = Command::new(&host.jailer)
+        let mut command = Command::new(&host.jailer);
+        if host.ksm {
+            // SAFETY: prctl is async-signal-safe. The jailer and Firecracker
+            // keep the setting across fork and exec (Linux 6.7 and later).
+            unsafe {
+                command.pre_exec(|| {
+                    if nix::libc::prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = command
             .args(["--id", &jail.id, "--uid", &uid, "--gid", &uid])
             .arg("--exec-file")
             .arg(&host.firecracker)
