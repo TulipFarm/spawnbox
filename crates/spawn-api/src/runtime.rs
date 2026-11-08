@@ -1471,6 +1471,14 @@ impl Sandboxes {
         vm.stop().await;
         self.release(index);
         let stopped_ms = begin.elapsed().as_millis();
+        let merge_dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = spawn_node::finish_paused(&merge_dir)
+                && merge_dir.exists()
+            {
+                eprintln!("{error:#}");
+            }
+        });
         let snapshot_bytes = stored_bytes(&dir);
         let paused_at = now_ms();
         let saved = {
@@ -1981,6 +1989,12 @@ impl Sandboxes {
             self.pause_locked(id, PauseReason::Migrate, &Origin::system())
                 .await?;
         }
+        let dir = self.paused_dir(id);
+        let merge_dir = dir.clone();
+        tokio::task::spawn_blocking(move || spawn_node::finish_paused(&merge_dir))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(|error| ApiError::internal(format!("{error:#}")))?;
         let saved = {
             let mut inner = self.inner();
             let record = inner
@@ -2003,7 +2017,7 @@ impl Sandboxes {
             sandbox,
             saved,
             was_running,
-            dir: self.paused_dir(id),
+            dir,
             volumes,
         })
     }

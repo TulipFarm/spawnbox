@@ -11,6 +11,8 @@ pub mod netplan;
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
+mod diff;
+#[cfg(target_os = "linux")]
 pub mod firecracker;
 #[cfg(target_os = "linux")]
 pub mod guest;
@@ -29,6 +31,8 @@ pub mod volume;
 
 #[cfg(target_os = "linux")]
 pub use backend::{Backend, Vm};
+#[cfg(target_os = "linux")]
+pub use diff::finish_paused;
 #[cfg(target_os = "linux")]
 pub use node::{
     Build, Frozen, HOT_FILE, Log, Node, Recipe, RestoreSteps, Restored, ResumeError, Slot,

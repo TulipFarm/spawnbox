@@ -3,6 +3,7 @@
 use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -176,6 +177,7 @@ pub struct Vm {
     child: Child,
     lift: Arc<Mutex<Lift>>,
     pager: Option<Box<Pager>>,
+    dirty: AtomicBool,
 }
 
 #[derive(Default)]
@@ -257,6 +259,7 @@ impl Vm {
             child,
             lift: Arc::default(),
             pager: None,
+            dirty: AtomicBool::new(false),
         };
         vm.wait_for_api().await?;
         Ok(vm)
@@ -287,6 +290,19 @@ impl Vm {
     /// Firecracker's process ID. The jailer runs it in its own process.
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// The VM was loaded from the file `vm.mem` in its jail with dirty page
+    /// tracking, and no snapshot was taken since: a diff snapshot over that
+    /// file is complete.
+    pub fn set_dirty_tracked(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a diff snapshot can be taken, and forgets it: any snapshot
+    /// resets the dirty pages.
+    pub fn take_dirty_tracked(&self) -> bool {
+        self.dirty.swap(false, Ordering::SeqCst)
     }
 
     /// Serves the VM's memory with `pager` until the VM stops.

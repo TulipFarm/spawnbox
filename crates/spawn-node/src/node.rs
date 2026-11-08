@@ -750,6 +750,11 @@ impl Node {
         mode: NetMode,
         volumes: &[Attach],
     ) -> Result<Restored, ResumeError> {
+        let merge_dir = dir.to_owned();
+        tokio::task::spawn_blocking(move || crate::diff::finish_paused(&merge_dir))
+            .await
+            .map_err(|error| ResumeError::Before(error.into()))?
+            .map_err(ResumeError::Before)?;
         let has_layer = dir.join(LAYER).exists();
         let paused = Build::at(dir, self.backend(), limits, has_layer);
         let restored = self
@@ -885,6 +890,7 @@ impl Node {
             .await
             .map_err(ResumeError::Before)?;
         let spawn = ms(started.elapsed());
+        let from_file = !matches!(from, LoadFrom::Pages(_));
         let backend = match from {
             LoadFrom::Pages(pages) => {
                 let sock = vm.root().join("uffd.sock");
@@ -911,6 +917,8 @@ impl Node {
                 json!({
                     "snapshot_path": "/vm.state",
                     "mem_backend": backend,
+                    // So a pause can write only the pages written since.
+                    "track_dirty_pages": from_file,
                     "resume_vm": true,
                 }),
             )
@@ -918,6 +926,9 @@ impl Node {
         if let Err(error) = loaded {
             vm.stop().await;
             return Err(ResumeError::Before(error));
+        }
+        if from_file {
+            vm.set_dirty_tracked();
         }
         let load = ms(started.elapsed());
         let channel = async {
@@ -955,8 +966,9 @@ impl Node {
 
     /// Pauses a sandbox from `restore` or `resume` and saves its memory and
     /// disks to `dir`, which must not exist. Returns the milliseconds the
-    /// snapshot took. On success, stop the sandbox; on error it runs on,
-    /// unless the error is `Frozen`.
+    /// snapshot took. On success, stop the sandbox, then call
+    /// `finish_paused` in the background; on error it runs on, unless the
+    /// error is `Frozen`.
     pub async fn pause(&self, vm: &Vm, dir: &Path) -> Result<f64> {
         match vm {
             Vm::Firecracker(vm) => pause_vm(vm, dir).await,
@@ -1002,6 +1014,8 @@ async fn snapshot_container(container: &Container, dir: &Path) -> Result<f64> {
 }
 
 async fn snapshot_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
+    // The snapshot resets the dirty pages, so later pauses save all memory.
+    vm.take_dirty_tracked();
     let started = Instant::now();
     vm.patch("/vm", json!({ "state": "Paused" })).await?;
     // Back only once the memory file is on disk: see `lift_memory_max`.
@@ -1148,6 +1162,7 @@ async fn pause_container(container: &Container, dir: &Path) -> Result<f64> {
 }
 
 async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
+    let diff = vm.take_dirty_tracked() && vm.root().join("vm.mem").exists();
     let started = Instant::now();
     vm.patch("/vm", json!({ "state": "Paused" })).await?;
     // See `lift_memory_max`. The vCPUs are stopped, so the guest cannot
@@ -1160,7 +1175,7 @@ async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
         vm.put(
             "/snapshot/create",
             json!({
-                "snapshot_type": "Full",
+                "snapshot_type": if diff { "Diff" } else { "Full" },
                 "snapshot_path": "/paused.state",
                 "mem_file_path": "/paused.mem",
                 // Writing the memory to disk takes seconds; flush_later
@@ -1174,7 +1189,13 @@ async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
         let root = vm.root();
         let moved = (|| -> Result<()> {
             keep(&root.join("paused.state"), &dir.join("vm.state"))?;
-            keep(&root.join("paused.mem"), &dir.join("vm.mem"))?;
+            if diff {
+                keep(&root.join("paused.mem"), &dir.join(crate::diff::DIFF))?;
+                std::fs::hard_link(root.join("vm.mem"), dir.join(crate::diff::BASE))
+                    .context("keep the memory the VM was loaded from")?;
+            } else {
+                keep(&root.join("paused.mem"), &dir.join("vm.mem"))?;
+            }
             for name in [ROOTFS, LAYER] {
                 let src = root.join(name);
                 if src.exists() {
@@ -1204,7 +1225,15 @@ async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
     if let Ok(lift) = lift {
         lift.keep();
     }
-    flush_later(dir.to_owned(), &["vm.state", "vm.mem"]);
+    // `finish_paused` flushes the memory of a diff.
+    flush_later(
+        dir.to_owned(),
+        if diff {
+            &["vm.state"]
+        } else {
+            &["vm.state", "vm.mem"]
+        },
+    );
     saved
 }
 
