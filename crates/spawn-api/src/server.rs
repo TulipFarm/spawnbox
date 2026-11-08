@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -212,6 +212,11 @@ pub struct Args {
     /// authentication. Off if not set. Keep it on a private network.
     #[arg(long)]
     metrics_listen: Option<SocketAddr>,
+    /// Percent of host memory that running sandboxes may reserve together,
+    /// by their `memory_mib`. Over 100 lets sandboxes that do not use all
+    /// their memory share it. A create past it gets `503 no_capacity`.
+    #[arg(long, default_value_t = 150, value_parser = clap::value_parser!(u16).range(10..=1000))]
+    memory_overcommit_pct: u16,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
@@ -643,6 +648,7 @@ async fn run(
                 warm_memory_mib: host_memory_mib()? * u64::from(args.warm_pool_memory_pct) / 100,
                 warm_min: usize::try_from(args.warm_pool_min)?,
                 warm_reserve: usize::try_from(args.max_builds)?,
+                memory_limit_mib: host_memory_mib()? * u64::from(args.memory_overcommit_pct) / 100,
             },
         ),
         templates,
@@ -962,6 +968,9 @@ pub fn router(app: AppState) -> Router {
         .with_state(app)
 }
 
+/// `Retry-After` of a `no_capacity` reply.
+const NO_CAPACITY_RETRY_S: &str = "30";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let request_id = ids::new_id("req").unwrap_or_default();
@@ -974,7 +983,14 @@ impl IntoResponse for ApiError {
         }
         let status = StatusCode::from_u16(self.code.http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(self.body(&request_id))).into_response()
+        let mut response = (status, Json(self.body(&request_id))).into_response();
+        if self.code == Code::NoCapacity {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(NO_CAPACITY_RETRY_S),
+            );
+        }
+        response
     }
 }
 

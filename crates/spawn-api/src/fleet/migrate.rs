@@ -583,8 +583,13 @@ pub async fn migrate(
         ));
     }
     targets.retain(|h| {
-        h.capacity.memory_available_mib >= u64::from(row.memory_mib)
-            && (!running || h.capacity.free_slots > 0)
+        // A paused sandbox reserves memory only when it resumes.
+        let room = if running {
+            h.capacity.memory_room_mib()
+        } else {
+            h.capacity.memory_available_mib
+        };
+        room >= u64::from(row.memory_mib) && (!running || h.capacity.free_slots > 0)
     });
     targets.sort_by_key(|h| std::cmp::Reverse(h.capacity.memory_available_mib));
     let target = targets

@@ -83,6 +83,12 @@ pub struct Capacity {
     pub memory_available_mib: u64,
     #[serde(default)]
     pub memory_total_mib: u64,
+    /// Memory reserved by running sandboxes, and the most they may
+    /// reserve. 0 and 0 from hosts older than these fields.
+    #[serde(default)]
+    pub memory_reserved_mib: u64,
+    #[serde(default)]
+    pub memory_limit_mib: u64,
     pub templates: Vec<ReadyTemplate>,
     pub warm: Vec<WarmCount>,
     /// `Templates::fingerprint`. Sandboxes move only between hosts with
@@ -97,6 +103,21 @@ pub struct Capacity {
 }
 
 impl Capacity {
+    /// Memory that sandboxes may still reserve. No limit from older hosts.
+    pub fn memory_unreserved_mib(&self) -> u64 {
+        if self.memory_limit_mib == 0 {
+            return u64::MAX;
+        }
+        self.memory_limit_mib
+            .saturating_sub(self.memory_reserved_mib)
+    }
+
+    /// Memory a new sandbox can have: free memory, and memory that is not
+    /// reserved, whichever is less.
+    pub fn memory_room_mib(&self) -> u64 {
+        self.memory_available_mib.min(self.memory_unreserved_mib())
+    }
+
     pub fn template(&self, key: &str) -> Option<&ReadyTemplate> {
         self.templates.iter().find(|t| t.key == key)
     }
@@ -295,11 +316,14 @@ pub fn local_capacity(app: &App) -> Capacity {
             ready: p.ready,
         })
         .collect();
+    let (memory_reserved_mib, memory_limit_mib) = app.sandboxes.memory_reserved();
     Capacity {
         free_slots: app.sandboxes.free_slots(),
         slots: app.sandboxes.total_slots(),
         memory_available_mib: memory_available_mib().unwrap_or(0),
         memory_total_mib: memory_total_mib().unwrap_or(0),
+        memory_reserved_mib,
+        memory_limit_mib,
         templates,
         warm,
         fingerprint: app.templates.fingerprint().to_owned(),

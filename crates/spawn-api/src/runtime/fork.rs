@@ -167,7 +167,7 @@ impl Sandboxes {
         for _ in 0..count {
             let child = async {
                 let id = ids::new_id("sbx").map_err(ApiError::internal)?;
-                let admission = self.admit(&source.tenant, &quotas, &id, source.limits)?;
+                let admission = self.admit(&source.tenant, &quotas, &id, source.limits, true)?;
                 let index = self.take_slot(None).await?;
                 Ok::<_, ApiError>(Child {
                     id,

@@ -160,9 +160,9 @@ struct Saved {
 
 struct Inner {
     records: HashMap<String, Record>,
-    /// Sandboxes being created or resumed, by ID: their tenant and size.
-    /// Counted against quotas until they run.
-    starting: HashMap<String, (String, Limits)>,
+    /// Sandboxes being created or resumed, by ID. Counted against quotas
+    /// until they run.
+    starting: HashMap<String, Starting>,
     /// Sandboxes being paused, by ID: their tenant and the snapshot bytes
     /// they may store. Counted against the snapshot quota until paused.
     pausing: HashMap<String, (String, u64)>,
@@ -174,11 +174,29 @@ impl Inner {
         let running = self.records.values().filter(|r| {
             r.tenant == tenant && matches!(r.vm, VmState::Running(_) | VmState::Changing)
         });
-        let starting = self.starting.values().filter(|(t, _)| t == tenant);
-        for limits in running.map(|r| &r.limits).chain(starting.map(|(_, l)| l)) {
+        let starting = self.starting.values().filter(|s| s.tenant == tenant);
+        for limits in running
+            .map(|r| &r.limits)
+            .chain(starting.map(|s| &s.limits))
+        {
             usage.add(u64::from(limits.vcpus), u64::from(limits.memory_mib));
         }
         usage
+    }
+
+    /// Memory that running and starting VMs on this host may use.
+    fn reserved_mib(&self) -> u64 {
+        let running = self
+            .records
+            .values()
+            .filter(|r| matches!(r.vm, VmState::Running(_) | VmState::Changing))
+            .map(|r| r.limits.memory_mib);
+        let starting = self
+            .starting
+            .values()
+            .filter(|s| s.here)
+            .map(|s| s.limits.memory_mib);
+        running.chain(starting).map(u64::from).sum()
     }
 
     /// Bytes stored for `tenant`'s paused sandboxes.
@@ -199,6 +217,13 @@ impl Inner {
 
 /// A sandbox admitted under its tenant's quotas. Counted while it starts;
 /// drop it once the sandbox runs or failed.
+struct Starting {
+    tenant: String,
+    limits: Limits,
+    /// `false` for a sandbox that starts on a worker.
+    here: bool,
+}
+
 struct Admission {
     inner: Arc<Mutex<Inner>>,
     id: String,
@@ -284,6 +309,9 @@ pub struct Settings {
     pub warm_min: usize,
     /// Free slots warm pools leave for template builds.
     pub warm_reserve: usize,
+    /// Memory that running sandboxes may reserve together. A create, fork
+    /// or resume past it gets `no_capacity`.
+    pub memory_limit_mib: u64,
 }
 
 #[derive(Clone)]
@@ -659,26 +687,43 @@ impl Sandboxes {
         )
     }
 
+    fn no_memory() -> ApiError {
+        ApiError::new(
+            Code::NoCapacity,
+            "the memory of this host is reserved by other sandboxes",
+        )
+    }
+
     fn shutting_down() -> ApiError {
         ApiError::new(Code::NoCapacity, "server is shutting down")
     }
 
-    /// Counts a sandbox of `limits` against `tenant`'s quotas, or fails
-    /// with `quota_exceeded`.
+    /// Counts a sandbox of `limits` against `tenant`'s quotas, and against
+    /// this host's memory if it starts `here`. Fails with `quota_exceeded`
+    /// or `no_capacity`.
     fn admit(
         &self,
         tenant: &str,
         quotas: &Quotas,
         id: &str,
         limits: Limits,
+        here: bool,
     ) -> Result<Admission, ApiError> {
         let mut inner = self.inner();
         let mut usage = inner.usage(tenant);
         usage.merge(self.db.mirror_usage(tenant)?);
         quotas.admit(usage, u64::from(limits.vcpus), u64::from(limits.memory_mib))?;
-        inner
-            .starting
-            .insert(id.to_owned(), (tenant.to_owned(), limits));
+        if here
+            && inner.reserved_mib() + u64::from(limits.memory_mib) > self.settings.memory_limit_mib
+        {
+            return Err(Self::no_memory());
+        }
+        let starting = Starting {
+            tenant: tenant.to_owned(),
+            limits,
+            here,
+        };
+        inner.starting.insert(id.to_owned(), starting);
         Ok(Admission {
             inner: Arc::clone(&self.inner),
             id: id.to_owned(),
@@ -696,7 +741,7 @@ impl Sandboxes {
     ) -> Result<Reservation, ApiError> {
         let id = ids::new_id("res").map_err(ApiError::internal)?;
         let limits = Limits { vcpus, memory_mib };
-        Ok(Reservation(self.admit(tenant, quotas, &id, limits)?))
+        Ok(Reservation(self.admit(tenant, quotas, &id, limits, false)?))
     }
 
     /// Sandboxes this host can start now: free slots, and warm VMs, which
@@ -704,6 +749,12 @@ impl Sandboxes {
     pub fn free_slots(&self) -> usize {
         let warm: usize = self.warm_pools().2.iter().map(|p| p.ready).sum();
         self.slots.free_count().saturating_add(warm)
+    }
+
+    /// Memory reserved by sandboxes on this host, and the most they may
+    /// reserve.
+    pub fn memory_reserved(&self) -> (u64, u64) {
+        (self.inner().reserved_mib(), self.settings.memory_limit_mib)
     }
 
     /// `--max-sandboxes`.
@@ -850,7 +901,7 @@ impl Sandboxes {
             Some(warm) => warm.id.clone(),
             None => ids::new_id("sbx").map_err(ApiError::internal)?,
         };
-        let admitted = self.admit(&tenant.id, &tenant.quotas, &id, ready.build.limits);
+        let admitted = self.admit(&tenant.id, &tenant.quotas, &id, ready.build.limits, true);
         let (_admission, index) = match (admitted, warm.as_ref().map(|w| w.index)) {
             (Ok(admission), Some(index)) => (admission, index),
             (Ok(admission), None) => (admission, self.take_slot(Some(&key)).await?),
@@ -1488,7 +1539,7 @@ impl Sandboxes {
         let row = self.db.get_tenant(&tenant)?;
         let quotas = row.as_ref().map(|t| t.quotas).unwrap_or_default();
         quotas.admit_egress(self.meter.month_egress(&tenant, now_ms())?)?;
-        let _admission = self.admit(&tenant, &quotas, id, limits)?;
+        let _admission = self.admit(&tenant, &quotas, id, limits, true)?;
         let policies: Vec<Policy> = row
             .and_then(|t| t.egress)
             .into_iter()

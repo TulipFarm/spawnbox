@@ -2,11 +2,13 @@
 //! makes a join token and runs the operator's hook (a program or a webhook),
 //! which starts a machine that joins with it. When the fleet is idle, the
 //! primary drains the least used worker, moves its sandboxes away, runs the
-//! hook to stop the machine, and removes the node.
+//! hook to stop the machine, and removes the node. A create that finds no
+//! room asks for a worker at once.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ use axum::extract::State;
 use ring::hmac;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
 
 use super::primary::{self, Primary};
 use super::{Capacity, hex, local_capacity, migrate};
@@ -131,6 +134,8 @@ struct Fleet {
     total: usize,
     pending_up: bool,
     scaling_down: bool,
+    /// A create found no room since the last tick.
+    refused: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -150,6 +155,8 @@ fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
     let lasted = |since: Option<i64>, after: i64| since.is_some_and(|t0| now - t0 >= after);
     let need = if f.active < s.min_workers {
         Some(format!("fewer than {} workers", s.min_workers))
+    } else if f.refused {
+        Some("a create found no room".to_owned())
     } else if lasted(t.high_since, s.up_after_ms) {
         Some(format!(
             "load {:.0}% for {} s",
@@ -178,11 +185,14 @@ fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
     Decision::Wait
 }
 
-/// Part of the slots or the memory in use over `hosts`, whichever is more,
-/// from 0 to 1. `None` if no host reports them.
+/// Part of the slots, the memory in use or the memory reserved over
+/// `hosts`, whichever is more, from 0 to 1. `None` if no host reports them.
 fn fleet_load(hosts: &[Capacity]) -> Option<f64> {
     let (mut used, mut slots, mut mem_used, mut mem_total) = (0u64, 0u64, 0u64, 0u64);
+    let (mut reserved, mut limit) = (0u64, 0u64);
     for host in hosts {
+        reserved += host.memory_reserved_mib;
+        limit += host.memory_limit_mib;
         let total = host.slots as u64;
         slots += total;
         used += total.saturating_sub(host.free_slots as u64);
@@ -192,10 +202,15 @@ fn fleet_load(hosts: &[Capacity]) -> Option<f64> {
             .saturating_sub(host.memory_available_mib);
     }
     let ratio = |used: u64, total: u64| (total > 0).then(|| used as f64 / total as f64);
-    match (ratio(used, slots), ratio(mem_used, mem_total)) {
-        (Some(a), Some(b)) => Some(a.max(b).clamp(0.0, 1.0)),
-        (one, other) => one.or(other).map(|r| r.clamp(0.0, 1.0)),
-    }
+    [
+        ratio(used, slots),
+        ratio(mem_used, mem_total),
+        ratio(reserved, limit),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(f64::max)
+    .map(|r| r.clamp(0.0, 1.0))
 }
 
 /// What `GET /v1/nodes/autoscale` shows.
@@ -208,9 +223,18 @@ struct Status {
 pub struct Autoscaler {
     settings: Settings,
     status: Mutex<Status>,
+    refused: AtomicBool,
+    wake: Notify,
 }
 
 impl Autoscaler {
+    /// A create found no room: ask for a worker without waiting for the
+    /// load to stay high.
+    pub fn refused(&self) {
+        self.refused.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
     pub fn load(&self) -> Option<f64> {
         self.status
             .lock()
@@ -244,6 +268,8 @@ pub fn start(app: AppState, settings: Settings) -> Result<tokio::task::JoinHandl
     let scaler = Arc::new(Autoscaler {
         settings,
         status: Mutex::default(),
+        refused: AtomicBool::new(false),
+        wake: Notify::new(),
     });
     if p.autoscaler.set(Arc::clone(&scaler)).is_err() {
         return Err(anyhow!("the autoscaler is already running"));
@@ -251,7 +277,10 @@ pub fn start(app: AppState, settings: Settings) -> Result<tokio::task::JoinHandl
     Ok(tokio::spawn(async move {
         let mut memory = Memory::default();
         loop {
-            tokio::time::sleep(TICK).await;
+            tokio::select! {
+                () = tokio::time::sleep(TICK) => {}
+                () = scaler.wake.notified() => {}
+            }
             if let Err(error) = tick(&app, &scaler, &mut memory).await {
                 eprintln!("autoscale: {error:#}");
             }
@@ -265,7 +294,10 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
     let now = now_ms();
     let nodes = app.db.list_nodes()?;
     let counts = app.db.node_sandbox_counts()?;
-    let mut fleet = Fleet::default();
+    let mut fleet = Fleet {
+        refused: scaler.refused.swap(false, Ordering::SeqCst),
+        ..Fleet::default()
+    };
     let mut removing: Option<ScaleRequest> = None;
     for request in app.db.scale_requests(true, 100)? {
         match request.action.as_str() {
@@ -726,6 +758,21 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_create_adds_a_worker_at_once() {
+        let s = settings();
+        let refused = Fleet {
+            refused: true,
+            ..fleet(0.2, 1)
+        };
+        assert!(matches!(after(&s, &refused, 0), Decision::Up(r) if r.contains("no room")));
+        let full = Fleet {
+            refused: true,
+            ..fleet(0.2, 3)
+        };
+        assert_eq!(after(&s, &full, 0), Decision::Wait);
+    }
+
+    #[test]
     fn one_change_at_a_time() {
         let s = settings();
         let pending = Fleet {
@@ -762,6 +809,13 @@ mod tests {
         assert!((load - 0.5).abs() < 1e-9);
         let load = fleet_load(&[host(10, 100), host(10, 100)]).unwrap();
         assert!((load - 0.9).abs() < 1e-9);
+        let reserved = Capacity {
+            memory_reserved_mib: 1425,
+            memory_limit_mib: 1500,
+            ..host(10, 1000)
+        };
+        let load = fleet_load(&[reserved]).unwrap();
+        assert!((load - 0.95).abs() < 1e-9);
         let old = Capacity {
             free_slots: 3,
             memory_available_mib: 500,

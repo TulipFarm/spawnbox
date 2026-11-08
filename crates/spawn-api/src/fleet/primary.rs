@@ -619,7 +619,10 @@ fn candidates(
                 || wanted.as_deref() == Some(template.spec_sha256.as_str());
             let warm = capacity.warm_ready(key, network) > 0;
             let room = capacity.free_slots.saturating_sub(placing) > 0;
-            let memory = warm || capacity.memory_available_mib >= u64::from(template.memory_mib);
+            // A warm VM already holds its memory, but it is not reserved yet.
+            let asked = u64::from(template.memory_mib);
+            let memory = capacity.memory_unreserved_mib() >= asked
+                && (warm || capacity.memory_available_mib >= asked);
             if !(current && (warm || room) && memory) {
                 return None;
             }
@@ -709,6 +712,12 @@ pub async fn create(
     let placed = place_any(app, tenant, req, headers, body, origin, &span).await;
     if let Err(error) = &placed {
         span.fail(error.message.clone());
+        if error.code == Code::NoCapacity
+            && let Ok(p) = primary(app)
+            && let Some(scaler) = p.autoscaler.get()
+        {
+            scaler.refused();
+        }
     }
     placed
 }
