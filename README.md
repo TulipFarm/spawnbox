@@ -1067,8 +1067,11 @@ stops a machine on AWS, Azure or any other cloud.
 
 How it decides:
 
-- The load is the larger of the used slots and the used memory, for the
-  primary and the ready workers that are not drained.
+- The load is the largest of the used slots, the used memory and the
+  reserved memory, for the primary and the ready workers that are not
+  drained.
+- If a create gets `503 no_capacity`, the primary asks for one more
+  worker at once. It does not wait for `--autoscale-up-after-s`.
 - If the load stays above `--autoscale-up-pct` for
   `--autoscale-up-after-s`, or there are fewer workers than
   `--autoscale-min-workers`, the primary asks for one more worker.
@@ -1185,6 +1188,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   `secrets`. Org keys can also send `tenant`.
 - The create response has `timings_ms` and `started_from`. The value of
   `started_from` is `warm_pool` or `build`.
+- Each host adds up the `memory_mib` of its running sandboxes. A create,
+  fork or resume that goes over `--memory-overcommit-pct` of the host
+  memory (default 150) gives `503 no_capacity` with `Retry-After: 30`.
+  A primary first tries the other hosts. Paused sandboxes do not count.
 - `GET /v1/sandboxes` lists sandboxes. Org keys can add `?tenant=`.
 - `GET /v1/sandboxes/{id}` gets one sandbox.
 - `DELETE /v1/sandboxes/{id}` deletes a sandbox.
@@ -1536,8 +1543,8 @@ These calls operate only on a primary. The key must have the scope
 
 Each node has `id`, `kind` (`worker` or `edge`), `url`, `state` (`ready`, `suspect`, `down`),
 `draining`, `last_seen`, `sandboxes`, `config_current` and `capacity`
-(free slots, free memory, ready templates, warm VMs, CPU model and
-`fingerprint`). Sandboxes move only between hosts with the same
+(free slots, free memory, reserved memory and its limit, ready templates,
+warm VMs, CPU model and `fingerprint`). Sandboxes move only between hosts with the same
 `fingerprint` and CPU model.
 
 Each sandbox has the field `node`: the ID of the worker that runs it, or
@@ -1593,6 +1600,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--preview-tls-cert`, `--preview-tls-key` | None | HTTPS for previews, usually a wildcard certificate |
 | `--data-dir` | `/var/lib/spawnbox` | Database, builds, paused sandboxes and logs |
 | `--max-sandboxes` | 50 | Maximum number of sandboxes that run at the same time |
+| `--memory-overcommit-pct` | 150 | Percent of host memory that the `memory_mib` of running sandboxes can add up to. Over 100 fits more sandboxes that do not use all their memory. 100 means the host never gives out more memory than it has. |
 | `--vcpus`, `--memory-mib`, `--upper-disk-gib` | 2, 1024, 20 | Size of `base`, and the default size for templates |
 | `--max-timeout-s` | 86400 | Maximum `timeout_s` of a sandbox |
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
@@ -1641,6 +1649,7 @@ Type these commands on the host.
 | --- | --- | --- |
 | The log shows `sandboxes run in gvisor`, but you want Firecracker | Spawnbox cannot open `/dev/kvm` | Type `spawnbox doctor`. Use a bare-metal server, or turn on nested virtualization. |
 | Spawnbox does not start, and the log shows `--backend firecracker needs /dev/kvm` | You set `--backend firecracker` on a host without KVM | Remove `--backend firecracker`, or use a host with KVM. |
+| A create gives `503 no_capacity` with `the memory of this host is reserved by other sandboxes` | The running sandboxes reserve `--memory-overcommit-pct` of the host memory | Delete or pause sandboxes, add a worker, or use smaller templates. |
 | A create gives `503 no_capacity` for a `microvm-only` tenant | No Firecracker host has space | Add a Firecracker host, or set `isolation` of the tenant to `any`. |
 | The installer stops with `only Debian and Ubuntu are supported` | Wrong operating system | Use Ubuntu 22.04 or later, or Debian 12 or later. |
 | `curl .../healthz` shows `Connection refused` | The service is not running | Type `sudo systemctl status spawnbox`. Then read the log with `sudo journalctl -u spawnbox -n 50`. |

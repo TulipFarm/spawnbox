@@ -843,7 +843,7 @@ Runs inside each `spawn-api` instance, per request. No central scheduler process
 3. **Reserve**: a conditional `UPDATE nodes SET committed = committed + $need WHERE id = $id AND committed + $need <= capacity * ratio`. Zero rows means someone else won; take the next node.
 4. **Place**: call `spawn-node.CreateSandbox`. On failure, release the reservation and try the next node. Three tries, then `503 no_capacity`.
 
-As built (M3, SQLite): the primary `spawn-api` runs the scheduler for itself and its workers. Reservations are in-memory on the primary and count mirror rows of worker sandboxes. CPU fingerprint and region filters, the build-cached score and overcommit wait for the Postgres control plane.
+As built (M3, SQLite): the primary `spawn-api` runs the scheduler for itself and its workers. Reservations are in-memory on the primary and count mirror rows of worker sandboxes. Memory overcommit is a fixed limit per host (see Overcommit). CPU fingerprint and region filters, the build-cached score and other overcommit wait for the Postgres control plane.
 
 ### Node registration and health
 
@@ -900,13 +900,15 @@ One node becomes many by adding nodes, not by changing code. These parts keep a 
 
 The host is never allowed to OOM. Under memory pressure, the node pauses the longest-idle sandboxes to disk first, then refuses placements.
 
+As built (M3): memory only. Each host adds up the `memory_mib` of its running and starting sandboxes, and refuses a create, fork or resume over `--memory-overcommit-pct` of host memory (default 150, so 1.5 to 1) with `503 no_capacity` and `Retry-After: 30`. Hosts report reserved memory and the limit in their capacity; the primary skips full hosts. Warm VMs and template builds are not counted. vCPU overcommit, disk limits, KSM, balloon and PSI-driven pausing are not built.
+
 ### Autoscaling
 
 - Open source: a pluggable hook. When the fleet needs a node, `spawn-api` runs a command or calls a webhook (`scale_up {region, shape}`). The operator's script creates the machine and runs `spawn-node join`.
 - Built-in providers for AWS (C8i/M8i/R8i with nested virtualization) and GCP (N2 with nested virtualization) in v2.
 - Triggers: committed memory above 70 percent for 2 minutes, add a node. Below 30 percent for 20 minutes, drain one.
 - Recommended shape: bare metal for the always-on base, cloud VMs for bursts.
-- As built (M3): `--autoscale-hook` takes an absolute program path or a webhook URL. The primary checks load every 10 s; load is the larger of used slots and used memory over the primary and ready, undrained workers. The defaults match the triggers above, with `--autoscale-min-workers` and `--autoscale-max-workers` bounds and one change at a time. `scale_up` carries a fresh join token (30-minute TTL) and the CA hash, not region or shape. `scale_down` drains the worker with the fewest sandboxes, migrates them, and calls the hook only once the worker is empty, then removes it. Webhooks are signed with HMAC-SHA256 when `--autoscale-secret` is set. Requests are stored in `scale_requests`, shown at `GET /v1/nodes/autoscale` and recorded as `autoscale.*` events. Built-in cloud providers are not built.
+- As built (M3): `--autoscale-hook` takes an absolute program path or a webhook URL. The primary checks load every 10 s; load is the largest of used slots, used memory and reserved memory over the primary and ready, undrained workers. A create that gets `no_capacity` asks for a worker at once. The defaults match the triggers above, with `--autoscale-min-workers` and `--autoscale-max-workers` bounds and one change at a time. `scale_up` carries a fresh join token (30-minute TTL) and the CA hash, not region or shape. `scale_down` drains the worker with the fewest sandboxes, migrates them, and calls the hook only once the worker is empty, then removes it. Webhooks are signed with HMAC-SHA256 when `--autoscale-secret` is set. Requests are stored in `scale_requests`, shown at `GET /v1/nodes/autoscale` and recorded as `autoscale.*` events. Built-in cloud providers are not built.
 
 ### Drain and migration
 
