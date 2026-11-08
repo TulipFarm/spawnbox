@@ -1069,7 +1069,7 @@ How it decides:
 
 - The load is the largest of the used slots, the used memory and the
   reserved memory, for the primary and the ready workers that are not
-  drained.
+  drained. A host that is short of memory counts as full.
 - If a create gets `503 no_capacity`, the primary asks for one more
   worker at once. It does not wait for `--autoscale-up-after-s`.
 - If the load stays above `--autoscale-up-pct` for
@@ -1192,6 +1192,15 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   fork or resume that goes over `--memory-overcommit-pct` of the host
   memory (default 150) gives `503 no_capacity` with `Retry-After: 30`.
   A primary first tries the other hosts. Paused sandboxes do not count.
+- When free host memory drops below `--memory-pressure-pct` (default 10)
+  percent, or processes wait for memory that share of the time, the host
+  pauses the sandbox with no running call that was used least recently,
+  one at a time, and refuses creates and resumes with `503 no_capacity`
+  until memory is fine again. The `sandbox.paused` event has the reason
+  `memory_pressure`. The next call resumes the sandbox as usual.
+- A Firecracker guest gives the pages it frees back to the host, so a
+  sandbox uses only the memory it needs now. Templates built before this
+  are rebuilt once.
 - `GET /v1/sandboxes` lists sandboxes. Org keys can add `?tenant=`.
 - `GET /v1/sandboxes/{id}` gets one sandbox.
 - `DELETE /v1/sandboxes/{id}` deletes a sandbox.
@@ -1205,9 +1214,12 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 - A paused sandbox shows `"state": "paused"` and `paused_at`.
 - Paused sandboxes stay after a server restart. Spawnbox deletes them
   after `--paused-retention-s` (default 7 days).
-- A pause writes all the memory of the sandbox to disk. On the test server,
-  this takes approximately 0.7 s. If earlier pauses are not yet written,
-  it can take up to 12 s.
+- On Firecracker, a pause writes only the memory that changed since the
+  sandbox was started or resumed. Spawnbox then merges it with the earlier
+  memory in the background; a resume or a move waits for that merge. The
+  first pause after a fork, a failed pause or a lazy (UFFD) restore writes
+  all the memory. On the test server a full pause took approximately 0.7 s,
+  and up to 12 s while earlier pauses were still being written.
 - `POST /v1/sandboxes/{id}:fork` starts copies of a running sandbox on its
   host. Field: `count`, 1 to 16 (default 1).
   - The response is `201` with `sandboxes` (the copies that started) and
@@ -1543,7 +1555,8 @@ These calls operate only on a primary. The key must have the scope
 
 Each node has `id`, `kind` (`worker` or `edge`), `url`, `state` (`ready`, `suspect`, `down`),
 `draining`, `last_seen`, `sandboxes`, `config_current` and `capacity`
-(free slots, free memory, reserved memory and its limit, ready templates,
+(free slots, free memory, reserved memory and its limit, whether memory is
+short, ready templates,
 warm VMs, CPU model and `fingerprint`). Sandboxes move only between hosts with the same
 `fingerprint` and CPU model.
 
@@ -1603,6 +1616,8 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--memory-overcommit-pct` | 150 | Percent of host memory that the `memory_mib` of running sandboxes can add up to. Over 100 fits more sandboxes that do not use all their memory. 100 means the host never gives out more memory than it has. |
 | `--vcpus`, `--memory-mib`, `--upper-disk-gib` | 2, 1024, 20 | Size of `base`, and the default size for templates |
 | `--max-timeout-s` | 86400 | Maximum `timeout_s` of a sandbox |
+| `--memory-pressure-pct` | 10 | Pause idle sandboxes to disk and refuse new ones when free host memory is below this percent, or processes wait for memory (PSI) this percent of the time. `0` turns it off. |
+| `--ksm` | off | Let the kernel merge equal memory pages across Firecracker VMs. Saves memory when sandboxes run the same programs, but a sandbox can learn what another holds by timing its writes. Use it only when all sandboxes trust each other. Needs Linux 6.7 or later. |
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
 | `--paused-retention-s` | 604800 | Delete paused sandboxes after this time |
 | `--max-builds` | 2 | Maximum number of template builds at the same time |
@@ -1650,6 +1665,7 @@ Type these commands on the host.
 | The log shows `sandboxes run in gvisor`, but you want Firecracker | Spawnbox cannot open `/dev/kvm` | Type `spawnbox doctor`. Use a bare-metal server, or turn on nested virtualization. |
 | Spawnbox does not start, and the log shows `--backend firecracker needs /dev/kvm` | You set `--backend firecracker` on a host without KVM | Remove `--backend firecracker`, or use a host with KVM. |
 | A create gives `503 no_capacity` with `the memory of this host is reserved by other sandboxes` | The running sandboxes reserve `--memory-overcommit-pct` of the host memory | Delete or pause sandboxes, add a worker, or use smaller templates. |
+| A create gives `503 no_capacity` with `this host is short of memory` | Free host memory is below `--memory-pressure-pct`; the host is pausing idle sandboxes | Wait and try again, add a worker, or give the sandboxes less memory. |
 | A create gives `503 no_capacity` for a `microvm-only` tenant | No Firecracker host has space | Add a Firecracker host, or set `isolation` of the tenant to `any`. |
 | The installer stops with `only Debian and Ubuntu are supported` | Wrong operating system | Use Ubuntu 22.04 or later, or Debian 12 or later. |
 | `curl .../healthz` shows `Connection refused` | The service is not running | Type `sudo systemctl status spawnbox`. Then read the log with `sudo journalctl -u spawnbox -n 50`. |
