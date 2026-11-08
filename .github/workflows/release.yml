@@ -1,0 +1,87 @@
+name: Release
+
+# A tag like v0.1.0 builds the bundle and publishes it as a GitHub Release.
+# Running it by hand builds the bundle and keeps it as a workflow artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    # The oldest supported glibc, so spawn-api runs on Ubuntu 22.04+ and Debian 12+.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends musl-tools pkg-config
+          rustup toolchain install
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked -p spawn-api -p spawnbox-cli
+          cargo build --release --locked -p spawn-guest --target x86_64-unknown-linux-musl
+          mkdir out
+          cp target/release/spawn-api target/release/spawnbox target/x86_64-unknown-linux-musl/release/spawn-guest out/
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: binaries
+          path: out/
+          if-no-files-found: error
+
+  bundle:
+    needs: binaries
+    # debootstrap here knows Debian 13 (trixie), which the base disk uses.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: binaries
+          path: binaries
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev debootstrap e2fsprogs zstd
+      - name: Build the kernel and base disk
+        run: |
+          chmod 0755 binaries/*
+          b=dist/spawnbox
+          mkdir -p "$b/bin" "$b/deploy"
+          scripts/fetch-firecracker.sh "$b/bin"
+          scripts/fetch-gvisor.sh "$b/bin"
+          guest/kernel/build.sh "$b/vmlinux"
+          guest/images/debian/build.sh binaries/spawn-guest "$b/rootfs.ext4"
+      - name: Package
+        run: |
+          b=dist/spawnbox
+          install -m 0755 binaries/spawn-api binaries/spawnbox "$b/bin/"
+          install -m 0755 deploy/install.sh "$b/deploy/"
+          cp LICENSE README.md "$b/"
+          echo "${GITHUB_REF_NAME}" > "$b/VERSION"
+          tar -C dist -czf spawnbox-x86_64-linux.tar.gz spawnbox
+          sha256sum spawnbox-x86_64-linux.tar.gz > spawnbox-x86_64-linux.tar.gz.sha256
+          ls -lh spawnbox-x86_64-linux.tar.gz
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            spawnbox-x86_64-linux.tar.gz spawnbox-x86_64-linux.tar.gz.sha256
+      - name: Keep the bundle
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: spawnbox-x86_64-linux
+          path: spawnbox-x86_64-linux.tar.gz*
+          compression-level: 0

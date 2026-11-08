@@ -166,21 +166,22 @@ Type all the commands in steps 3 to 7 on **the host**.
    curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh
    ```
 
-   The command installs Git if it is not installed, downloads the code
-   into `~/spawnbox` and runs `deploy/install.sh`. The installer does
-   these tasks:
+   The command downloads the latest
+   [release](https://github.com/TulipFarm/spawnbox/releases), checks its
+   SHA-256 sum and installs it. A release has the built programs, a Linux
+   kernel for the sandboxes, a Debian disk image, Firecracker and gVisor
+   (`runsc`). The installer also installs the system tools that Spawnbox
+   uses, and starts the `spawnbox` systemd service. It takes about a
+   minute.
 
-   - It installs the build tools and Rust, if they are not installed.
-   - It compiles Spawnbox, a Linux kernel for the sandboxes and a Debian
-     disk image. The first installation can take a long time because it
-     compiles a kernel.
-   - It downloads Firecracker and gVisor (`runsc`) and checks their
-     checksums.
-   - It installs and starts the `spawnbox` systemd service.
+   To upgrade later, type the same command again. To install a specific
+   release, set `SPAWNBOX_VERSION`, for example
+   `curl -fsSL ... | SPAWNBOX_VERSION=v0.1.0 sh`.
 
-   To upgrade later, type the same command again. To use a different
-   directory or a tag, set `SPAWNBOX_DIR` or `SPAWNBOX_REF`, for example
-   `curl -fsSL ... | SPAWNBOX_REF=v0.1.0 sh`. If you prefer, clone the
+   To compile Spawnbox from the code instead, set `SPAWNBOX_FROM_SOURCE=1`.
+   The command then downloads the code into `~/spawnbox`, installs the
+   build tools and Rust, and compiles everything. This takes about 30
+   minutes because it compiles a kernel. You can also clone the
    repository yourself and type `deploy/install.sh`.
 
 2. Wait until the installer stops. The last lines of the output must look
@@ -1661,8 +1662,9 @@ spawnbox doctor
 Firecracker if KVM operates, or gVisor if it does not. Exit code `0`
 means that all checks passed.
 
-To remove Spawnbox, type `~/spawnbox/deploy/install.sh --uninstall`. This keeps your
-data. To remove the data too, type `~/spawnbox/deploy/install.sh --purge`.
+To remove Spawnbox, type `sudo /opt/spawnbox/install.sh --uninstall`. This
+keeps your data. To remove the data too, type
+`sudo /opt/spawnbox/install.sh --purge`.
 
 ## How Spawnbox works
 
@@ -1737,8 +1739,9 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `crates/spawn-bench` | The boot and restore benchmark |
 | `crates/spawnbox-cli` | The `spawnbox` CLI |
 | `guest/` | The guest kernel settings and the Debian base image |
-| `install.sh` | Downloads the code and runs `deploy/install.sh`, for `curl ... \| sh` |
-| `deploy/install.sh` | The installer for one server |
+| `install.sh` | The one-line installer: downloads a release (or the code) and runs `deploy/install.sh` |
+| `deploy/install.sh` | The installer for one server, from a release bundle or the code |
+| `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |
 | `scripts/` | Build scripts and end-to-end tests |
 | `docs/spec.md` | The full design and the plan |
 

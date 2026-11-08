@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Installs Spawnbox on one Linux host from this source checkout.
+# Installs Spawnbox on one Linux host, from a release bundle (made by
+# .github/workflows/release.yml, with bin/ next to deploy/) or from a source
+# checkout, which it compiles first.
 #
 #   deploy/install.sh              install, or upgrade an existing install
 #   deploy/install.sh --uninstall  remove the service and binaries; keep
@@ -9,12 +11,12 @@
 #
 # Needs Ubuntu 22.04+ or Debian 12+ on x86_64, and root or sudo. With
 # /dev/kvm, sandboxes are Firecracker microVMs; without it, gVisor
-# containers. Run it as the user who owns the checkout: it builds there with
-# that user's Rust toolchain, then installs with sudo.
+# containers. From source, run it as the user who owns the checkout: it
+# builds there with that user's Rust toolchain, then installs with sudo.
 #
 # Layout:
 #   /opt/spawnbox/                 spawn-api, the spawnbox CLI, Firecracker,
-#                                  gVisor, kernel, base disk
+#                                  gVisor, kernel, base disk, this script
 #   /usr/local/bin/spawnbox        link to the CLI
 #   /etc/spawnbox/spawnbox.env     server flags (SPAWNBOX_ARGS); kept on upgrade
 #   /var/lib/spawnbox/             database, templates, secrets key, logs
@@ -29,6 +31,8 @@ unit=/etc/systemd/system/spawnbox.service
 cli_link=/usr/local/bin/spawnbox
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 artifacts="${SPAWNBOX_ARTIFACTS:-$HOME/.cache/spawnbox/artifacts}"
+bundle=no
+[[ -x "$repo/bin/spawn-api" ]] && bundle=yes
 
 sudo=""
 [[ $EUID -eq 0 ]] || sudo=sudo
@@ -64,7 +68,7 @@ case "${1:-}" in
   "") ;;
   --uninstall) uninstall no; exit 0 ;;
   --purge) uninstall yes; exit 0 ;;
-  -h | --help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "unknown option $1 (see --help)" ;;
 esac
 
@@ -79,29 +83,42 @@ if [[ ! -c /dev/kvm ]]; then
   echo "nested virtualization."
 fi
 
-say "installing build tools"
-$sudo apt-get update -qq
-$sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-  build-essential bc bison flex libelf-dev libssl-dev pkg-config musl-tools \
-  debootstrap e2fsprogs nftables iproute2 curl git ca-certificates xz-utils zstd >/dev/null
+[[ "$bundle" == yes || -f "$repo/Cargo.toml" ]] || die "run this from a release bundle or a source checkout"
 
-if ! command -v rustup >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
-  # shellcheck source=/dev/null
-  source "$HOME/.cargo/env"
-fi
-if ! command -v rustup >/dev/null; then
-  say "installing Rust with rustup"
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
-    sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-  # shellcheck source=/dev/null
-  source "$HOME/.cargo/env"
-fi
+if [[ "$bundle" == yes ]]; then
+  say "installing the tools Spawnbox runs"
+  $sudo apt-get update -qq
+  $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    e2fsprogs nftables iproute2 procps curl ca-certificates >/dev/null
+  bins="$repo/bin"
+  artifacts="$repo"
+else
+  say "installing build tools"
+  $sudo apt-get update -qq
+  $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    build-essential bc bison flex libelf-dev libssl-dev pkg-config musl-tools \
+    debootstrap e2fsprogs nftables iproute2 curl git ca-certificates xz-utils zstd >/dev/null
 
-say "building (the first build takes a while: it compiles a kernel)"
-cd "$repo"
-# rust-toolchain.toml pins the toolchain; rustup installs it on first use.
-cargo build --release --locked -p spawn-api -p spawnbox-cli
-scripts/build-artifacts.sh "$artifacts"
+  if ! command -v rustup >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.cargo/env"
+  fi
+  if ! command -v rustup >/dev/null; then
+    say "installing Rust with rustup"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+      sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+    # shellcheck source=/dev/null
+    source "$HOME/.cargo/env"
+  fi
+
+  say "building (the first build takes a while: it compiles a kernel)"
+  cd "$repo"
+  # rust-toolchain.toml pins the toolchain; rustup installs it on first use.
+  cargo build --release --locked -p spawn-api -p spawnbox-cli
+  scripts/build-artifacts.sh "$artifacts"
+  install -m 0755 target/release/spawn-api target/release/spawnbox "$artifacts/bin/"
+  bins="$artifacts/bin"
+fi
 
 first_install=no
 $sudo test -f "$data/spawnbox.db" || first_install=yes
@@ -109,13 +126,14 @@ $sudo test -f "$data/spawnbox.db" || first_install=yes
 stop_service
 say "installing into $prefix"
 $sudo install -d -m 0755 "$prefix/bin"
-$sudo install -m 0755 target/release/spawn-api target/release/spawnbox "$artifacts/bin/firecracker" "$artifacts/bin/jailer" "$artifacts/bin/runsc" "$prefix/bin/"
+$sudo install -m 0755 "$bins/spawn-api" "$bins/spawnbox" "$bins/firecracker" "$bins/jailer" "$bins/runsc" "$prefix/bin/"
 $sudo rm -rf "$prefix/bin/gvisor-bin"
-$sudo cp -r "$artifacts/bin/gvisor-bin" "$prefix/bin/"
+$sudo cp -r "$bins/gvisor-bin" "$prefix/bin/"
 if [[ ! -e "$cli_link" || -L "$cli_link" ]]; then
   $sudo ln -sfn "$prefix/bin/spawnbox" "$cli_link"
 fi
 $sudo install -m 0644 "$artifacts/vmlinux" "$artifacts/rootfs.ext4" "$prefix/"
+$sudo install -m 0755 "$repo/deploy/install.sh" "$prefix/install.sh"
 $sudo install -d -m 0755 "$config_dir"
 if ! $sudo test -f "$config"; then
   $sudo tee "$config" >/dev/null <<'EOF'
