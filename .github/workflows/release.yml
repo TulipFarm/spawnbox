@@ -68,7 +68,7 @@ jobs:
           install -m 0755 deploy/install.sh "$b/deploy/"
           cp LICENSE README.md "$b/"
           echo "${GITHUB_REF_NAME}" > "$b/VERSION"
-          tar -C dist -czf spawnbox-x86_64-linux.tar.gz spawnbox
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf spawnbox-x86_64-linux.tar.gz spawnbox
           sha256sum spawnbox-x86_64-linux.tar.gz > spawnbox-x86_64-linux.tar.gz.sha256
           ls -lh spawnbox-x86_64-linux.tar.gz
       - name: Publish the release
