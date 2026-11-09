@@ -50,6 +50,7 @@ from_release() {
 }
 
 from_source() {
+  HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
   dir="${SPAWNBOX_DIR:-$HOME/spawnbox}"
   ref="${SPAWNBOX_REF:-main}"
   need git

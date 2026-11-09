@@ -23,6 +23,10 @@
 #   spawnbox.service               systemd unit
 set -euo pipefail
 
+# Boot scripts (cloud-init user data) run without HOME.
+HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+export HOME
+
 prefix=/opt/spawnbox
 config_dir=/etc/spawnbox
 config="$config_dir/spawnbox.env"
