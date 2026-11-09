@@ -299,8 +299,15 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
                 if let Some(node) = request.node.as_deref() {
                     end(app, &request, Some(node), "joined", "autoscale.done");
                 } else if request.expires_at.is_some_and(|at| at <= now) {
-                    let why = "no worker joined before the join token expired";
-                    end(app, &request, None, why, "autoscale.failed");
+                    // The hook may have started a machine that never joined.
+                    if due {
+                        if stop_unjoined(s, &request).await {
+                            let why = "no worker joined before the join token expired";
+                            end(app, &request, None, why, "autoscale.failed");
+                        } else {
+                            memory.retry_at.insert(request.id.clone(), now + RETRY_MS);
+                        }
+                    }
                 } else {
                     fleet.pending_up = true;
                     if due && !memory.sent.contains(&request.id) {
@@ -656,6 +663,29 @@ async fn remove_worker(app: &App, s: &Settings, request: &ScaleRequest, node: &N
     }
     end(app, request, Some(&node.id), "removed", "autoscale.done");
     true
+}
+
+/// Asks the hook to stop the machine started for a scale-up that no worker
+/// joined: a `scale_down` with only `scale_up` set.
+async fn stop_unjoined(s: &Settings, request: &ScaleRequest) -> bool {
+    let body = json!({
+        "action": DOWN,
+        "id": request.id,
+        "reason": "no worker joined for this scale_up",
+        "node": { "id": null, "url": null, "scale_up": request.id },
+    });
+    let env = [
+        ("SPAWNBOX_NODE_ID", String::new()),
+        ("SPAWNBOX_NODE_URL", String::new()),
+        ("SPAWNBOX_NODE_SCALE_UP", request.id.clone()),
+    ];
+    match call(&s.hook, DOWN, &request.id, &body, &env).await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("autoscale: {DOWN} for {}: hook failed: {error}", request.id);
+            false
+        }
+    }
 }
 
 async fn call(

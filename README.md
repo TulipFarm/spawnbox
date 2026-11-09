@@ -1178,7 +1178,8 @@ How it decides:
 - It asks for one worker at a time, and never goes above
   `--autoscale-max-workers`. Retiring workers do not count. If the load
   goes up while a worker retires, the primary asks for a new worker.
-- A new worker must join within 30 minutes.
+- A new worker must join within 30 minutes. If none does, the primary
+  calls the hook to stop the machine it asked for.
 - If the hook fails, the primary sends the same request again after 5
   minutes. A new primary that takes over also sends the open `scale_up`
   requests again, because it cannot know if the hook ran. The request ID
@@ -1241,11 +1242,16 @@ the request as JSON on stdin, and these environment variables:
 | `SPAWNBOX_REQUEST_ID` | Both | ID of the request, for example `scl_...`. The same request can come again. |
 | `SPAWNBOX_JOIN_TOKEN` | `scale_up` | Join token for the new worker |
 | `SPAWNBOX_PRIMARY_CA_SHA256` | `scale_up` | Value for `--primary-ca-sha256` |
-| `SPAWNBOX_NODE_ID` | `scale_down` | ID of the worker to stop |
-| `SPAWNBOX_NODE_URL` | `scale_down` | `--advertise` URL of the worker |
+| `SPAWNBOX_NODE_ID` | `scale_down` | ID of the worker to stop, or empty |
+| `SPAWNBOX_NODE_URL` | `scale_down` | `--advertise` URL of the worker, or empty |
 | `SPAWNBOX_NODE_SCALE_UP` | `scale_down` | ID of the `scale_up` request that made the worker, or empty |
 
 A `scale_down` for a machine that is already gone must also exit `0`.
+
+If no worker joins within 30 minutes of a `scale_up`, the primary sends a
+`scale_down` with only `SPAWNBOX_NODE_SCALE_UP` set (the node's `id` and
+`url` are `null` in the JSON), so the hook stops any machine it started
+for that request.
 
 To use a webhook, give a URL to `--autoscale-hook`, for example
 `--autoscale-hook https://hooks.example.com/spawnbox`. The URL must use

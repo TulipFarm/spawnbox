@@ -48,7 +48,12 @@ SPAWNBOX_ARGS="--preview-url $SPAWNBOX_PREVIEW_URL --primary $SPAWNBOX_PRIMARY_U
 SPAWNBOX_JOIN_TOKEN=$SPAWNBOX_JOIN_TOKEN
 END
 )
-curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh
+# Downloads can fail for a while; the join token is good for 30 minutes.
+for try in \$(seq 20); do
+  curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh && break
+  [ "\$try" -lt 20 ] || exit 1
+  sleep 60
+done
 systemctl restart spawnbox
 EOF
   tags="{Key=spawnbox-fleet,Value=$SPAWNBOX_FLEET},{Key=spawnbox-request,Value=$SPAWNBOX_REQUEST_ID}"
