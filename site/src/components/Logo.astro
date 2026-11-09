@@ -1,0 +1,18 @@
+---
+// Brand marks: Simple Icons (CC0) and LobeHub icons (MIT, Codex). Trademarks belong to their owners.
+import logos from "../logos.json";
+interface Props {
+  name: keyof typeof logos;
+  size?: number;
+  x?: number;
+  y?: number;
+  mono?: boolean;
+}
+const { name, size = 14, x, y, mono = false } = Astro.props;
+const l = logos[name] as { name: string; color: string; d: string; rule?: "evenodd" };
+---
+
+<svg class="logo" viewBox="0 0 24 24" width={size} height={size} x={x} y={y} role="img" aria-label={l.name}>
+  <title>{l.name}</title>
+  <path d={l.d} fill={mono ? "currentColor" : l.color} fill-rule={l.rule} />
+</svg>
