@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs or upgrades Spawnbox on this host:
 #
-#   curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh
+#   curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh
 #
 # It downloads the latest release (built programs, kernel and base disk),
 # checks its SHA-256 sum and runs its deploy/install.sh. Settings:

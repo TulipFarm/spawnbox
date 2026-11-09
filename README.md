@@ -163,7 +163,7 @@ Type all the commands in steps 3 to 7 on **the host**.
 1. Type this command:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh
+   curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh
    ```
 
    The command downloads the latest
