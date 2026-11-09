@@ -75,6 +75,7 @@ pub async fn run(args: Args) -> Result<()> {
         jails: work.join("jails"),
         logs: work.join("logs"),
         ksm: false,
+        pins: None,
     };
     net::remove_stale_namespaces().await?;
     host.remove_all().await;

@@ -695,6 +695,9 @@ impl Node {
         let boot = Instant::now();
         vm.put("/actions", json!({ "action_type": "InstanceStart" }))
             .await?;
+        // Firecracker makes the vCPU threads on start, so they may run on
+        // each other's CPUs for a moment first.
+        vm.pin_vcpus()?;
         let channel = guest::connect(&vm.dialer(), Duration::from_secs(30))
             .await
             .with_context(|| format!("guest did not answer; see logs/{}.log", slot.id))?;
@@ -911,6 +914,7 @@ impl Node {
                 json!({ "backend_path": "/vm.mem", "backend_type": "File" })
             }
         };
+        let pin_first = vm.pins_each_vcpu();
         let loaded = vm
             .put(
                 "/snapshot/load",
@@ -919,10 +923,17 @@ impl Node {
                     "mem_backend": backend,
                     // So a pause can write only the pages written since.
                     "track_dirty_pages": from_file,
-                    "resume_vm": true,
+                    "resume_vm": !pin_first,
                 }),
             )
             .await;
+        let loaded = match loaded {
+            Ok(()) if pin_first => match vm.pin_vcpus() {
+                Ok(()) => vm.patch("/vm", json!({ "state": "Resumed" })).await,
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
         if let Err(error) = loaded {
             vm.stop().await;
             return Err(ResumeError::Before(error));

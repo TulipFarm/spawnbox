@@ -41,6 +41,97 @@ pub struct Host {
     /// memory, but a guest can time page writes to guess what another
     /// guest holds, so use it only when all guests trust each other.
     pub ksm: bool,
+    /// Keeps each vCPU on one host CPU; see `CpuPins`.
+    pub pins: Option<Arc<CpuPins>>,
+}
+
+/// Gives each VM its own host CPUs, least used first. Under nested
+/// virtualization (a cloud VM running Firecracker) a vCPU that moves
+/// between host CPUs can fail to enter the guest (`KVM_EXIT_FAIL_ENTRY`)
+/// once many VMs share each CPU, and Firecracker exits. A vCPU that stays
+/// on one CPU does not.
+pub struct CpuPins {
+    /// How many vCPUs are pinned to each CPU, by CPU number.
+    used: Mutex<Vec<(usize, u32)>>,
+}
+
+impl CpuPins {
+    /// Over the CPUs this process may run on.
+    pub fn new() -> Result<Self> {
+        let allowed = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0))
+            .context("read CPU affinity")?;
+        let used: Vec<_> = (0..nix::sched::CpuSet::count())
+            .filter(|&cpu| allowed.is_set(cpu).unwrap_or(false))
+            .map(|cpu| (cpu, 0))
+            .collect();
+        if used.is_empty() {
+            bail!("no CPUs to pin vCPUs to");
+        }
+        Ok(Self {
+            used: Mutex::new(used),
+        })
+    }
+
+    /// Whether this host is itself a virtual machine.
+    pub fn nested() -> bool {
+        std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
+            info.lines()
+                .filter(|line| line.starts_with("flags"))
+                .any(|line| line.split_whitespace().any(|flag| flag == "hypervisor"))
+        })
+    }
+
+    /// One CPU for each of `vcpus`, distinct while there are enough.
+    fn take(self: &Arc<Self>, vcpus: u8) -> CpuLease {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cpus = Vec::new();
+        for _ in 0..vcpus.max(1) {
+            let fresh = used
+                .iter_mut()
+                .filter(|(cpu, _)| !cpus.contains(cpu))
+                .min_by_key(|(cpu, count)| (*count, *cpu));
+            let (cpu, count) = match fresh {
+                Some(slot) => slot,
+                None => used
+                    .iter_mut()
+                    .min_by_key(|(cpu, count)| (*count, *cpu))
+                    .expect("not empty"),
+            };
+            *count += 1;
+            cpus.push(*cpu);
+        }
+        CpuLease {
+            pins: Arc::clone(self),
+            cpus,
+        }
+    }
+}
+
+/// The CPUs one VM is pinned to; vCPU `n` runs on `cpus[n]`.
+struct CpuLease {
+    pins: Arc<CpuPins>,
+    cpus: Vec<usize>,
+}
+
+impl CpuLease {
+    fn set(&self) -> Result<nix::sched::CpuSet> {
+        let mut set = nix::sched::CpuSet::new();
+        for &cpu in &self.cpus {
+            set.set(cpu)?;
+        }
+        Ok(set)
+    }
+}
+
+impl Drop for CpuLease {
+    fn drop(&mut self) {
+        let mut used = self.pins.used.lock().unwrap_or_else(|e| e.into_inner());
+        for cpu in &self.cpus {
+            if let Some((_, count)) = used.iter_mut().find(|(c, _)| c == cpu) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
 }
 
 impl Host {
@@ -173,11 +264,11 @@ pub struct Limits {
 pub struct Vm {
     jail: Jail,
     net: Netns,
-    api: PathBuf,
     child: Child,
     lift: Arc<Mutex<Lift>>,
     pager: Option<Box<Pager>>,
     dirty: AtomicBool,
+    lease: Option<Box<CpuLease>>,
 }
 
 #[derive(Default)]
@@ -234,6 +325,22 @@ impl Vm {
                 });
             }
         }
+        let lease = host
+            .pins
+            .as_ref()
+            .map(|pins| Box::new(pins.take(limits.vcpus)));
+        if let Some(lease) = &lease {
+            // Every thread starts on the VM's CPUs; `pin_vcpus` then gives
+            // each vCPU thread its own, which a one-vCPU VM already has.
+            let set = lease.set()?;
+            // SAFETY: sched_setaffinity is a plain syscall, safe after fork.
+            unsafe {
+                command.pre_exec(move || {
+                    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                        .map_err(std::io::Error::from)
+                });
+            }
+        }
         let child = command
             .args(["--id", &jail.id, "--uid", &uid, "--gid", &uid])
             .arg("--exec-file")
@@ -251,23 +358,60 @@ impl Vm {
             .kill_on_drop(true)
             .spawn()
             .context("start jailer")?;
-        let api = jail.root.join("api.sock");
         let mut vm = Self {
             jail,
             net,
-            api,
             child,
             lift: Arc::default(),
             pager: None,
             dirty: AtomicBool::new(false),
+            lease,
         };
         vm.wait_for_api().await?;
         Ok(vm)
     }
 
+    /// Whether the vCPU threads must be pinned one by one once they exist:
+    /// the VM has more than one vCPU and its vCPUs are pinned.
+    pub fn pins_each_vcpu(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.cpus.len() > 1)
+    }
+
+    /// Moves each vCPU thread (`fc_vcpu <n>`) to its own CPU. Call it once
+    /// Firecracker has made them, before they run if possible.
+    pub fn pin_vcpus(&self) -> Result<()> {
+        let Some(lease) = self.lease.as_ref().filter(|_| self.pins_each_vcpu()) else {
+            return Ok(());
+        };
+        let pid = self.pid().context("Firecracker has exited")?;
+        for task in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            let Some(n) = comm.trim().strip_prefix("fc_vcpu ") else {
+                continue;
+            };
+            let (Ok(n), Some(tid)) = (
+                n.parse::<usize>(),
+                task.file_name().to_str().and_then(|t| t.parse().ok()),
+            ) else {
+                continue;
+            };
+            let mut set = nix::sched::CpuSet::new();
+            set.set(lease.cpus[n % lease.cpus.len()])?;
+            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &set)
+                .with_context(|| format!("pin vCPU {n} of {}", self.jail.id))?;
+        }
+        Ok(())
+    }
+
+    fn api(&self) -> PathBuf {
+        self.jail.root.join("api.sock")
+    }
+
     async fn wait_for_api(&mut self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while UnixStream::connect(&self.api).await.is_err() {
+        while UnixStream::connect(self.api()).await.is_err() {
             if let Some(status) = self.child.try_wait()? {
                 bail!("jailer exited with {status}; see logs for {}", self.jail.id);
             }
@@ -363,7 +507,7 @@ impl Vm {
     }
 
     async fn call(&self, method: Method, path: &str, body: Value) -> Result<()> {
-        let stream = UnixStream::connect(&self.api).await?;
+        let stream = UnixStream::connect(self.api()).await?;
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         tokio::spawn(conn);
@@ -401,5 +545,36 @@ impl Vm {
             eprintln!("warning: remove {}: {error}", self.jail.dir.display());
         }
         self.net.remove().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pins(cpus: usize) -> Arc<CpuPins> {
+        Arc::new(CpuPins {
+            used: Mutex::new((0..cpus).map(|cpu| (cpu, 0)).collect()),
+        })
+    }
+
+    #[test]
+    fn vms_spread_over_the_least_used_cpus() {
+        let pins = pins(4);
+        let a = pins.take(1);
+        let b = pins.take(2);
+        let c = pins.take(1);
+        assert_eq!(
+            (a.cpus.clone(), b.cpus.clone(), c.cpus.clone()),
+            (vec![0], vec![1, 2], vec![3])
+        );
+        drop(b);
+        assert_eq!(pins.take(2).cpus, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_vm_with_more_vcpus_than_cpus_shares_them() {
+        let pins = pins(2);
+        assert_eq!(pins.take(3).cpus, vec![0, 1, 0]);
     }
 }

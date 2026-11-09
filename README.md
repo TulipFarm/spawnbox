@@ -1751,6 +1751,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--max-timeout-s` | 86400 | Maximum `timeout_s` of a sandbox |
 | `--memory-pressure-pct` | 10 | Pause idle sandboxes to disk and refuse new ones when free host memory is below this percent, or processes wait for memory (PSI) this percent of the time. `0` turns it off. |
 | `--ksm` | off | Let the kernel merge equal memory pages across Firecracker VMs. Saves memory when sandboxes run the same programs, but a sandbox can learn what another holds by timing its writes. Use it only when all sandboxes trust each other. Needs Linux 6.7 or later. |
+| `--pin-vcpus` | `auto` | Keep each Firecracker vCPU on one host CPU, spreading VMs over the least used CPUs. `auto` turns it on when the host is itself a VM. Under nested virtualization, VMs whose vCPUs move between CPUs can crash (`KVM_EXIT_FAIL_ENTRY` in the sandbox log) once many share each CPU. `on` or `off` overrides it. |
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
 | `--paused-retention-s` | 604800 | Delete paused sandboxes after this time |
 | `--max-builds` | 2 | Maximum number of template builds at the same time |

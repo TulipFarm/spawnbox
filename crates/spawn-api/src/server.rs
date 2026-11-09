@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use spawn_egress::{Activity, Ca, Egress, Policy, SecretStore};
-use spawn_node::firecracker::Host;
+use spawn_node::firecracker::{CpuPins, Host};
 use spawn_node::gvisor::Runsc;
 use spawn_node::net::{self, HostNet};
 use spawn_node::{Backend, Node, absolute};
@@ -100,6 +100,15 @@ enum BackendArg {
     Firecracker,
     /// gVisor containers, for hosts without KVM. Weaker isolation.
     Gvisor,
+}
+
+/// Whether each Firecracker vCPU stays on one host CPU.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PinArg {
+    /// On when the host is itself a virtual machine.
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(clap::Args)]
@@ -243,6 +252,11 @@ pub struct Args {
     /// by timing; use it only when all sandboxes trust each other.
     #[arg(long)]
     ksm: bool,
+    /// Keeps each Firecracker vCPU on one host CPU, spreading VMs over the
+    /// CPUs. Under nested virtualization, VMs whose vCPUs move between
+    /// CPUs can crash once many share each CPU.
+    #[arg(long, value_enum, default_value_t = PinArg::Auto)]
+    pin_vcpus: PinArg,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
@@ -458,11 +472,21 @@ pub async fn serve(args: Args) -> Result<()> {
         jails: data.join("jails"),
         logs: data.join("logs"),
         ksm: args.ksm,
+        pins: None,
     };
     let (runsc, inputs) = match backend {
         Backend::Firecracker => {
             host.jailer = need(&args.jailer, "jailer")?;
             host.firecracker = need(&args.firecracker, "firecracker")?;
+            let pin = match args.pin_vcpus {
+                PinArg::Auto => CpuPins::nested(),
+                PinArg::On => true,
+                PinArg::Off => false,
+            };
+            if pin {
+                host.pins = Some(Arc::new(CpuPins::new()?));
+                eprintln!("each vCPU stays on one host CPU");
+            }
             let inputs = Inputs {
                 kernel: need(&args.kernel, "kernel")?,
                 rootfs: absolute(&args.rootfs)?,
