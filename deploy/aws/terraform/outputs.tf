@@ -12,5 +12,6 @@ output "hook_env" {
     SPAWNBOX_SUBNETS="${join(" ", var.subnet_ids)}"
     SPAWNBOX_PRIMARY_URL=${var.primary_url}
     SPAWNBOX_PREVIEW_URL=${var.preview_url}
+    SPAWNBOX_WORKER_ARGS="${var.worker_args}"
   EOT
 }

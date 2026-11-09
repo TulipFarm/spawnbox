@@ -1167,15 +1167,17 @@ How it decides:
 - If a create gets `503 no_capacity`, the primary asks for one more
   worker at once. It does not wait for `--autoscale-up-after-s`.
 - If the load stays above `--autoscale-up-pct` for
-  `--autoscale-up-after-s`, or there are fewer workers than
-  `--autoscale-min-workers`, the primary asks for one more worker
+  `--autoscale-up-after-s`, the primary asks for one more worker
   (`scale_up`).
+- If there are fewer workers than `--autoscale-min-workers`, the primary
+  asks for all the missing workers at once. To get ready for a known
+  burst, raise the minimum before it starts.
 - If the load stays below `--autoscale-down-pct` for
   `--autoscale-down-after-s`, the primary
   [retires](#retire-a-worker-safely) the worker with the fewest
   sandboxes. When it is `ready_to_terminate`, the primary calls the hook
   to stop the machine (`scale_down`), then removes the worker.
-- It asks for one worker at a time, and never goes above
+- Otherwise it asks for one worker at a time, and it never goes above
   `--autoscale-max-workers`. Retiring workers do not count. If the load
   goes up while a worker retires, the primary asks for a new worker.
 - A new worker must join within 30 minutes. If none does, the primary
@@ -1225,6 +1227,16 @@ How it decides:
 
 4. Add these flags to `SPAWNBOX_ARGS` on the primary and restart:
    `--autoscale-hook /etc/spawnbox/aws-hook.sh --autoscale-max-workers 10`.
+
+To change new workers, add these to `/etc/spawnbox/aws-hook.env`:
+
+- `SPAWNBOX_WORKER_ARGS`: more flags for each worker, for example
+  `"--max-sandboxes 64"`. The Terraform variable `worker_args` sets it.
+- `SPAWNBOX_WORKER_SETUP`: path to a script on the primary. Each new
+  worker runs it as root at boot, before Spawnbox is installed, for
+  example to start a monitoring agent. It goes in the EC2 user data,
+  which is at most 16 KB. Do not change it while a worker is still to
+  join: a request sent again must have the same user data.
 
 With Pulumi or another tool, make the same parts and use the same hook.
 On Azure or GCP, change the `aws` commands in the hook.

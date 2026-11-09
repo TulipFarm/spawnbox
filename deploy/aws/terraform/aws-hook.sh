@@ -11,6 +11,11 @@
 # if this hook fails or a new primary takes over. So each request starts at
 # most one machine: the request ID is the EC2 client token, and the subnet
 # and user data depend only on the request.
+#
+# Optional settings in aws-hook.env for new workers:
+#   SPAWNBOX_WORKER_ARGS   more flags for the worker, e.g. "--max-sandboxes 64"
+#   SPAWNBOX_WORKER_SETUP  a script on the primary that each worker runs as
+#                          root at boot, before Spawnbox is installed
 set -eu
 
 # shellcheck source=/dev/null
@@ -44,10 +49,20 @@ install -d -m 0755 /etc/spawnbox
 (
 umask 077
 cat > /etc/spawnbox/spawnbox.env <<END
-SPAWNBOX_ARGS="--preview-url $SPAWNBOX_PREVIEW_URL --primary $SPAWNBOX_PRIMARY_URL --node-listen \$ip:7444 --advertise https://\$ip:7444 --primary-ca-sha256 $SPAWNBOX_PRIMARY_CA_SHA256"
+SPAWNBOX_ARGS="--preview-url $SPAWNBOX_PREVIEW_URL --primary $SPAWNBOX_PRIMARY_URL --node-listen \$ip:7444 --advertise https://\$ip:7444 --primary-ca-sha256 $SPAWNBOX_PRIMARY_CA_SHA256${SPAWNBOX_WORKER_ARGS:+ $SPAWNBOX_WORKER_ARGS}"
 SPAWNBOX_JOIN_TOKEN=$SPAWNBOX_JOIN_TOKEN
 END
 )
+EOF
+  if [ -n "${SPAWNBOX_WORKER_SETUP:-}" ]; then
+    {
+      echo "cat > /etc/spawnbox/worker-setup <<'SPAWNBOX_SETUP_END'"
+      cat "$SPAWNBOX_WORKER_SETUP"
+      echo "SPAWNBOX_SETUP_END"
+      echo "sh /etc/spawnbox/worker-setup"
+    } >> "$boot"
+  fi
+  cat >> "$boot" <<EOF
 # Downloads can fail for a while; the join token is good for 30 minutes.
 for try in \$(seq 20); do
   curl -fsSL https://raw.githubusercontent.com/TulipFarm/spawnbox/main/install.sh | sh && break

@@ -36,6 +36,12 @@ variable "instance_type" {
   default     = "c8i.2xlarge"
 }
 
+variable "worker_args" {
+  description = "More flags for each worker, for example \"--max-sandboxes 64\""
+  type        = string
+  default     = ""
+}
+
 variable "disk_gib" {
   description = "Worker disk size"
   type        = number

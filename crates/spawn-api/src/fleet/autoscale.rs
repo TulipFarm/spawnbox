@@ -133,9 +133,10 @@ struct Fleet {
     load: Option<f64>,
     /// Workers that are ready and not draining.
     active: usize,
-    /// Workers not removed or retiring, and the one asked for.
+    /// Workers not removed or retiring, and the ones asked for.
     total: usize,
-    pending_up: bool,
+    /// Scale-ups still waiting for their worker to join.
+    pending_up: usize,
     scaling_down: bool,
     /// A create found no room since the last tick.
     refused: bool,
@@ -144,19 +145,27 @@ struct Fleet {
 #[derive(Debug, PartialEq)]
 enum Decision {
     Wait,
-    Up(String),
+    /// Ask for this many workers.
+    Up(String, usize),
     Down(String),
 }
 
-/// One step at a time: no new request while a worker is still to join.
+/// Below the minimum, asks for all missing workers at once. Otherwise one
+/// step at a time: no new request while a worker is still to join.
 fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
-    if f.pending_up {
+    let missing = s.min_workers.saturating_sub(f.active + f.pending_up);
+    if missing > 0 {
+        let n = missing.min(s.max_workers.saturating_sub(f.total));
+        if n > 0 {
+            return Decision::Up(format!("fewer than {} workers", s.min_workers), n);
+        }
+        return Decision::Wait;
+    }
+    if f.pending_up > 0 {
         return Decision::Wait;
     }
     let lasted = |since: Option<i64>, after: i64| since.is_some_and(|t0| now - t0 >= after);
-    let need = if f.active < s.min_workers {
-        Some(format!("fewer than {} workers", s.min_workers))
-    } else if f.refused {
+    let need = if f.refused {
         Some("a create found no room".to_owned())
     } else if lasted(t.high_since, s.up_after_ms) {
         Some(format!(
@@ -171,7 +180,7 @@ fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
         // A retiring worker never takes sandboxes again, so a worker is
         // added even while one is being removed.
         if f.total < s.max_workers {
-            return Decision::Up(reason);
+            return Decision::Up(reason, 1);
         }
         return Decision::Wait;
     }
@@ -309,7 +318,7 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
                         }
                     }
                 } else {
-                    fleet.pending_up = true;
+                    fleet.pending_up += 1;
                     if due && !memory.sent.contains(&request.id) {
                         send_up(app, p, s, &request, memory, now).await;
                     }
@@ -385,14 +394,16 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
         .collect();
     fleet.load = current_load(app, p)?;
     fleet.active = active.len();
-    fleet.total = workers.len() + usize::from(fleet.pending_up);
+    fleet.total = workers.len() + fleet.pending_up;
     memory.trend.update(fleet.load, s, now);
 
     match decide(s, &fleet, &memory.trend, now) {
         Decision::Wait => {}
-        Decision::Up(reason) => {
+        Decision::Up(reason, n) => {
             memory.trend = Trend::default();
-            scale_up(app, p, s, &reason, memory, now).await?;
+            for _ in 0..n {
+                scale_up(app, p, s, &reason, memory, now).await?;
+            }
         }
         Decision::Down(reason) => {
             memory.trend = Trend::default();
@@ -859,7 +870,7 @@ mod tests {
         assert_eq!(after(&s, &fleet(0.8, 1), 60_000), Decision::Wait);
         assert!(matches!(
             after(&s, &fleet(0.8, 1), 120_000),
-            Decision::Up(_)
+            Decision::Up(_, 1)
         ));
         assert_eq!(after(&s, &fleet(0.5, 1), 999_000_000), Decision::Wait);
     }
@@ -877,7 +888,7 @@ mod tests {
     #[test]
     fn keeps_within_min_and_max() {
         let s = settings();
-        assert!(matches!(after(&s, &fleet(0.0, 0), 0), Decision::Up(r) if r.contains("fewer")));
+        assert!(matches!(after(&s, &fleet(0.0, 0), 0), Decision::Up(r, 1) if r.contains("fewer")));
         assert_eq!(after(&s, &fleet(0.9, 3), 999_000), Decision::Wait);
         assert_eq!(after(&s, &fleet(0.1, 1), 9_999_000), Decision::Wait);
         assert!(matches!(
@@ -893,7 +904,7 @@ mod tests {
             refused: true,
             ..fleet(0.2, 1)
         };
-        assert!(matches!(after(&s, &refused, 0), Decision::Up(r) if r.contains("no room")));
+        assert!(matches!(after(&s, &refused, 0), Decision::Up(r, 1) if r.contains("no room")));
         let full = Fleet {
             refused: true,
             ..fleet(0.2, 3)
@@ -905,8 +916,9 @@ mod tests {
     fn one_change_at_a_time() {
         let s = settings();
         let pending = Fleet {
-            pending_up: true,
-            ..fleet(0.0, 0)
+            pending_up: 1,
+            total: 1,
+            ..fleet(0.9, 1)
         };
         assert_eq!(after(&s, &pending, 999_000), Decision::Wait);
         let removing = Fleet {
@@ -918,7 +930,37 @@ mod tests {
             scaling_down: true,
             ..fleet(0.9, 2)
         };
-        assert!(matches!(after(&s, &busy_again, 120_000), Decision::Up(_)));
+        assert!(matches!(
+            after(&s, &busy_again, 120_000),
+            Decision::Up(_, 1)
+        ));
+    }
+
+    #[test]
+    fn asks_for_all_missing_workers_at_once() {
+        let s = Settings {
+            min_workers: 20,
+            max_workers: 25,
+            ..settings()
+        };
+        assert!(matches!(after(&s, &fleet(0.0, 2), 0), Decision::Up(r, 18) if r.contains("fewer")));
+        let asked = Fleet {
+            pending_up: 15,
+            total: 17,
+            ..fleet(0.0, 2)
+        };
+        assert!(matches!(after(&s, &asked, 0), Decision::Up(_, 3)));
+        let all_asked = Fleet {
+            pending_up: 18,
+            total: 20,
+            ..fleet(0.9, 2)
+        };
+        assert_eq!(after(&s, &all_asked, 999_000), Decision::Wait);
+        let near_max = Fleet {
+            total: 23,
+            ..fleet(0.0, 2)
+        };
+        assert!(matches!(after(&s, &near_max, 0), Decision::Up(_, 2)));
     }
 
     #[test]
