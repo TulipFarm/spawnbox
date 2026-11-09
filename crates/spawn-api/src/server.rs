@@ -767,6 +767,7 @@ async fn run(
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 app.sandboxes.expire();
+                app.sandboxes.reap_exited();
                 app.sandboxes.pause_idle();
                 app.sandboxes.relieve_pressure();
                 app.sandboxes.refill_warm();

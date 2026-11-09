@@ -371,6 +371,14 @@ impl Vm {
         Ok(vm)
     }
 
+    /// How Firecracker ended, if it has: the guest crashed or was killed.
+    pub fn exited(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(format!("Firecracker exited with {status}")),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
     /// Whether the vCPU threads must be pinned one by one once they exist:
     /// the VM has more than one vCPU and its vCPUs are pinned.
     pub fn pins_each_vcpu(&self) -> bool {

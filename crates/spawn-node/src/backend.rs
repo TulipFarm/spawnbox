@@ -107,6 +107,14 @@ impl Vm {
         }
     }
 
+    /// Why the guest is gone, if its process ended without `stop`.
+    pub fn exited(&mut self) -> Option<String> {
+        match self {
+            Self::Firecracker(vm) => vm.exited(),
+            Self::Gvisor(c) => c.exited(),
+        }
+    }
+
     /// Stops the guest's CPUs; its memory stays. For warm pools.
     pub async fn freeze(&self) -> Result<()> {
         match self {

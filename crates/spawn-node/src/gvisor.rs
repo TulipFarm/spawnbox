@@ -137,6 +137,8 @@ pub struct Container {
     bundle: PathBuf,
     net: Netns,
     filestore: Option<PathBuf>,
+    /// The sandbox process, if found: its PID and start time.
+    process: Option<(u32, String)>,
 }
 
 impl Container {
@@ -197,16 +199,32 @@ impl Container {
             bundle,
             net,
             filestore: None,
+            process: None,
         };
-        container.filestore = container.find_filestore().await;
+        if let Some(pid) = container.sandbox_pid().await {
+            container.process = start_time(pid).map(|started| (pid, started));
+            container.filestore = container.find_filestore(pid);
+        }
         Ok(container)
+    }
+
+    async fn sandbox_pid(&self) -> Option<u32> {
+        let state = self.runsc.cmd(&["state", &self.id]).await.ok()?;
+        let pid = serde_json::from_str::<Value>(&state).ok()?["pid"].as_u64()?;
+        u32::try_from(pid).ok()
+    }
+
+    /// Whether the sandbox process ended without `stop`. A new process
+    /// with the same PID has another start time.
+    pub fn exited(&self) -> Option<String> {
+        let (pid, started) = self.process.as_ref()?;
+        (start_time(*pid).as_ref() != Some(started))
+            .then(|| "the gVisor sandbox process exited".to_owned())
     }
 
     /// gVisor keeps the guest's writes in a deleted file in `fs/`. Its
     /// sandbox process holds it open, so `/proc/<pid>/fd/<n>` reaches it.
-    async fn find_filestore(&self) -> Option<PathBuf> {
-        let state = self.runsc.cmd(&["state", &self.id]).await.ok()?;
-        let pid = serde_json::from_str::<Value>(&state).ok()?["pid"].as_u64()?;
+    fn find_filestore(&self, pid: u32) -> Option<PathBuf> {
         let prefix = self.bundle.join("fs").join("runsc-filestore-");
         let prefix = prefix.to_str()?;
         std::fs::read_dir(format!("/proc/{pid}/fd"))
@@ -417,6 +435,15 @@ fn mounts_under(dir: &Path) -> Vec<String> {
         .filter(|target| Path::new(target).starts_with(dir))
         .map(str::to_owned)
         .collect()
+}
+
+/// When process `pid` started, in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`), or `None` if there is no such process.
+fn start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name in field 2 may hold spaces, but not the last ')'.
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    after_name.split_whitespace().nth(19).map(str::to_owned)
 }
 
 /// runsc removes the cgroup when the container ends; this covers a crash.

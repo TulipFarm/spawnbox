@@ -982,28 +982,40 @@ impl Sandboxes {
         );
         let restoring = Instant::now();
         let started = async {
-            let restored = match warm {
-                Some(vm) => {
-                    let restored = self.wake(vm).await?;
-                    if let Err(error) = restored.vm.attach(&attaches).await {
-                        restored.vm.stop().await;
-                        return Err(error);
-                    }
-                    restored
-                }
-                None => match &lazy {
+            let cold = async {
+                match &lazy {
                     Some(lazy) => {
                         let pages: Arc<dyn PageSource> = lazy.clone();
                         self.node
                             .restore_lazy(&ready.build, &name, index, mode, &attaches, pages)
-                            .await?
+                            .await
                     }
                     None => {
                         self.node
                             .restore(&ready.build, &name, index, mode, &attaches)
-                            .await?
+                            .await
+                    }
+                }
+            };
+            let (restored, warmed) = match warm {
+                Some(vm) => match self.wake(vm).await {
+                    Ok(restored) => {
+                        if let Err(error) = restored.vm.attach(&attaches).await {
+                            restored.vm.stop().await;
+                            return Err(error);
+                        }
+                        (restored, true)
+                    }
+                    // A warm VM that died while waiting: start this one cold.
+                    Err(error) => {
+                        eprintln!(
+                            "create {}: warm VM failed ({error:#}); restoring",
+                            sandbox.id
+                        );
+                        (cold.await?, false)
                     }
                 },
+                None => (cold.await?, false),
             };
             let apply_start = restored.started.elapsed();
             let fixups = async {
@@ -1015,10 +1027,10 @@ impl Sandboxes {
                 restored.vm.stop().await;
                 return Err(error);
             }
-            anyhow::Ok((restored, apply_start))
+            anyhow::Ok((restored, apply_start, warmed))
         }
         .await;
-        let (restored, apply_start) = match started {
+        let (restored, apply_start, from_pool) = match started {
             Ok(ok) => ok,
             Err(error) => {
                 eprintln!("create {}: {error:#}", sandbox.id);
@@ -1154,16 +1166,41 @@ impl Sandboxes {
             tokio::spawn(async move {
                 // An error means the VM stopped first, as it should.
                 if let Ok(why) = lost.await {
-                    this.lose_memory(&id, &origin, &why).await;
+                    let reason = "memory pages could not be fetched";
+                    this.lose(&id, &origin, &why, reason).await;
                 }
             });
         }
         Ok((sandbox, timings))
     }
 
-    /// Fails a sandbox whose pager stopped it because a memory part could
-    /// not be fetched.
-    async fn lose_memory(&self, id: &str, origin: &Origin, why: &str) {
+    /// Fails running sandboxes whose VM process ended on its own, as when
+    /// the guest crashed. Call every second.
+    pub fn reap_exited(&self) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let exited: Vec<(String, String)> = self
+            .inner()
+            .records
+            .iter_mut()
+            .filter_map(|(id, record)| match &mut record.vm {
+                VmState::Running(live) => live.vm.exited().map(|why| (id.clone(), why)),
+                _ => None,
+            })
+            .collect();
+        for (id, why) in exited {
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.lose(&id, &Origin::system(), &why, "the VM exited")
+                    .await;
+            });
+        }
+    }
+
+    /// Fails a sandbox whose VM stopped without being asked to: its pager
+    /// could not fetch memory, or the VM exited.
+    async fn lose(&self, id: &str, origin: &Origin, why: &str, reason: &str) {
         eprintln!("{id}: {why}; it was stopped");
         // A pause or move may hold it for a while; it fails without memory.
         for _ in 0..600 {
@@ -1190,7 +1227,7 @@ impl Sandboxes {
                     origin,
                     &record.tenant,
                     id,
-                    json!({ "reason": "memory pages could not be fetched" }),
+                    json!({ "reason": reason }),
                 );
                 return;
             }

@@ -525,6 +525,11 @@ example Amazon S3, Cloudflare R2, Garage or SeaweedFS. Then:
 > gets a `sandbox.lost` event. A pause or a fork of such a sandbox waits
 > until its memory is on the host.
 
+> **NOTE:** If a sandbox's VM stops on its own, for example because the
+> guest crashed, Spawnbox notices within a second. The sandbox's state
+> becomes `failed`, it gets a `sandbox.lost` event, and calls to it return
+> `409 conflict`. A warm VM that stopped is replaced by a normal start.
+
 > **NOTE:** Spawnbox deletes objects in the store that no host used for 7
 > days. Do not keep other data under the same prefix.
 
