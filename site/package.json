@@ -1,0 +1,17 @@
+{
+  "name": "spawnbox-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "astro": "7.4.7"
+  },
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": ">=26"
+  }
+}
