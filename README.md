@@ -906,7 +906,9 @@ With one primary, the API stops when the primary stops. To prevent this,
 run two or more primaries on one Postgres database. One primary is the
 **leader** and serves the API. The others are **standbys**: they wait and
 do not listen on any port. When the leader stops, a standby becomes the
-leader in about 15 seconds.
+leader in about 15 seconds. The new leader serves at once and builds its
+own copy of the `base` template in the background; until that is ready,
+new sandboxes start on workers.
 
 1. Make a Postgres 15 (or later) database, for example on Amazon RDS.
 2. Copy `/var/lib/spawnbox/secrets.key` from the primary to the same path

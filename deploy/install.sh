@@ -134,6 +134,14 @@ if [[ ! -e "$cli_link" || -L "$cli_link" ]]; then
 fi
 $sudo install -m 0644 "$artifacts/vmlinux" "$artifacts/rootfs.ext4" "$prefix/"
 $sudo install -m 0755 "$repo/deploy/install.sh" "$prefix/install.sh"
+# A release bundle names its tag; a source build has none.
+version=""
+if [[ -f "$repo/VERSION" ]]; then
+  $sudo install -m 0644 "$repo/VERSION" "$prefix/VERSION"
+  version="$(cat "$repo/VERSION")"
+else
+  $sudo rm -f "$prefix/VERSION"
+fi
 $sudo install -d -m 0755 "$config_dir"
 if ! $sudo test -f "$config"; then
   $sudo tee "$config" >/dev/null <<'EOF'
@@ -212,7 +220,7 @@ for _ in $(seq 300); do
 done
 curl -fs "$url/healthz" >/dev/null || die "spawnbox did not answer on $url; see: journalctl -u spawnbox"
 
-say "Spawnbox is running at $url"
+say "Spawnbox ${version:-from source} is running at $url"
 if [[ -n "$key" ]]; then
   cat <<EOF
 

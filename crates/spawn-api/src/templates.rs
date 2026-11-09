@@ -266,6 +266,7 @@ impl Templates {
         max_builds: usize,
         store: Option<Arc<BuildStore>>,
         cache_bytes: u64,
+        wait_for_base: bool,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let fingerprint = {
@@ -300,7 +301,17 @@ impl Templates {
             fresh: Mutex::new(HashMap::new()),
         });
         this.load()?;
-        this.ensure_base().await?;
+        if wait_for_base {
+            this.ensure_base().await?;
+        } else {
+            let base = Arc::clone(&this);
+            tokio::spawn(async move {
+                match base.ensure_base().await {
+                    Ok(()) => eprintln!("template {BASE_TEMPLATE:?} ready"),
+                    Err(error) => eprintln!("{error:#}"),
+                }
+            });
+        }
         for build in this.db.builds_in(&[build_state::QUEUED])? {
             this.queue(build.id);
         }

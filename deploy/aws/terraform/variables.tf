@@ -20,7 +20,7 @@ variable "primary_security_group_id" {
 }
 
 variable "primary_url" {
-  description = "The --fleet-listen URL of the primary, for example https://10.0.0.1:7443"
+  description = "The --fleet-listen URL of the primary, for example https://10.0.0.1:7443. With standby primaries, give every primary's URL, separated by commas"
   type        = string
 }
 

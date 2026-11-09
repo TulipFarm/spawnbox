@@ -5,3 +5,7 @@
 .DS_Store
 __pycache__/
 docs/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

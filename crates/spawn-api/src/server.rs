@@ -54,9 +54,9 @@ use crate::ids;
 use crate::metering::{HOUR_MS, Meter, Totals, hour_start, month_start};
 use crate::metrics;
 use crate::model::{
-    ApiError, Code, CreateSandbox, CreateVolume, Exec, ForkSandbox, GitClone, Resources,
-    SandboxView, SecretInput, SecretView, SnapshotSandbox, TemplateSpec, Timings, VolumeMount,
-    check_user, rfc3339_ms,
+    ApiError, BASE_TEMPLATE, Code, CreateSandbox, CreateVolume, Exec, ForkSandbox, GitClone,
+    Resources, SandboxView, SecretInput, SecretView, SnapshotSandbox, TemplateSpec, Timings,
+    VolumeMount, check_user, rfc3339_ms,
 };
 use crate::otlp::Otlp;
 use crate::runtime::{Busy, Parts, Sandboxes, Settings, now_ms};
@@ -650,6 +650,13 @@ async fn run(
         }
         None => None,
     };
+    // A standby taking over serves at once: workers take creates while it
+    // builds its own copy of `base`. A new fleet waits for its first build.
+    let wait_for_base = args.database_url.is_none()
+        || !db
+            .builds_in(&[crate::db::build_state::READY])?
+            .iter()
+            .any(|b| b.template == BASE_TEMPLATE);
     let started = Instant::now();
     let templates = Templates::start(
         db.clone(),
@@ -667,6 +674,7 @@ async fn run(
         usize::try_from(args.max_builds)?,
         build_store,
         args.build_cache_gib.saturating_mul(1 << 30),
+        wait_for_base,
     )
     .await
     .context("load templates")?;
