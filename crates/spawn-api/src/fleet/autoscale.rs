@@ -37,6 +37,9 @@ const TICK: Duration = Duration::from_secs(10);
 const JOIN_TTL_MS: i64 = 30 * 60_000;
 /// Wait this long after a hook fails before running it again.
 const RETRY_MS: i64 = 5 * 60_000;
+/// A worker down this long is taken to be gone, so it no longer counts
+/// toward `max_workers`. If it comes back it counts again.
+const GONE_AFTER_MS: i64 = 10 * 60_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most hook output lines written to the log.
@@ -192,6 +195,11 @@ fn decide(s: &Settings, f: &Fleet, t: &Trend, now: i64) -> Decision {
         ));
     }
     Decision::Wait
+}
+
+/// True if `node`'s machine may still be running.
+fn may_run(node: &NodeRow, now: i64) -> bool {
+    node.state != node_state::DOWN || node.last_seen.is_none_or(|seen| now - seen < GONE_AFTER_MS)
 }
 
 /// Part of the slots, the memory in use or the memory reserved over
@@ -394,7 +402,7 @@ async fn tick(app: &AppState, scaler: &Autoscaler, memory: &mut Memory) -> Resul
         .collect();
     fleet.load = current_load(app, p)?;
     fleet.active = active.len();
-    fleet.total = workers.len() + fleet.pending_up;
+    fleet.total = workers.iter().filter(|n| may_run(n, now)).count() + fleet.pending_up;
     memory.trend.update(fleet.load, s, now);
 
     match decide(s, &fleet, &memory.trend, now) {
@@ -862,6 +870,27 @@ mod tests {
         trend.update(f.load, s, 0);
         trend.update(f.load, s, now);
         decide(s, f, &trend, now)
+    }
+
+    #[test]
+    fn a_worker_down_for_long_stops_counting() {
+        let node = |state: &str, last_seen| NodeRow {
+            id: "nod_a".into(),
+            url: String::new(),
+            state: state.into(),
+            boot: None,
+            seq: 0,
+            report: None,
+            last_seen,
+            created_at: 0,
+            removed_at: None,
+            draining: false,
+            kind: node_kind::WORKER.into(),
+        };
+        let now = GONE_AFTER_MS + 1;
+        assert!(may_run(&node(node_state::READY, Some(0)), now));
+        assert!(may_run(&node(node_state::DOWN, Some(now - 60_000)), now));
+        assert!(!may_run(&node(node_state::DOWN, Some(0)), now));
     }
 
     #[test]
