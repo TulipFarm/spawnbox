@@ -1,9 +1,20 @@
 ---
+import { Code } from "astro:components";
 import Box from "../components/Box.astro";
 import Logo from "../components/Logo.astro";
+import "../styles/base.css";
 
 const repo = "https://github.com/TulipFarm/spawnbox";
 const install = "curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh";
+const demoLines = [
+  "spawnbox create --timeout 600",
+  "spawnbox exec $S -- python3 main.py",
+  "spawnbox ports publish $S 3000",
+  "spawnbox fork $S --count 3",
+  "spawnbox pause $S",
+];
+const ptyCmd = "python3 main.py";
+const codeLang = (v: string) => (/^(spawnbox|curl|npm) /.test(v) ? "bash" : /^(GET|POST|PUT|DELETE) \//.test(v) ? "http" : null);
 
 const C = Math.cos(Math.PI / 6);
 const pt = (i: number, j: number, k: number, s: number) => [(i - j) * C * s, (i + j) * 0.5 * s - k * s];
@@ -60,10 +71,17 @@ const fleet = Array.from({ length: 16 }, (_, n) => ({ gi: n % 4, gj: Math.floor(
 const feeds = [0, 1, 2, 3].map((gi) => `M${xy(main.i + 2, main.j + 2, 3, FS)} L${xy(gi * 5.4, 3 * 5.4 + 4.4, 0.4, FS)}`);
 
 const metrics = [
-  { n: 8, pre: "≈", unit: "ms", label: "Start a new sandbox" },
-  { n: 75, pre: "60–", unit: "ms", label: "Start from a saved copy" },
-  { n: 65, pre: "≈", unit: "ms", label: "Wake up a paused sandbox" },
-  { n: 16, pre: "", unit: "copies", label: "Copies of one sandbox, made in under 1 s" },
+  { n: 6484, pre: "", unit: "sandboxes", label: "Running at the same time" },
+  { n: 768, pre: "", unit: "AI agents", label: "Working at once. Every one finished." },
+  { n: 8, pre: "≈", unit: "ms", label: "To start a fresh sandbox" },
+  { n: 0, pre: "", unit: "failures", label: "From Spawnbox in 3,707 agent runs" },
+];
+
+const scale = [
+  { v: "23", count: 23, unit: "agents", label: "On one 8 vCPU, 32 GB server" },
+  { v: "26→37", unit: "servers", label: "Added by itself as the load grew" },
+  { v: "≈400", unit: "ms", label: "Typical start for an agent, anywhere in the fleet" },
+  { v: "2×", unit: "", label: "Double the servers, double the agents" },
 ];
 
 const groups = [
@@ -353,9 +371,11 @@ const events = [
           <div class="typer reveal" id="term" data-mode="demo">
             <div class="face demo" aria-hidden="true">
               <span class="p">$</span> <span id="typed"></span><span class="caret"></span>
+              {demoLines.map((l) => <template class="demo-line" data-len={l.length}><Code code={l} lang="bash" theme="github-light" inline /></template>)}
             </div>
             <div class="face inst" aria-hidden="true">
-              <span class="p">$</span> <code id="inst-typed" data-cmd={install}></code>
+              <span class="p">$</span> <span id="inst-typed" data-cmd={install}></span>
+              <template id="inst-tpl"><Code code={install} lang="bash" theme="github-light" inline /></template>
               <button class="copy" type="button" id="copy-install">Copy</button>
             </div>
           </div>
@@ -427,14 +447,45 @@ const events = [
               </svg>
               <p class="m-n">
                 {m.pre}
-                <span data-count={m.n}>{m.n}</span>
+                <span data-count={m.n}>{m.n.toLocaleString("en-US")}</span>
                 <small>{m.unit}</small>
               </p>
               <p class="m-l">{m.label}</p>
             </div>
           ))
         }
-        <p class="note">Measured on the Spawnbox test server.</p>
+        <p class="note">Measured on AWS, Nov 2026. <a href="#scale">How we tested ↓</a></p>
+      </section>
+
+      <section id="scale" class="scale">
+        <header class="scale-head reveal">
+          <p class="eyebrow">TESTED AT SCALE</p>
+          <h2>768 coding agents at once.<br /><span class="hl">Every one finished.</span></h2>
+          <p class="scale-sub">
+            Each agent got its own 2 GiB microVM, ran Claude Code, wrote a file and pushed a commit. We doubled the count until it failed, then
+            halved the gap. The fleet grew by itself from 26 to 37 machines.
+          </p>
+        </header>
+        <div class="metrics scale-metrics">
+          {
+            scale.map((m) => (
+              <div class="metric reveal">
+                <svg class="ruler" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">
+                  <path d="M0.5 0v10M99.5 0v10M0 5h100" />
+                </svg>
+                <p class="m-n">
+                  {m.count != null ? <span data-count={m.count}>{m.v}</span> : m.v}
+                  <small>{m.unit}</small>
+                </p>
+                <p class="m-l">{m.label}</p>
+              </div>
+            ))
+          }
+        </div>
+        <p class="scale-note">
+          Measured 10 Nov 2026 on AWS m8i.2xlarge workers. A typical agent sandbox started in about 400 ms through the fleet API. The agents talked
+          to a stand-in model and a local git remote, so no AI or GitHub rate limits applied.
+        </p>
       </section>
 
       <section id="fits">
@@ -524,7 +575,7 @@ const events = [
                       <>
                         <dt>{k}</dt>
                         <dd>
-                          <code>{v}</code>
+                          {codeLang(v) ? <Code code={v} lang={codeLang(v)!} theme="github-light" inline /> : <code>{v}</code>}
                         </dd>
                       </>
                     ))}
@@ -584,7 +635,7 @@ const events = [
               </div>
             </div>
             <h3>Real web apps</h3>
-            <p>Run the Next.js or Vite app you ship to Vercel, or one you made in Lovable. Start it with <code>npm run dev</code>, publish port 3000, and open the link.</p>
+            <p>Run the Next.js or Vite app you ship to Vercel, or one you made in Lovable. Start it with <Code code="npm run dev" lang="bash" theme="github-light" inline />, publish port 3000, and open the link.</p>
           </article>
         </div>
       </section>
@@ -667,6 +718,7 @@ const events = [
               <div class="pty-bar"><span><i></i><i></i></span><span>TERMINAL</span><span></span></div>
               <div class="pty-body">
                 <p><span class="chev">›</span> <span id="pty-typed"></span><span class="caret"></span></p>
+                <template id="pty-tpl"><Code code={ptyCmd} lang="bash" theme="github-light" inline /></template>
                 <span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span>
               </div>
             </div>
@@ -910,7 +962,7 @@ const events = [
         const t0 = performance.now();
         const tick = (t: number) => {
           const k = Math.min(1, (t - t0) / 900);
-          el.textContent = String(Math.round(end * (1 - Math.pow(1 - k, 3))));
+          el.textContent = Math.round(end * (1 - Math.pow(1 - k, 3))).toLocaleString("en-US");
           if (k < 1) requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
@@ -956,26 +1008,35 @@ const events = [
       };
       if (!reduce) setInterval(clock, 1000);
 
+      // show the first n characters of pre-highlighted code, keeping its colors
+      const typeCode = (el: HTMLElement, tpl: HTMLTemplateElement, n: number) => {
+        el.replaceChildren(tpl.content.cloneNode(true));
+        const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let left = n;
+        for (let t = walk.nextNode() as Text | null; t; t = walk.nextNode() as Text | null) {
+          if (left >= t.length) left -= t.length;
+          else {
+            t.data = t.data.slice(0, left);
+            left = 0;
+          }
+        }
+      };
+
       const pty = document.getElementById("pty-typed")!;
-      const cmd = "python3 main.py";
-      if (reduce) pty.textContent = cmd;
+      const ptyTpl = document.getElementById("pty-tpl") as HTMLTemplateElement;
+      const cmdLen = ptyTpl.content.textContent!.length;
+      if (reduce) typeCode(pty, ptyTpl, cmdLen);
       else {
         let pi = 0;
         const ptyStep = () => {
-          pi = (pi + 1) % (cmd.length + 25);
-          pty.textContent = cmd.slice(0, pi);
+          pi = (pi + 1) % (cmdLen + 25);
+          typeCode(pty, ptyTpl, pi);
           setTimeout(ptyStep, 90);
         };
         ptyStep();
       }
 
-      const lines = [
-        "spawnbox create --timeout 600",
-        "spawnbox exec $S -- python3 main.py",
-        "spawnbox ports publish $S 3000",
-        "spawnbox fork $S --count 3",
-        "spawnbox pause $S",
-      ];
+      const lines = [...document.querySelectorAll<HTMLTemplateElement>(".demo-line")];
       const fleetN = document.getElementById("fleet-n")!;
       const fleetS = document.getElementById("fleet-s")!;
       const fleetRows = [...document.querySelectorAll<SVGGElement>(".fr")];
@@ -992,6 +1053,7 @@ const events = [
       const instTyped = document.getElementById("inst-typed")!;
       const copyBtn = document.getElementById("copy-install")!;
       const installCmd = instTyped.dataset.cmd!;
+      const instTpl = document.getElementById("inst-tpl") as HTMLTemplateElement;
       const [demoFace, instFace] = term.querySelectorAll(".face");
       let instTimer = 0;
       toggle.addEventListener("click", () => {
@@ -1003,12 +1065,12 @@ const events = [
         clearTimeout(instTimer);
         if (!on) return;
         if (reduce) {
-          instTyped.textContent = installCmd;
+          typeCode(instTyped, instTpl, installCmd.length);
           return;
         }
         let i = 0;
         const type = () => {
-          instTyped.textContent = installCmd.slice(0, ++i);
+          typeCode(instTyped, instTpl, ++i);
           if (i < installCmd.length) instTimer = window.setTimeout(type, 18);
         };
         instTimer = window.setTimeout(type, 250);
@@ -1030,7 +1092,7 @@ const events = [
       });
       const typed = document.getElementById("typed")!;
       if (reduce) {
-        typed.textContent = lines[0];
+        typeCode(typed, lines[0], +lines[0].dataset.len!);
         document.querySelectorAll("svg").forEach((s) => s.pauseAnimations());
       } else {
         let li = 0;
@@ -1038,10 +1100,11 @@ const events = [
         let del = false;
         const step = () => {
           const line = lines[li];
+          const len = +line.dataset.len!;
           ci += del ? -1 : 1;
-          typed.textContent = line.slice(0, ci);
+          typeCode(typed, line, ci);
           let wait = del ? 25 : 55;
-          if (!del && ci === line.length) {
+          if (!del && ci === len) {
             del = true;
             wait = 1600;
           } else if (del && ci === 0) {
@@ -1058,205 +1121,6 @@ const events = [
 </html>
 
 <style is:global>
-  :root {
-    --paper: #fbfcfe;
-    --ink: #0a1f4d;
-    --muted: #4a5f86;
-    --blue: #1d4ed8;
-    --blue-2: #3b82f6;
-    --sky: #e8f0ff;
-    --line: rgba(29, 78, 216, 0.22);
-    --grid-minor: rgba(29, 78, 216, 0.05);
-    --grid-major: rgba(29, 78, 216, 0.1);
-    --top: #f2f6ff;
-    --left: #c9dafd;
-    --right: #93b4fb;
-    --mono: "IBM Plex Mono", ui-monospace, monospace;
-    --sans: "IBM Plex Sans Condensed", system-ui, sans-serif;
-  }
-
-  * {
-    box-sizing: border-box;
-  }
-  html {
-    scroll-behavior: smooth;
-  }
-  body {
-    margin: 0;
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 17px;
-    line-height: 1.55;
-    background-color: var(--paper);
-    background-image:
-      linear-gradient(var(--grid-major) 1px, transparent 1px),
-      linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
-      linear-gradient(var(--grid-minor) 1px, transparent 1px),
-      linear-gradient(90deg, var(--grid-minor) 1px, transparent 1px);
-    background-size:
-      100px 100px,
-      100px 100px,
-      20px 20px,
-      20px 20px;
-  }
-  a {
-    color: inherit;
-  }
-  a:focus-visible {
-    outline: 2px dashed var(--blue);
-    outline-offset: 3px;
-  }
-
-  .sheet {
-    max-width: 1200px;
-    margin: 24px auto;
-    padding: 0 36px;
-    border: 1.5px solid var(--ink);
-    outline: 1px solid var(--line);
-    outline-offset: 6px;
-    background: rgba(251, 252, 254, 0.6);
-    position: relative;
-  }
-  .sheet::before,
-  .sheet::after {
-    content: "";
-    position: absolute;
-    width: 18px;
-    height: 18px;
-    border: 1.5px solid var(--blue);
-  }
-  .sheet::before {
-    top: -10px;
-    left: -10px;
-    border-right: 0;
-    border-bottom: 0;
-  }
-  .sheet::after {
-    bottom: -10px;
-    right: -10px;
-    border-left: 0;
-    border-top: 0;
-  }
-
-  .iso polygon {
-    stroke: var(--blue);
-    stroke-width: 1.2;
-    stroke-linejoin: round;
-  }
-  .f-top {
-    fill: var(--top);
-  }
-  .f-left {
-    fill: var(--left);
-  }
-  .f-right {
-    fill: var(--right);
-  }
-  .iso-deep .f-top {
-    fill: #dbe7ff;
-  }
-  .iso-deep .f-left {
-    fill: #7ea3f5;
-  }
-  .iso-deep .f-right {
-    fill: #4f7fe8;
-  }
-  .iso-pale polygon {
-    fill: #fff;
-  }
-  .iso-pale .f-right {
-    fill: var(--sky);
-  }
-  .iso-wire polygon {
-    fill: rgba(255, 255, 255, 0.5);
-    stroke-dasharray: 4 3;
-  }
-  .gridline {
-    stroke: rgba(29, 78, 216, 0.08);
-    stroke-width: 1;
-  }
-
-  .topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 18px 0;
-    border-bottom: 1px solid var(--line);
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-  .mark {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    text-decoration: none;
-    font-family: var(--mono);
-    font-weight: 600;
-    letter-spacing: 0.2em;
-  }
-  nav {
-    display: flex;
-    gap: 22px;
-    align-items: center;
-    font-family: var(--mono);
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-  }
-  nav a:not(.btn-line) {
-    text-decoration: none;
-    color: var(--muted);
-    position: relative;
-  }
-  nav a:not(.btn-line)::after {
-    content: "";
-    position: absolute;
-    left: 0;
-    right: 100%;
-    bottom: -4px;
-    border-bottom: 1.5px solid var(--blue);
-    transition: right 0.25s;
-  }
-  nav a:not(.btn-line):hover {
-    color: var(--ink);
-  }
-  nav a:not(.btn-line):hover::after {
-    right: 0;
-  }
-
-  .btn,
-  .btn-line {
-    font-family: var(--mono);
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    text-decoration: none;
-    padding: 11px 18px;
-    border: 1.5px solid var(--ink);
-    display: inline-block;
-    box-shadow: 4px 4px 0 var(--blue);
-    transition:
-      transform 0.15s,
-      box-shadow 0.15s;
-    background: #fff;
-  }
-  .btn {
-    background: var(--blue);
-    border-color: var(--blue);
-    color: #fff;
-    font-weight: 600;
-    box-shadow: 4px 4px 0 var(--ink);
-  }
-  .btn:hover,
-  .btn-line:hover {
-    transform: translate(-2px, -2px);
-    box-shadow: 6px 6px 0 var(--ink);
-  }
-  .btn:active,
-  .btn-line:active {
-    transform: translate(2px, 2px);
-    box-shadow: 1px 1px 0 var(--ink);
-  }
 
   .hero {
     display: grid;
@@ -1730,6 +1594,23 @@ const events = [
   section:not(.hero):not(.metrics) {
     padding: 88px 0 16px;
   }
+
+  .scale-head {
+    max-width: 760px;
+    margin-bottom: 32px;
+  }
+  .scale-sub {
+    margin: 12px 0 0;
+    color: var(--muted);
+    max-width: 70ch;
+  }
+  .scale-note {
+    margin: 12px 0 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    max-width: 110ch;
+  }
   .sec-head {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1848,97 +1729,6 @@ const events = [
     color: var(--muted);
   }
 
-  .legend {
-    display: flex;
-    gap: 20px;
-    flex-wrap: wrap;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--muted);
-    margin-bottom: 12px;
-  }
-  .table-wrap {
-    overflow-x: auto;
-    border: 1px solid var(--line);
-    background: #fff;
-  }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    min-width: 900px;
-    font-size: 14px;
-  }
-  th,
-  td {
-    text-align: left;
-    vertical-align: top;
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--line);
-  }
-  tbody tr:last-child > * {
-    border-bottom: 0;
-  }
-  thead th {
-    font-family: var(--mono);
-    font-size: 12px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    background: var(--sky);
-  }
-  tbody th {
-    font-weight: 600;
-    width: 190px;
-    position: sticky;
-    left: 0;
-    background: #fff;
-    z-index: 1;
-  }
-  td {
-    color: var(--muted);
-  }
-  td span {
-    display: block;
-  }
-  .us {
-    background: #f3f7ff;
-    color: var(--ink);
-    box-shadow: inset 2px 0 0 var(--blue);
-  }
-  thead th.us {
-    background: var(--blue);
-    color: #fff;
-  }
-  tbody tr:hover td:not(.us) {
-    background: #fafcff;
-  }
-  .m {
-    font-style: normal;
-    font-size: 14px;
-    display: inline-block;
-    margin-bottom: 2px;
-  }
-  .m.yes {
-    color: var(--blue);
-  }
-  .m.part {
-    color: var(--blue-2);
-  }
-  .m.no,
-  .m.unk {
-    color: #8a9bbd;
-  }
-  .m.unk {
-    font-family: var(--mono);
-    font-size: 12px;
-  }
-  .sources {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--muted);
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-  }
 
   .steps {
     margin: 0;
@@ -1994,41 +1784,6 @@ const events = [
     margin-right: 8px;
   }
 
-  .title-block {
-    margin: 80px -36px 0;
-    display: grid;
-    grid-template-columns: 2fr repeat(3, 1fr);
-    border-top: 1.5px solid var(--ink);
-    background: #fff;
-  }
-  .tb-cell {
-    padding: 12px 16px;
-    border-left: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-  }
-  .tb-cell:first-child {
-    border-left: 0;
-  }
-  .k {
-    font-family: var(--mono);
-    font-size: 10px;
-    letter-spacing: 0.16em;
-    color: var(--muted);
-  }
-  .v {
-    font-family: var(--mono);
-    font-size: 13px;
-    overflow-wrap: anywhere;
-  }
-  .v.big {
-    font-size: 22px;
-    font-weight: 600;
-    letter-spacing: 0.2em;
-    color: var(--blue);
-  }
 
   .reveal {
     opacity: 0;

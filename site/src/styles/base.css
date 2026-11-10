@@ -1,0 +1,334 @@
+/* Shared by every page: colors, sheet, top bar, buttons, compare table, footer. */
+:root {
+  --paper: #fbfcfe;
+  --ink: #0a1f4d;
+  --muted: #4a5f86;
+  --blue: #1d4ed8;
+  --blue-2: #3b82f6;
+  --sky: #e8f0ff;
+  --line: rgba(29, 78, 216, 0.22);
+  --grid-minor: rgba(29, 78, 216, 0.05);
+  --grid-major: rgba(29, 78, 216, 0.1);
+  --top: #f2f6ff;
+  --left: #c9dafd;
+  --right: #93b4fb;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+  --sans: "IBM Plex Sans Condensed", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.55;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid-major) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+    linear-gradient(var(--grid-minor) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-minor) 1px, transparent 1px);
+  background-size:
+    100px 100px,
+    100px 100px,
+    20px 20px,
+    20px 20px;
+}
+a {
+  color: inherit;
+}
+a:focus-visible {
+  outline: 2px dashed var(--blue);
+  outline-offset: 3px;
+}
+
+.sheet {
+  max-width: 1200px;
+  margin: 24px auto;
+  padding: 0 36px;
+  border: 1.5px solid var(--ink);
+  outline: 1px solid var(--line);
+  outline-offset: 6px;
+  background: rgba(251, 252, 254, 0.6);
+  position: relative;
+}
+.sheet::before,
+.sheet::after {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid var(--blue);
+}
+.sheet::before {
+  top: -10px;
+  left: -10px;
+  border-right: 0;
+  border-bottom: 0;
+}
+.sheet::after {
+  bottom: -10px;
+  right: -10px;
+  border-left: 0;
+  border-top: 0;
+}
+
+.iso polygon {
+  stroke: var(--blue);
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+}
+.f-top {
+  fill: var(--top);
+}
+.f-left {
+  fill: var(--left);
+}
+.f-right {
+  fill: var(--right);
+}
+.iso-deep .f-top {
+  fill: #dbe7ff;
+}
+.iso-deep .f-left {
+  fill: #7ea3f5;
+}
+.iso-deep .f-right {
+  fill: #4f7fe8;
+}
+.iso-pale polygon {
+  fill: #fff;
+}
+.iso-pale .f-right {
+  fill: var(--sky);
+}
+.iso-wire polygon {
+  fill: rgba(255, 255, 255, 0.5);
+  stroke-dasharray: 4 3;
+}
+.gridline {
+  stroke: rgba(29, 78, 216, 0.08);
+  stroke-width: 1;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.2em;
+}
+nav {
+  display: flex;
+  gap: 22px;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+nav a:not(.btn-line) {
+  text-decoration: none;
+  color: var(--muted);
+  position: relative;
+}
+nav a:not(.btn-line)::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 100%;
+  bottom: -4px;
+  border-bottom: 1.5px solid var(--blue);
+  transition: right 0.25s;
+}
+nav a:not(.btn-line):hover {
+  color: var(--ink);
+}
+nav a:not(.btn-line):hover::after {
+  right: 0;
+}
+
+.btn,
+.btn-line {
+  font-family: var(--mono);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  padding: 11px 18px;
+  border: 1.5px solid var(--ink);
+  display: inline-block;
+  box-shadow: 4px 4px 0 var(--blue);
+  transition:
+    transform 0.15s,
+    box-shadow 0.15s;
+  background: #fff;
+}
+.btn {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 4px 4px 0 var(--ink);
+}
+.btn:hover,
+.btn-line:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0 var(--ink);
+}
+.btn:active,
+.btn-line:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+.legend {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 900px;
+  font-size: 14px;
+}
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+tbody tr:last-child > * {
+  border-bottom: 0;
+}
+thead th {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: var(--sky);
+}
+tbody th {
+  font-weight: 600;
+  width: 190px;
+  position: sticky;
+  left: 0;
+  background: #fff;
+  z-index: 1;
+}
+td {
+  color: var(--muted);
+}
+td span {
+  display: block;
+}
+.us {
+  background: #f3f7ff;
+  color: var(--ink);
+  box-shadow: inset 2px 0 0 var(--blue);
+}
+thead th.us {
+  background: var(--blue);
+  color: #fff;
+}
+tbody tr:hover td:not(.us) {
+  background: #fafcff;
+}
+.m {
+  font-style: normal;
+  font-size: 14px;
+  display: inline-block;
+  margin-bottom: 2px;
+}
+.m.yes {
+  color: var(--blue);
+}
+.m.part {
+  color: var(--blue-2);
+}
+.m.no,
+.m.unk {
+  color: #8a9bbd;
+}
+.m.unk {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.sources {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.title-block {
+  margin: 80px -36px 0;
+  display: grid;
+  grid-template-columns: 2fr repeat(3, 1fr);
+  border-top: 1.5px solid var(--ink);
+  background: #fff;
+}
+.tb-cell {
+  padding: 12px 16px;
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tb-cell:first-child {
+  border-left: 0;
+}
+.k {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+.v {
+  font-family: var(--mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.v.big {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--blue);
+}
+
+/* Shiki output: keep each box's own background and the brand mono font */
+.astro-code {
+  background-color: transparent !important;
+  font-family: var(--mono);
+}
