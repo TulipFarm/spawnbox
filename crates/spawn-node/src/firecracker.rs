@@ -27,6 +27,10 @@ pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub(crate) const CGROUP_PARENT: &str = "spawnbox";
 /// Firecracker's (or gVisor's) own memory on top of guest memory.
 pub(crate) const VMM_OVERHEAD_MIB: u64 = 256;
+/// Room above `memory.high` before the kernel kills the VM. Guest disk
+/// writes are dirty page cache charged to the VM; above `memory.high` the
+/// writer waits for the disk instead of the VM being killed.
+const WRITEBACK_MARGIN_MIB: u64 = 256;
 const KSM_RUN: &str = "/sys/kernel/mm/ksm/run";
 const PR_SET_MEMORY_MERGE: nix::libc::c_int = 67;
 
@@ -274,13 +278,16 @@ pub struct Vm {
 #[derive(Default)]
 struct Lift {
     count: u32,
-    old: String,
+    /// `memory.high` and `memory.max` as they were before the lift.
+    old: [String; 2],
 }
+
+const MEMORY_FILES: [&str; 2] = ["memory.high", "memory.max"];
 
 /// From `Vm::lift_memory_max`. Dropping it puts the limit back once no
 /// other guard is left.
 pub struct MemoryLift {
-    file: PathBuf,
+    cgroup: PathBuf,
     lift: Arc<Mutex<Lift>>,
 }
 
@@ -295,10 +302,13 @@ impl Drop for MemoryLift {
     fn drop(&mut self) {
         let mut lift = self.lift.lock().unwrap_or_else(|e| e.into_inner());
         lift.count -= 1;
-        if lift.count == 0
-            && let Err(error) = std::fs::write(&self.file, &lift.old)
-        {
-            eprintln!("warning: write {}: {error}", self.file.display());
+        if lift.count == 0 {
+            for (name, old) in MEMORY_FILES.iter().zip(&lift.old) {
+                let file = self.cgroup.join(name);
+                if let Err(error) = std::fs::write(&file, old) {
+                    eprintln!("warning: write {}: {error}", file.display());
+                }
+            }
         }
     }
 }
@@ -308,9 +318,11 @@ impl Vm {
         let log = std::fs::File::create(host.logs.join(format!("{}.log", jail.id)))?;
         let uid = jail.uid.to_string();
         let cpu_max = format!("cpu.max={} 100000", u32::from(limits.vcpus) * 100_000);
+        let high_mib = u64::from(limits.memory_mib) + VMM_OVERHEAD_MIB;
+        let memory_high = format!("memory.high={}", high_mib * 1024 * 1024);
         let memory_max = format!(
             "memory.max={}",
-            (u64::from(limits.memory_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024
+            (high_mib + WRITEBACK_MARGIN_MIB) * 1024 * 1024
         );
         let mut command = Command::new(&host.jailer);
         if host.ksm {
@@ -351,6 +363,7 @@ impl Vm {
             .arg(net.path())
             .args(["--cgroup-version", "2", "--parent-cgroup", CGROUP_PARENT])
             .args(["--cgroup", &cpu_max, "--cgroup", &memory_max])
+            .args(["--cgroup", &memory_high])
             .args(["--", "--api-sock", "/api.sock"])
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -470,26 +483,35 @@ impl Vm {
         self.pager.as_deref_mut()
     }
 
-    /// Removes the cgroup's memory limit until the last returned guard is
+    /// Removes the cgroup's memory limits until the last returned guard is
     /// dropped. A snapshot's memory file is page cache charged to the VM:
     /// at the limit every page would wait for the disk, and while the
     /// pages are dirty the kernel cannot drop them, so a running VM at its
     /// limit is killed.
     pub fn lift_memory_max(&self) -> Result<MemoryLift> {
-        let file = Path::new(CGROUP_ROOT)
+        let cgroup = Path::new(CGROUP_ROOT)
             .join(CGROUP_PARENT)
-            .join(&self.jail.id)
-            .join("memory.max");
+            .join(&self.jail.id);
         let mut lift = self.lift.lock().unwrap_or_else(|e| e.into_inner());
         if lift.count == 0 {
-            let old = std::fs::read_to_string(&file)
-                .with_context(|| format!("read {}", file.display()))?;
-            std::fs::write(&file, "max").with_context(|| format!("write {}", file.display()))?;
-            lift.old = old.trim().to_owned();
+            let mut old: [String; 2] = Default::default();
+            for (name, old) in MEMORY_FILES.iter().zip(&mut old) {
+                let file = cgroup.join(name);
+                *old = std::fs::read_to_string(&file)
+                    .with_context(|| format!("read {}", file.display()))?
+                    .trim()
+                    .to_owned();
+            }
+            for name in MEMORY_FILES {
+                let file = cgroup.join(name);
+                std::fs::write(&file, "max")
+                    .with_context(|| format!("write {}", file.display()))?;
+            }
+            lift.old = old;
         }
         lift.count += 1;
         Ok(MemoryLift {
-            file,
+            cgroup,
             lift: self.lift.clone(),
         })
     }

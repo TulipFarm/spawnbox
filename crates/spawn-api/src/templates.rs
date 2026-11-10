@@ -782,6 +782,26 @@ impl Templates {
                 self.new_build(&template.name, &template.spec)?;
             }
         }
+        // A build can fail for a passing reason, such as a network error,
+        // so each start tries a failed template once more.
+        for template in self.db.list_templates()? {
+            if template.name == BASE_TEMPLATE || self.current().contains_key(&template.name) {
+                continue;
+            }
+            let snapshot = serde_json::from_str::<TemplateSpec>(&template.spec)
+                .is_ok_and(|spec| spec.snapshot.is_some());
+            let failed = self
+                .db
+                .latest_build(&template.name)?
+                .is_some_and(|b| b.state == build_state::FAILED);
+            if failed && !snapshot {
+                eprintln!(
+                    "building template {:?} again after a failed build",
+                    template.name
+                );
+                self.new_build(&template.name, &template.spec)?;
+            }
+        }
         self.remove_unused_dirs()
     }
 
