@@ -1,4 +1,31 @@
+<a href="https://spawnbox.tulipfarm.ai">
+  <img src=".github/assets/spawnbox-hero.svg" alt="Spawnbox: sandboxes for AI agents, on your own servers" width="100%">
+</a>
+
+<div align="center">
+
 # Spawnbox
+
+**Open-source sandboxes for AI agents. Run them on your own servers.**
+
+[Website](https://spawnbox.tulipfarm.ai) ·
+[Get started](#getting-started) ·
+[API reference](#api-reference) ·
+[Releases](https://github.com/TulipFarm/spawnbox/releases) ·
+[How it works](ARCHITECTURE.md) ·
+[TulipFarm](https://tulipfarm.ai)
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-1d4ed8?style=flat-square)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/TulipFarm/spawnbox?style=flat-square&color=1d4ed8&label=release)](https://github.com/TulipFarm/spawnbox/releases)
+[![GitHub stars](https://img.shields.io/github/stars/TulipFarm/spawnbox?style=flat-square&color=1d4ed8)](https://github.com/TulipFarm/spawnbox/stargazers)
+[![Built with Rust](https://img.shields.io/badge/built_with-Rust-0a1f4d?style=flat-square&logo=rust)](Cargo.toml)
+[![Runtime: Firecracker and gVisor](https://img.shields.io/badge/runtime-Firecracker_·_gVisor-0a1f4d?style=flat-square)](#how-spawnbox-works)
+
+[![Follow on X](https://img.shields.io/badge/@TulipFarmAI-000000?style=flat-square&logo=x)](https://x.com/TulipFarmAI)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-tulipfarmai-0a66c2?style=flat-square)](https://linkedin.com/company/tulipfarmai)
+[![YouTube](https://img.shields.io/badge/YouTube-@tulipfarmai-ff0000?style=flat-square&logo=youtube&logoColor=white)](https://youtube.com/@tulipfarmai)
+
+</div>
 
 Spawnbox is an open-source sandbox server for AI agent platforms. You
 install it on your own Linux server.
@@ -10,12 +37,47 @@ write files, open a terminal and show a web app. A sandbox starts in less
 than 100 ms. It can connect only to the internet hosts that you allow.
 Your API keys do not go into the sandbox.
 
+> [!WARNING]
 > **Status: early development (milestone M3 of M4).** Do not use Spawnbox
 > for production work or for code that you do not trust. This README
 > shows only the functions that operate now.
 
+## Install in one line
+
+On a Linux server, as your usual user (not `sudo`):
+
+```sh
+curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh
+```
+
+Then give each agent its own box:
+
+```sh
+spawnbox create --timeout 600
+spawnbox exec $S -- python3 main.py
+spawnbox ports publish $S 3000
+spawnbox fork $S --count 3
+spawnbox pause $S
+```
+
+The full steps are in [Getting started](#getting-started).
+
+## Tested at scale
+
+<a href="https://spawnbox.tulipfarm.ai/#scale">
+  <img src=".github/assets/spawnbox-numbers.svg" alt="6,484 sandboxes at the same time. 768 AI agents at once. About 8 ms to start. 0 failures from Spawnbox in 3,707 agent runs." width="100%">
+</a>
+
+768 coding agents ran at once, and every one finished. Each agent got its
+own 2 GiB microVM, ran Claude Code, wrote a file and pushed a commit. The
+fleet grew by itself from 26 to 37 servers. Measured on AWS m8i.2xlarge
+workers, 10 Nov 2026.
+[How we tested](https://spawnbox.tulipfarm.ai/#scale).
+
 ## Contents
 
+- [Install in one line](#install-in-one-line)
+- [Tested at scale](#tested-at-scale)
 - [Why use Spawnbox](#why-use-spawnbox)
 - [Features](#features)
 - [Getting started](#getting-started)
@@ -29,6 +91,7 @@ Your API keys do not go into the sandbox.
 - [Development](#development)
 - [Contributing](#contributing)
 - [License](#license)
+- [Links](#links)
 
 ## Why use Spawnbox
 
@@ -2083,3 +2146,21 @@ guest kernels and base images keep their own licenses.
 
 Spawnbox is open source and you run it on your own servers. There is no
 hosted service and no paid plan.
+
+## Links
+
+- Website: [spawnbox.tulipfarm.ai](https://spawnbox.tulipfarm.ai)
+- Source: [github.com/TulipFarm/spawnbox](https://github.com/TulipFarm/spawnbox)
+- Releases: [github.com/TulipFarm/spawnbox/releases](https://github.com/TulipFarm/spawnbox/releases)
+- Issues: [github.com/TulipFarm/spawnbox/issues](https://github.com/TulipFarm/spawnbox/issues)
+- X: [@TulipFarmAI](https://x.com/TulipFarmAI)
+- LinkedIn: [linkedin.com/company/tulipfarmai](https://linkedin.com/company/tulipfarmai)
+- YouTube: [youtube.com/@tulipfarmai](https://youtube.com/@tulipfarmai)
+- Made by the [TulipFarm](https://tulipfarm.ai) team
+
+<div align="center">
+<br>
+
+If Spawnbox helps you, give it a ⭐ on GitHub. It helps other people find it.
+
+</div>
