@@ -76,6 +76,7 @@ impl Sandboxes {
         let lock = self.waking_lock(id, origin).await?;
         let _changing = lock.lock().await;
         let source = self.source(id)?;
+        refuse_protected(source.protected)?;
         let row = self.get(id)?;
         let placeholders: HashSet<&str> = source
             .secrets
@@ -515,3 +516,45 @@ impl Sandboxes {
     }
 }
 
+/// A template spec would show the env values of a sandbox created with them.
+fn refuse_protected(protected: bool) -> Result<(), ApiError> {
+    if protected {
+        return Err(ApiError::new(
+            Code::ProtectedEnv,
+            "a sandbox created with env values cannot be saved as a template, \
+             as the template would expose them; attach secrets instead",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secretbox::SandboxEnv;
+
+    fn snapshot_of(env: &str, services: &str) -> Result<(), ApiError> {
+        let own = SandboxEnv {
+            env: serde_json::from_str(env).unwrap(),
+            services: serde_json::from_str(services).unwrap(),
+        };
+        refuse_protected(own.is_protected())
+    }
+
+    #[test]
+    fn only_sandboxes_without_own_env_become_templates() {
+        assert!(snapshot_of("{}", "[]").is_ok());
+        assert!(snapshot_of("{}", r#"[{"name":"web","command":["srv"]}]"#).is_ok());
+        for (env, services) in [
+            (r#"{"TOKEN":"x"}"#, "[]"),
+            (
+                "{}",
+                r#"[{"name":"web","command":["srv"],"env":{"KEY":"x"}}]"#,
+            ),
+        ] {
+            let error = snapshot_of(env, services).unwrap_err();
+            assert_eq!(error.code.as_str(), "protected_env");
+            assert_eq!(error.code.http_status(), 409);
+        }
+    }
+}
