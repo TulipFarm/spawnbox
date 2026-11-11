@@ -197,6 +197,11 @@ pub struct Args {
     /// secrets cannot be read. Default: <data-dir>/secrets.key.
     #[arg(long)]
     secrets_key_file: Option<PathBuf>,
+    /// Start even if the env of some sandboxes cannot be read with the
+    /// secrets key. Those sandboxes and their files are left as they are,
+    /// for a later start with the right key.
+    #[arg(long)]
+    allow_unreadable_env: bool,
     /// Keep state in this Postgres database instead of SQLite in the data
     /// directory: `postgres://user:password@host:5432/spawnbox`. Primaries
     /// that share it fail over: one serves, the others wait and take over
@@ -335,6 +340,32 @@ pub struct Args {
     autoscale_down_after_s: u32,
 }
 
+/// Stops the start if the env of some sandboxes cannot be read, as that
+/// usually means the wrong secrets key.
+fn check_unreadable(
+    unreadable: &[String],
+    key_file: &std::path::Path,
+    allowed: bool,
+) -> Result<()> {
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    let what = format!(
+        "{} cannot read the stored env of {} sandboxes ({})",
+        key_file.display(),
+        unreadable.len(),
+        unreadable.join(", ")
+    );
+    if !allowed {
+        anyhow::bail!(
+            "{what}. Start with the key that sealed it, or with --allow-unreadable-env \
+             to leave those sandboxes as they are"
+        );
+    }
+    eprintln!("warning: {what}; leaving them as they are");
+    Ok(())
+}
+
 /// The autoscaler's settings, if `--autoscale-hook` is set.
 fn autoscale_settings(args: &Args) -> Result<Option<fleet::autoscale::Settings>> {
     let Some(hook) = &args.autoscale_hook else {
@@ -462,13 +493,10 @@ pub async fn serve(args: Args) -> Result<()> {
             resealed.start_records, resealed.saved
         );
     }
-    if !resealed.unreadable.is_empty() {
-        eprintln!(
-            "warning: cannot read the stored env of {}; was {} replaced?",
-            resealed.unreadable.join(", "),
-            key_file.display()
-        );
+    if resealed.vacuumed {
+        eprintln!("compacted the database to clear env stored by earlier versions");
     }
+    check_unreadable(&resealed.unreadable, &key_file, args.allow_unreadable_env)?;
     let ca = Arc::new(secrets::egress_ca(&data, &sbox).context("load egress CA")?);
     let backend = match args.backend {
         BackendArg::Auto => Backend::detect(),
@@ -2609,4 +2637,21 @@ fn totals_json(totals: &Totals) -> Value {
         "disk_gib_h": round(totals.disk_gib_h),
         "egress_bytes": totals.egress_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_env_stops_the_start_unless_allowed() {
+        let key = std::path::Path::new("/data/secrets.key");
+        assert!(check_unreadable(&[], key, false).is_ok());
+        let ids = ["sbx_a".to_string(), "sbx_b".to_string()];
+        let refused = check_unreadable(&ids, key, false).unwrap_err().to_string();
+        assert!(refused.contains("/data/secrets.key"), "{refused}");
+        assert!(refused.contains("2 sandboxes"), "{refused}");
+        assert!(refused.contains("--allow-unreadable-env"), "{refused}");
+        assert!(check_unreadable(&ids, key, true).is_ok());
+    }
 }

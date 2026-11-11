@@ -850,10 +850,6 @@ impl Sandboxes {
         seal_saved(self.secrets.sbox(), tenant, id, saved)
     }
 
-    fn parse_saved(&self, id: &str, tenant: &str, json: &str) -> Option<Saved> {
-        open_saved(self.secrets.sbox(), tenant, id, json)
-    }
-
     fn retention_ms(&self, quotas: &Quotas) -> i64 {
         let seconds = quotas.paused_retention_s(self.settings.paused_retention_s);
         i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
@@ -2530,34 +2526,51 @@ impl Sandboxes {
     /// files nothing owns. Call once at start.
     pub fn load_paused(&self) -> anyhow::Result<usize> {
         let mut loaded = HashSet::new();
+        let mut kept = HashSet::new();
         let files = self.templates.backend().snapshot_files();
         for (sandbox, saved) in self.db.paused_sandboxes()? {
             let dir = self.paused_dir(&sandbox.id);
-            let saved = saved.and_then(|s| self.parse_saved(&sandbox.id, &sandbox.tenant, &s));
             let complete = files.iter().all(|name| dir.join(name).exists());
-            let (Some(saved), true) = (saved, complete) else {
-                if sandbox.persistent {
-                    self.db.set_cold(&sandbox.id, sandbox.generation)?;
-                    let origin = Origin::system();
-                    self.cold_event(
-                        &origin,
+            let found = find_paused(
+                self.secrets.sbox(),
+                &sandbox.tenant,
+                &sandbox.id,
+                saved.as_deref(),
+                complete,
+            );
+            let saved = match found {
+                Paused::Resumable(saved) => saved,
+                Paused::Unreadable => {
+                    // Probably the wrong secrets key: a start with the right
+                    // one must still find the sandbox as it was.
+                    eprintln!("{}: cannot read its env; leaving it paused", sandbox.id);
+                    kept.insert(sandbox.id);
+                    continue;
+                }
+                Paused::Lost => {
+                    if sandbox.persistent {
+                        self.db.set_cold(&sandbox.id, sandbox.generation)?;
+                        let origin = Origin::system();
+                        self.cold_event(
+                            &origin,
+                            &sandbox.tenant,
+                            &sandbox.id,
+                            "paused_files_missing",
+                        );
+                        continue;
+                    }
+                    eprintln!("{}: paused files are missing; marking failed", sandbox.id);
+                    self.db
+                        .set_state(&sandbox.id, sandbox.generation, state::FAILED, now_ms())?;
+                    self.event(
+                        "sandbox.lost",
+                        &Origin::system(),
                         &sandbox.tenant,
                         &sandbox.id,
-                        "paused_files_missing",
+                        json!({ "reason": "paused files are missing" }),
                     );
                     continue;
                 }
-                eprintln!("{}: paused files are missing; marking failed", sandbox.id);
-                self.db
-                    .set_state(&sandbox.id, sandbox.generation, state::FAILED, now_ms())?;
-                self.event(
-                    "sandbox.lost",
-                    &Origin::system(),
-                    &sandbox.tenant,
-                    &sandbox.id,
-                    json!({ "reason": "paused files are missing" }),
-                );
-                continue;
             };
             let id = sandbox.id.clone();
             let record = self.paused_record(sandbox, saved, &dir)?;
@@ -2568,15 +2581,10 @@ impl Sandboxes {
                 self.watch_services(&id, generation, None);
             }
         }
-        if let Ok(entries) = std::fs::read_dir(&self.settings.paused_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !loaded.contains(&name) {
-                    remove_dir(&entry.path());
-                }
-            }
-        }
-        Ok(loaded.len())
+        let count = loaded.len();
+        kept.extend(loaded);
+        remove_unowned_dirs(&self.settings.paused_dir, &kept);
+        Ok(count)
     }
 
     fn paused_record(
@@ -2952,6 +2960,43 @@ fn open_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Sa
     Some(saved)
 }
 
+enum Paused {
+    Resumable(Saved),
+    /// Its saved state or snapshot files are gone.
+    Lost,
+    /// Its saved state is there but cannot be opened with this key.
+    Unreadable,
+}
+
+/// What a start can do with a sandbox an earlier run paused.
+fn find_paused(
+    sbox: &SecretBox,
+    tenant: &str,
+    id: &str,
+    saved: Option<&str>,
+    complete: bool,
+) -> Paused {
+    let Some(json) = saved else {
+        return Paused::Lost;
+    };
+    match open_saved(sbox, tenant, id, json) {
+        None => Paused::Unreadable,
+        Some(_) if !complete => Paused::Lost,
+        Some(saved) => Paused::Resumable(saved),
+    }
+}
+
+fn remove_unowned_dirs(paused_dir: &Path, keep: &HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(paused_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+            remove_dir(&entry.path());
+        }
+    }
+}
+
 /// A `Saved` sent by another host, in plain, and as this host stores it:
 /// sealed under its own key.
 fn rewrap(
@@ -3055,6 +3100,44 @@ mod tests {
         assert!(open_saved(&sbox, "u", "sbx_a", &stored).is_none());
         // Only the sealed form is read from storage.
         assert!(open_saved(&sbox, "t", "sbx_a", &to_json(&saved)).is_none());
+    }
+
+    #[test]
+    fn a_paused_sandbox_survives_a_start_with_the_wrong_key() {
+        let right = SecretBox::new(&[7; 32]).unwrap();
+        let wrong = SecretBox::new(&[8; 32]).unwrap();
+        let stored = seal_saved(&right, "t", "sbx_a", sample()).unwrap();
+        let root = std::env::temp_dir().join(format!("spawnbox-paused-{}", now_ms()));
+        for id in ["sbx_a", "sbx_gone"] {
+            std::fs::create_dir_all(root.join(id)).unwrap();
+            std::fs::write(root.join(id).join("mem"), "snapshot").unwrap();
+        }
+        assert!(matches!(
+            find_paused(&wrong, "t", "sbx_a", Some(&stored), true),
+            Paused::Unreadable
+        ));
+        assert!(matches!(
+            find_paused(&wrong, "t", "sbx_a", Some(&stored), false),
+            Paused::Unreadable
+        ));
+        remove_unowned_dirs(&root, &HashSet::from(["sbx_a".to_owned()]));
+        assert!(root.join("sbx_a").join("mem").exists());
+        assert!(!root.join("sbx_gone").exists());
+        let Paused::Resumable(saved) = find_paused(&right, "t", "sbx_a", Some(&stored), true)
+        else {
+            panic!("the right key should resume it");
+        };
+        assert_eq!(saved.env, sample().env);
+        assert_eq!(saved.services, sample().services);
+        assert!(matches!(
+            find_paused(&right, "t", "sbx_a", Some(&stored), false),
+            Paused::Lost
+        ));
+        assert!(matches!(
+            find_paused(&right, "t", "sbx_a", None, true),
+            Paused::Lost
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
