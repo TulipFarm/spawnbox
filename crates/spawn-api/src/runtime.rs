@@ -31,7 +31,7 @@ use crate::metering::{Meter, Rate};
 use crate::metrics;
 use crate::model::{ApiError, BASE_TEMPLATE, Code, CreateSandbox, Exec, Service, Timings};
 use crate::ports::{self, Access, Publish};
-use crate::secretbox::SecretBox;
+use crate::secretbox::{SandboxEnv, SecretBox};
 use crate::secrets::Secrets;
 use crate::templates::{ReadyBuild, Slots, Startable, Templates};
 use crate::tenancy::{Quotas, Tenant, Usage};
@@ -100,6 +100,9 @@ struct Record {
     persistent: bool,
     /// Programs the guest keeps running, as created.
     services: Vec<Service>,
+    /// Created with env values of its own, in it or its services, which
+    /// must not be copied into a template.
+    protected: bool,
 }
 
 /// A cold sandbox's new VM, before it is recorded.
@@ -110,6 +113,7 @@ struct Booted {
     secrets: Vec<Attached>,
     mounted: bool,
     services: Vec<Service>,
+    protected: bool,
     /// The guest's last service event before they started.
     seq: u64,
 }
@@ -178,14 +182,15 @@ pub struct Published {
 }
 
 /// What a paused sandbox needs to resume, also after a server restart.
-/// Stored with `env` and `services` sealed in `env_sealed` and
-/// `services_sealed`; sent to other hosts with them in plain.
+/// Stored with `env` and `services` sealed together in `sealed`; sent to
+/// another host of the fleet with them in plain, over mutual TLS, to be
+/// sealed under that host's key.
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    env_sealed: Option<String>,
+    sealed: Option<String>,
     ports: BTreeMap<u16, Published>,
     /// Secret name and placeholder.
     secrets: Vec<(String, String)>,
@@ -194,8 +199,9 @@ struct Saved {
     remaining_ms: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     services: Vec<Service>,
+    /// As `Record::protected`. Unset by earlier versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    services_sealed: Option<String>,
+    protected: Option<bool>,
 }
 
 struct Inner {
@@ -916,6 +922,11 @@ impl Sandboxes {
         }
         services::check_env(&req.services, &placeholders)?;
         let service_ports = services::ports(&req.services)?;
+        let own_env = SandboxEnv {
+            env: req.env.clone(),
+            services: req.services.clone(),
+        };
+        let protected = own_env.is_protected();
         let template = req.template.as_deref().unwrap_or(BASE_TEMPLATE);
         // Held until the VM is restored, so the build's files stay in place.
         let (_, ready) = self.templates.ready(Some(&tenant.id), template)?;
@@ -1018,7 +1029,7 @@ impl Sandboxes {
                 .unwrap_or_else(|| ApiError::internal("persistent sandbox refused")),
         };
         let inserted = if persistent {
-            self.start_record(&sandbox, &ready, &req.env, &req.services, &service_ports)
+            self.start_record(&sandbox, &ready, &own_env, &service_ports)
                 .and_then(|start| {
                     let limit = tenant.quotas.persistent_sandboxes;
                     Ok(self.db.insert_persistent(&sandbox, &start, limit)?)
@@ -1245,6 +1256,7 @@ impl Sandboxes {
                 generation: 1,
                 persistent,
                 services: req.services,
+                protected,
             },
         );
         let started = match self.db.start_running(&sandbox.id, 1) {
@@ -1295,16 +1307,13 @@ impl Sandboxes {
         &self,
         sandbox: &db::Sandbox,
         ready: &ReadyBuild,
-        env: &BTreeMap<String, String>,
-        services: &[Service],
+        env: &SandboxEnv,
         ports: &BTreeMap<u16, Published>,
     ) -> Result<db::StartRecord, ApiError> {
-        let sbox = self.secrets.sbox();
-        let sealed = sbox
-            .seal_env(&sandbox.tenant, &sandbox.id, env)
-            .map_err(ApiError::internal)?;
-        let services = sbox
-            .seal_services(&sandbox.tenant, &sandbox.id, services)
+        let sealed = self
+            .secrets
+            .sbox()
+            .seal_sandbox_env(&sandbox.tenant, &sandbox.id, env)
             .map_err(ApiError::internal)?;
         Ok(db::StartRecord {
             sandbox: sandbox.id.clone(),
@@ -1322,7 +1331,6 @@ impl Sandboxes {
             env: sealed,
             created_at: sandbox.created_at,
             updated_at: sandbox.created_at,
-            services,
         })
     }
 
@@ -1710,6 +1718,7 @@ impl Sandboxes {
             secrets,
             mounted,
             services,
+            protected,
             seq,
         } = booted;
         let Restored {
@@ -1749,6 +1758,7 @@ impl Sandboxes {
                 generation,
                 persistent: true,
                 services,
+                protected,
             },
         );
         let finished = if self.closing.load(Ordering::SeqCst) {
@@ -1828,13 +1838,10 @@ impl Sandboxes {
         let own = self
             .secrets
             .sbox()
-            .open_env(&start.tenant, &start.sandbox, &start.env)
+            .open_sandbox_env(&start.tenant, &start.sandbox, &start.env)
             .ok_or_else(|| ApiError::internal("the start record's env cannot be read"))?;
-        let services = self
-            .secrets
-            .sbox()
-            .open_services(&start.tenant, &start.sandbox, &start.services)
-            .ok_or_else(|| ApiError::internal("the start record's services cannot be read"))?;
+        let protected = own.is_protected();
+        let SandboxEnv { env: own, services } = own;
         let mut env: BTreeMap<String, String> = CA_ENV
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -1906,6 +1913,7 @@ impl Sandboxes {
             secrets,
             mounted: !mounts.is_empty(),
             services,
+            protected,
             seq,
         })
     }
@@ -2582,6 +2590,7 @@ impl Sandboxes {
             .get_tenant(&sandbox.tenant)?
             .map(|t| t.quotas)
             .unwrap_or_default();
+        let protected = saved.protected.unwrap_or_else(|| guess_protected(&saved));
         Ok(Record {
             retention_ms: self.retention_ms(&quotas),
             tenant: sandbox.tenant,
@@ -2611,6 +2620,7 @@ impl Sandboxes {
             moving: None,
             generation: sandbox.generation,
             persistent: sandbox.persistent,
+            protected,
             services: saved.services,
         })
     }
@@ -2678,11 +2688,8 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
-        let parsed = self
-            .parse_saved(&sandbox.id, &sandbox.tenant, saved)
-            .ok_or_else(|| ApiError::invalid("saved state cannot be read"))?;
+        let (parsed, stored) = rewrap(self.secrets.sbox(), &sandbox.tenant, &sandbox.id, saved)?;
         let id = sandbox.id.clone();
-        let stored = self.stored(&id, &sandbox.tenant, parsed.clone())?;
         let dir = self.paused_dir(&id);
         let paused_at = sandbox.paused_at.unwrap_or_else(now_ms);
         let sandbox = db::Sandbox {
@@ -2877,7 +2884,7 @@ fn is_idle(record: &Record) -> bool {
 fn saved(record: &Record, remaining_ms: i64) -> Saved {
     Saved {
         env: record.env.clone(),
-        env_sealed: None,
+        sealed: None,
         ports: record.ports.clone(),
         secrets: record
             .secrets
@@ -2888,7 +2895,7 @@ fn saved(record: &Record, remaining_ms: i64) -> Saved {
         memory_mib: record.limits.memory_mib,
         remaining_ms,
         services: record.services.clone(),
-        services_sealed: None,
+        protected: Some(record.protected),
     }
 }
 
@@ -2916,41 +2923,63 @@ fn stored_bytes(path: &Path) -> u64 {
     }
 }
 
-/// `saved` as stored, with its env sealed to the sandbox.
+/// `saved` as stored, with its env and its services sealed to the sandbox.
 fn seal_saved(
     sbox: &SecretBox,
     tenant: &str,
     id: &str,
     mut saved: Saved,
 ) -> Result<String, ApiError> {
+    let plain = SandboxEnv {
+        env: std::mem::take(&mut saved.env),
+        services: std::mem::take(&mut saved.services),
+    };
     let sealed = sbox
-        .seal_env(tenant, id, &saved.env)
+        .seal_sandbox_env(tenant, id, &plain)
         .map_err(ApiError::internal)?;
-    saved.env = BTreeMap::new();
-    saved.env_sealed = Some(B64.encode(sealed));
-    if !saved.services.is_empty() {
-        let sealed = sbox
-            .seal_services(tenant, id, &saved.services)
-            .map_err(ApiError::internal)?;
-        saved.services = Vec::new();
-        saved.services_sealed = Some(B64.encode(sealed));
-    }
+    saved.sealed = Some(B64.encode(sealed));
     Ok(to_json(&saved))
 }
 
-/// Reads a stored or received `Saved`. Ones stored before env was sealed
-/// hold it in plain.
+/// Reads a stored `Saved`. Ones stored by earlier versions are brought to
+/// this format at start, by `reseal`.
 fn open_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Saved> {
     let mut saved: Saved = serde_json::from_str(json).ok()?;
-    if let Some(sealed) = saved.env_sealed.take() {
-        let sealed = B64.decode(sealed).ok()?;
-        saved.env = sbox.open_env(tenant, id, &sealed)?;
-    }
-    if let Some(sealed) = saved.services_sealed.take() {
-        let sealed = B64.decode(sealed).ok()?;
-        saved.services = sbox.open_services(tenant, id, &sealed)?;
-    }
+    let sealed = B64.decode(saved.sealed.take()?).ok()?;
+    let plain = sbox.open_sandbox_env(tenant, id, &sealed)?;
+    saved.env = plain.env;
+    saved.services = plain.services;
     Some(saved)
+}
+
+/// A `Saved` sent by another host, in plain, and as this host stores it:
+/// sealed under its own key.
+fn rewrap(
+    sbox: &SecretBox,
+    tenant: &str,
+    id: &str,
+    json: &str,
+) -> Result<(Saved, String), ApiError> {
+    let unreadable = || ApiError::invalid("saved state cannot be read");
+    let saved: Saved = serde_json::from_str(json).map_err(|_| unreadable())?;
+    if saved.sealed.is_some() {
+        return Err(unreadable());
+    }
+    let stored = seal_saved(sbox, tenant, id, saved.clone())?;
+    Ok((saved, stored))
+}
+
+/// For a `Saved` from an earlier version: whether any env value may be the
+/// caller's own. Template env counts too, as it cannot be told apart.
+fn guess_protected(saved: &Saved) -> bool {
+    saved.services.iter().any(|s| !s.env.is_empty())
+        || saved.env.iter().any(|(name, value)| {
+            !CA_ENV.iter().any(|(ca, _)| ca == name)
+                && !saved
+                    .secrets
+                    .iter()
+                    .any(|(_, placeholder)| placeholder == value)
+        })
 }
 
 fn to_json(value: &impl Serialize) -> String {
@@ -2991,36 +3020,160 @@ fn round(ms: f64) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn saved_env_is_sealed_to_its_sandbox() {
-        let sbox = SecretBox::new(&[7; 32]).unwrap();
-        let saved = Saved {
+    const CANARY: &str = "svc-secret-env";
+
+    fn sample() -> Saved {
+        Saved {
             env: BTreeMap::from([("TOKEN".to_owned(), "hunter2".to_owned())]),
-            env_sealed: None,
+            sealed: None,
             ports: BTreeMap::new(),
             secrets: Vec::new(),
             vcpus: 1,
             memory_mib: 256,
             remaining_ms: 5,
-            services: serde_json::from_str(
-                r#"[{"name":"web","command":["srv"],"env":{"KEY":"swordfish"}}]"#,
-            )
+            services: serde_json::from_str(&format!(
+                r#"[{{"name":"web","command":["srv"],"env":{{"KEY":"{CANARY}"}}}}]"#
+            ))
             .unwrap(),
-            services_sealed: None,
-        };
+            protected: Some(true),
+        }
+    }
+
+    #[test]
+    fn saved_env_is_sealed_to_its_sandbox() {
+        let sbox = SecretBox::new(&[7; 32]).unwrap();
+        let saved = sample();
         let stored = seal_saved(&sbox, "t", "sbx_a", saved.clone()).unwrap();
         assert!(!stored.contains("hunter2"));
-        assert!(!stored.contains("swordfish"));
+        assert!(!stored.contains(CANARY));
+        assert!(!stored.contains("TOKEN"));
         let opened = open_saved(&sbox, "t", "sbx_a", &stored).unwrap();
         assert_eq!(opened.env, saved.env);
         assert_eq!(opened.services, saved.services);
+        assert_eq!(opened.protected, Some(true));
         assert!(open_saved(&sbox, "t", "sbx_b", &stored).is_none());
         assert!(open_saved(&sbox, "u", "sbx_a", &stored).is_none());
-        // Rows stored before env was sealed still read.
-        let plain = to_json(&saved);
-        assert_eq!(
-            open_saved(&sbox, "t", "sbx_a", &plain).unwrap().env,
-            saved.env
-        );
+        // Only the sealed form is read from storage.
+        assert!(open_saved(&sbox, "t", "sbx_a", &to_json(&saved)).is_none());
+    }
+
+    #[test]
+    fn a_fork_seals_under_its_own_id() {
+        let sbox = SecretBox::new(&[7; 32]).unwrap();
+        let parent = seal_saved(&sbox, "t", "sbx_parent", sample()).unwrap();
+        let opened = open_saved(&sbox, "t", "sbx_parent", &parent).unwrap();
+        let child = seal_saved(&sbox, "t", "sbx_child", opened).unwrap();
+        assert!(open_saved(&sbox, "t", "sbx_child", &child).is_some());
+        assert!(open_saved(&sbox, "t", "sbx_parent", &child).is_none());
+        assert!(open_saved(&sbox, "t", "sbx_child", &parent).is_none());
+    }
+
+    #[test]
+    fn a_move_seals_under_the_destination_key() {
+        let source = SecretBox::new(&[7; 32]).unwrap();
+        let destination = SecretBox::new(&[8; 32]).unwrap();
+        let stored = seal_saved(&source, "t", "sbx_a", sample()).unwrap();
+        let sent = to_json(&open_saved(&source, "t", "sbx_a", &stored).unwrap());
+        let (saved, kept) = rewrap(&destination, "t", "sbx_a", &sent).unwrap();
+        assert_eq!(saved.services, sample().services);
+        assert!(!kept.contains(CANARY));
+        assert!(open_saved(&destination, "t", "sbx_a", &kept).is_some());
+        assert!(open_saved(&source, "t", "sbx_a", &kept).is_none());
+        // A sealed state is of no use to another host.
+        assert!(rewrap(&destination, "t", "sbx_a", &stored).is_err());
+    }
+
+    #[test]
+    fn guesses_protection_for_earlier_saved_states() {
+        let mut saved = sample();
+        saved.protected = None;
+        assert!(guess_protected(&saved));
+        saved.services[0].env.clear();
+        saved.env = CA_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        saved.env.insert("GH_TOKEN".into(), "ph_1".into());
+        saved.secrets = vec![("gh".into(), "ph_1".into())];
+        assert!(!guess_protected(&saved));
+        saved.env.insert("MODE".into(), "dev".into());
+        assert!(guess_protected(&saved));
+    }
+
+    #[test]
+    fn no_env_value_is_stored_in_plain() {
+        let dir = std::env::temp_dir().join(format!("spawnbox-canary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spawnbox.db");
+        let db = Db::open(&path).unwrap();
+        let sbox = SecretBox::new(&[7; 32]).unwrap();
+        let row = |id: &str| db::Sandbox {
+            id: id.into(),
+            tenant: "t".into(),
+            state: state::RUNNING.into(),
+            template: BASE_TEMPLATE.into(),
+            build: Some("bld_1".into()),
+            labels: BTreeMap::new(),
+            secrets: Vec::new(),
+            egress: Policy::allow_all(),
+            created_at: 1,
+            expires_at: i64::MAX,
+            idle_pause_s: 0,
+            paused_at: None,
+            node: None,
+            vcpus: 1,
+            memory_mib: 256,
+            volumes: Vec::new(),
+            persistent: true,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
+        };
+        // Create: the start record.
+        let own = SandboxEnv {
+            env: sample().env,
+            services: sample().services,
+        };
+        let start = db::StartRecord {
+            sandbox: "sbx_a".into(),
+            tenant: "t".into(),
+            template: BASE_TEMPLATE.into(),
+            build: "bld_1".into(),
+            spec: "{}".into(),
+            vcpus: 1,
+            memory_mib: 256,
+            egress: Policy::allow_all(),
+            secrets: Vec::new(),
+            volumes: Vec::new(),
+            ports: "{}".into(),
+            idle_pause_s: 0,
+            env: sbox.seal_sandbox_env("t", "sbx_a", &own).unwrap(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.insert_persistent(&row("sbx_a"), &start, None)
+            .unwrap()
+            .unwrap();
+        // Pause, then cold and started again: a new generation pauses.
+        let saved = seal_saved(&sbox, "t", "sbx_a", sample()).unwrap();
+        db.set_paused("sbx_a", 1, 2, &saved).unwrap();
+        db.set_cold("sbx_a", 1).unwrap();
+        let opened = db.get_start_record("sbx_a").unwrap().unwrap();
+        assert_eq!(sbox.open_sandbox_env("t", "sbx_a", &opened.env), Some(own));
+        // A fork pauses under its own ID.
+        db.insert_sandbox(&db::Sandbox {
+            persistent: false,
+            ..row("sbx_b")
+        })
+        .unwrap()
+        .unwrap();
+        let child = seal_saved(&sbox, "t", "sbx_b", sample()).unwrap();
+        db.set_paused("sbx_b", 1, 2, &child).unwrap();
+        db.truncate_log().unwrap();
+        for value in [CANARY, "hunter2"] {
+            assert!(!crate::reseal::tests::on_disk(&path, value), "{value}");
+        }
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

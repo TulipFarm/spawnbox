@@ -69,7 +69,7 @@ const RESERVED_HEADERS: &[&str] = &[
 
 /// `POST /v1/sandboxes`. Unknown fields are rejected so that spec fields
 /// that are not built yet fail instead of being ignored.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSandbox {
     pub template: Option<String>,
@@ -100,7 +100,7 @@ pub struct CreateSandbox {
 }
 
 /// A program that Spawnbox keeps running in a sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub name: String,
@@ -450,8 +450,63 @@ impl CreateVolume {
     }
 }
 
+/// Env names without their values, for `Debug`.
+struct EnvNames<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for EnvNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+impl std::fmt::Debug for CreateSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateSandbox")
+            .field("template", &self.template)
+            .field("timeout_s", &self.timeout_s)
+            .field("env", &EnvNames(&self.env))
+            .field("labels", &self.labels)
+            .field("secrets", &self.secrets)
+            .field("egress", &self.egress)
+            .field("idle_pause_s", &self.idle_pause_s)
+            .field("tenant", &self.tenant)
+            .field("volumes", &self.volumes)
+            .field("persistent", &self.persistent)
+            .field("services", &self.services)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("env", &EnvNames(&self.env))
+            .field("port", &self.port)
+            .field("access", &self.access)
+            .field("health", &self.health)
+            .field("restart", &self.restart)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Exec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exec")
+            .field("cmd", &self.cmd)
+            .field("cwd", &self.cwd)
+            .field("env", &EnvNames(&self.env))
+            .field("user", &self.user)
+            .field("timeout_s", &self.timeout_s)
+            .field("stdin", &self.stdin.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
 /// `POST /v1/sandboxes/{id}/exec`
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exec {
     pub cmd: String,
@@ -1134,6 +1189,7 @@ pub enum Code {
     NotFound,
     Forbidden,
     Conflict,
+    /// The sandbox holds env values that a template would expose.
     QuotaExceeded,
     NoCapacity,
     NodeUnreachable,

@@ -596,12 +596,22 @@ pub struct StartRecord {
     /// JSON of the published ports.
     pub ports: String,
     pub idle_pause_s: u64,
-    /// The env map, sealed with `SecretBox::seal_env`.
+    /// The sandbox's own env and its services, sealed with
+    /// `SecretBox::seal_sandbox_env`.
     pub env: Vec<u8>,
-    /// The services, sealed with `SecretBox::seal_services`. Empty if none.
-    pub services: Vec<u8>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A start record's sealed env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartEnv {
+    pub sandbox: String,
+    pub tenant: String,
+    pub env: Vec<u8>,
+    /// The services, as an earlier format sealed them apart from `env`.
+    /// Empty in the current one.
+    pub services: Vec<u8>,
 }
 
 /// Why a sandbox was not added.
@@ -700,6 +710,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Freed space is zeroed, so env that was rewritten sealed leaves no
+        // plain copy behind.
+        conn.pragma_update(None, "secure_delete", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let tx = conn.transaction()?;
         for (i, sql) in MIGRATIONS
@@ -960,8 +973,8 @@ impl Db {
             tx.execute(
                 "INSERT INTO start_records
                  (sandbox, tenant, template, build, spec, vcpus, memory_mib, egress, secrets,
-                  volumes, ports, idle_pause_s, env, created_at, updated_at, services)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  volumes, ports, idle_pause_s, env, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     start.sandbox,
                     start.tenant,
@@ -978,7 +991,6 @@ impl Db {
                     start.env.clone(),
                     start.created_at,
                     start.updated_at,
-                    start.services.clone(),
                 ],
             )?;
         }
@@ -990,8 +1002,7 @@ impl Db {
         self.conn()
             .query_row(
                 "SELECT sandbox, tenant, template, build, spec, vcpus, memory_mib, egress,
-                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at,
-                        services
+                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at
                  FROM start_records WHERE sandbox = ?1",
                 [sandbox],
                 |row| {
@@ -1011,11 +1022,89 @@ impl Db {
                         env: row.get(12)?,
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
-                        services: row.get(15)?,
                     })
                 },
             )
             .optional()
+    }
+
+    /// Every start record's sealed env.
+    pub fn start_record_envs(&self) -> Result<Vec<StartEnv>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT sandbox, tenant, env, services FROM start_records ORDER BY sandbox")?;
+        stmt.query_map((), |r| {
+            Ok(StartEnv {
+                sandbox: r.get(0)?,
+                tenant: r.get(1)?,
+                env: r.get(2)?,
+                services: r.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Replaces a start record's env if it still holds `old`. `false` if
+    /// it changed or is gone.
+    pub fn replace_start_env(
+        &self,
+        sandbox: &str,
+        old: (&[u8], &[u8]),
+        env: &[u8],
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE start_records SET env = ?2, services = ?3
+             WHERE sandbox = ?1 AND env = ?4 AND services = ?5",
+            params![
+                sandbox,
+                env.to_vec(),
+                Vec::<u8>::new(),
+                old.0.to_vec(),
+                old.1.to_vec()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Writes the column an earlier format sealed the services in.
+    #[cfg(test)]
+    pub fn set_legacy_start_services(&self, sandbox: &str, services: &[u8]) -> Result<()> {
+        self.conn().execute(
+            "UPDATE start_records SET services = ?2 WHERE sandbox = ?1",
+            params![sandbox, services.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Empties SQLite's write-ahead log, which may hold rows as they were
+    /// before a rewrite. Postgres keeps old row versions until it vacuums.
+    pub fn truncate_log(&self) -> Result<()> {
+        let conn = self.conn();
+        if !conn.is_postgres() {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+        Ok(())
+    }
+
+    /// The saved state of this host's sandboxes that have one, with their
+    /// tenant.
+    pub fn saved_states(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant, saved FROM sandboxes
+             WHERE saved IS NOT NULL AND node IS NULL ORDER BY seq",
+        )?;
+        stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    }
+
+    /// Replaces a sandbox's saved state if it is still `old`.
+    pub fn replace_saved(&self, id: &str, old: &str, saved: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes SET saved = ?2 WHERE id = ?1 AND saved = ?3 AND node IS NULL",
+            params![id, saved, old],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records a persistent sandbox's published ports, for its next start.
@@ -3127,7 +3216,6 @@ mod tests {
             ports: "{}".into(),
             idle_pause_s: 600,
             env: vec![1, 2, 3],
-            services: vec![4, 5],
             created_at: 1,
             updated_at: 1,
         }

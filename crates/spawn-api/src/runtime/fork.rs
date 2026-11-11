@@ -39,6 +39,7 @@ struct Source {
     own_rootfs: bool,
     persistent: bool,
     services: Vec<Service>,
+    protected: bool,
 }
 
 /// A copy with its quota and slot, before it starts.
@@ -291,6 +292,7 @@ impl Sandboxes {
             own_rootfs: live.vm.owns_rootfs(self.templates.base_rootfs()),
             persistent: record.persistent,
             services: record.services.clone(),
+            protected: record.protected,
         })
     }
 
@@ -473,6 +475,7 @@ impl Sandboxes {
                 generation: 1,
                 persistent: false,
                 services: source.services.clone(),
+                protected: source.protected,
             },
         );
         drop(admission);
@@ -511,3 +514,4 @@ impl Sandboxes {
         Some(sandbox)
     }
 }
+

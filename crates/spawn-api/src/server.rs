@@ -455,6 +455,20 @@ pub async fn serve(args: Args) -> Result<()> {
         }
         crate::leader::pull_shared(&db, &data, &sbox)?;
     }
+    let resealed = crate::reseal::reseal(&db, &sbox).context("seal stored env")?;
+    if resealed.start_records + resealed.saved > 0 {
+        eprintln!(
+            "sealed the env of {} start records and {} paused sandboxes in the current format",
+            resealed.start_records, resealed.saved
+        );
+    }
+    if !resealed.unreadable.is_empty() {
+        eprintln!(
+            "warning: cannot read the stored env of {}; was {} replaced?",
+            resealed.unreadable.join(", "),
+            key_file.display()
+        );
+    }
     let ca = Arc::new(secrets::egress_ca(&data, &sbox).context("load egress CA")?);
     let backend = match args.backend {
         BackendArg::Auto => Backend::detect(),
