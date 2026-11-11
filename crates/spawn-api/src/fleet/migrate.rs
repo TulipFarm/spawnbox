@@ -534,6 +534,12 @@ pub async fn migrate(
 ) -> Result<Value, ApiError> {
     let p = super::primary::primary(app)?;
     let row = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+    if row.persistent {
+        return Err(ApiError::new(
+            Code::Conflict,
+            "persistent sandboxes cannot move to another host yet",
+        ));
+    }
     if !matches!(row.state.as_str(), state::RUNNING | state::PAUSED) {
         return Err(ApiError::new(
             Code::Conflict,
@@ -925,6 +931,10 @@ mod tests {
                 vcpus: 1,
                 memory_mib: 256,
                 volumes: Vec::new(),
+                persistent: false,
+                generation: 1,
+                cold_starts: 0,
+                last_cold_start_at: None,
             },
             saved: "{}".into(),
             was_running: true,

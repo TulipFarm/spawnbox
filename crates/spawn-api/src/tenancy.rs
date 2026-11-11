@@ -189,7 +189,7 @@ pub fn split(key: &str) -> (Option<&str>, &str) {
 }
 
 /// Limits for one tenant. `None` means no limit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Quotas {
     pub running_sandboxes: Option<u64>,
@@ -203,6 +203,25 @@ pub struct Quotas {
     pub snapshot_storage_gib: Option<u64>,
     /// Total size of volumes, in GiB.
     pub volume_storage_gib: Option<u64>,
+    /// Persistent sandboxes in any state but deleted. 0, so none, unless
+    /// set.
+    pub persistent_sandboxes: Option<u64>,
+}
+
+impl Default for Quotas {
+    fn default() -> Self {
+        Self {
+            running_sandboxes: None,
+            running_vcpus: None,
+            running_memory_mib: None,
+            max_session_s: None,
+            max_paused_retention_s: None,
+            monthly_egress_bytes: None,
+            snapshot_storage_gib: None,
+            volume_storage_gib: None,
+            persistent_sandboxes: Some(0),
+        }
+    }
 }
 
 impl Quotas {
@@ -216,6 +235,7 @@ impl Quotas {
         monthly_egress_bytes: None,
         snapshot_storage_gib: None,
         volume_storage_gib: None,
+        persistent_sandboxes: Some(0),
     };
 
     /// Whether a sandbox of this shape may start next to `used`.
@@ -295,6 +315,19 @@ impl Quotas {
         }
     }
 
+    /// Whether one more persistent sandbox may be made next to `in_use`.
+    pub fn admit_persistent(&self, in_use: u64) -> Result<(), ApiError> {
+        match self.persistent_sandboxes {
+            Some(limit) if in_use.saturating_add(1) > limit => Err(ApiError::new(
+                Code::QuotaExceeded,
+                format!(
+                    "quota persistent_sandboxes exceeded: {in_use} in use, 1 asked, limit {limit}"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The longest `timeout_s` a sandbox may ask for.
     pub fn max_timeout_s(&self, server_max_s: u64) -> u64 {
         self.max_session_s
@@ -358,6 +391,8 @@ pub struct QuotaInput {
     pub snapshot_storage_gib: Option<Option<u64>>,
     #[serde(default, deserialize_with = "present")]
     pub volume_storage_gib: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    pub persistent_sandboxes: Option<Option<u64>>,
 }
 
 impl QuotaInput {
@@ -374,6 +409,7 @@ impl QuotaInput {
             (&mut quotas.monthly_egress_bytes, self.monthly_egress_bytes),
             (&mut quotas.snapshot_storage_gib, self.snapshot_storage_gib),
             (&mut quotas.volume_storage_gib, self.volume_storage_gib),
+            (&mut quotas.persistent_sandboxes, self.persistent_sandboxes),
         ] {
             if let Some(value) = change {
                 *field = value;
@@ -732,6 +768,26 @@ mod tests {
         let quotas = input.apply(quotas).unwrap();
         assert_eq!(quotas.monthly_egress_bytes, Some(5));
         assert_eq!(quotas.snapshot_storage_gib, None);
+    }
+
+    #[test]
+    fn persistent_sandboxes_need_a_quota() {
+        let err = Quotas::default().admit_persistent(0).unwrap_err();
+        assert_eq!(err.code, Code::QuotaExceeded);
+        assert!(
+            err.message.contains("persistent_sandboxes"),
+            "{}",
+            err.message
+        );
+        // Stored quotas from before the field was added allow none.
+        let old: Quotas = serde_json::from_str(r#"{"running_sandboxes":5}"#).unwrap();
+        assert_eq!(old.persistent_sandboxes, Some(0));
+        let input: QuotaInput = serde_json::from_str(r#"{"persistent_sandboxes":2}"#).unwrap();
+        let quotas = input.apply(Quotas::DEFAULTS).unwrap();
+        assert!(quotas.admit_persistent(1).is_ok());
+        assert!(quotas.admit_persistent(2).is_err());
+        let input: QuotaInput = serde_json::from_str(r#"{"persistent_sandboxes":null}"#).unwrap();
+        assert!(input.apply(quotas).unwrap().admit_persistent(1000).is_ok());
     }
 
     #[test]

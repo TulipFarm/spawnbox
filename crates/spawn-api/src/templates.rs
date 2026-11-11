@@ -240,6 +240,9 @@ pub struct Templates {
     builds: Semaphore,
     /// The newest ready build of each template.
     current: Mutex<HashMap<String, Arc<ReadyBuild>>>,
+    /// Retired builds that persistent sandboxes start from, by ID. Their
+    /// files stay until no start record names them.
+    kept: Mutex<HashMap<String, Arc<ReadyBuild>>>,
     closing: AtomicBool,
     store: Option<Arc<BuildStore>>,
     /// Disk the builds directory may use before idle builds that are in
@@ -294,6 +297,7 @@ impl Templates {
             defaults,
             builds: Semaphore::new(max_builds),
             current: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             store,
             cache_bytes,
@@ -500,11 +504,25 @@ impl Templates {
     /// written for `STORE_MAX_AGE`.
     async fn collect(&self) {
         let Some(store) = &self.store else { return };
-        let keep: HashSet<String> = self
+        let mut keep: HashSet<String> = self
             .current()
             .values()
             .filter_map(|b| b.store_key.clone())
             .collect();
+        // Builds that persistent sandboxes start from, loaded here or not.
+        let roots = self.db.build_roots().and_then(|roots| {
+            roots
+                .iter()
+                .map(|id| self.db.get_build(id))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        match roots {
+            Ok(builds) => keep.extend(builds.into_iter().flatten().filter_map(|b| b.store_key)),
+            Err(error) => {
+                eprintln!("build store: clean up: build roots: {error}");
+                return;
+            }
+        }
         match store.collect(&keep, STORE_MAX_AGE).await {
             Ok((0, 0)) => {}
             Ok((builds, blobs)) => {
@@ -722,6 +740,67 @@ impl Templates {
         self.current.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn kept(&self) -> MutexGuard<'_, HashMap<String, Arc<ReadyBuild>>> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Takes a replaced or removed build out of use. New sandboxes and warm
+    /// pools stop using it; its files stay while a start record names it.
+    fn retire(&self, old: Arc<ReadyBuild>) {
+        old.retired.store(true, Ordering::SeqCst);
+        match self.db.build_roots() {
+            Ok(roots) if !roots.contains(&old.id) => {}
+            // Kept when unsure; `prune_roots` lets it go later.
+            _ => {
+                self.kept().insert(old.id.clone(), old);
+            }
+        }
+    }
+
+    /// Keeps `ready`'s files if it was retired while a persistent sandbox
+    /// was made from it.
+    pub fn hold(&self, ready: &Arc<ReadyBuild>) {
+        if ready.retired.load(Ordering::SeqCst) {
+            self.kept().insert(ready.id.clone(), Arc::clone(ready));
+        }
+    }
+
+    /// Lets go of kept builds that no start record names any more.
+    pub fn prune_roots(&self) {
+        match self.db.build_roots() {
+            Ok(roots) => self.kept().retain(|id, _| roots.contains(id)),
+            Err(error) => eprintln!("build roots: {error}"),
+        }
+    }
+
+    /// The build a persistent sandbox starts from: the current build of
+    /// its template, a kept one, or one whose files are still here or in
+    /// the build store.
+    pub fn root(&self, id: &str) -> Result<Arc<ReadyBuild>, ApiError> {
+        if let Some(ready) = self.current().values().find(|b| b.id == id) {
+            return Ok(Arc::clone(ready));
+        }
+        let mut kept = self.kept();
+        if let Some(ready) = kept.get(id) {
+            return Ok(Arc::clone(ready));
+        }
+        let gone = || {
+            ApiError::new(
+                Code::Conflict,
+                format!("build {id} that this sandbox starts from is no longer on this host"),
+            )
+        };
+        let build = self.db.get_build(id)?.ok_or_else(gone)?;
+        if build.fingerprint != self.fingerprint {
+            return Err(gone());
+        }
+        let spec = serde_json::from_str::<TemplateSpec>(&build.spec).map_err(|_| gone())?;
+        let ready = self.open(&build, spec).ok_or_else(gone)?;
+        ready.retired.store(true, Ordering::SeqCst);
+        kept.insert(id.to_owned(), Arc::clone(&ready));
+        Ok(ready)
+    }
+
     /// Picks up ready builds from the last run, drops ones that no longer
     /// match this host's inputs, and removes directories nothing refers to.
     fn load(&self) -> Result<()> {
@@ -746,7 +825,7 @@ impl Templates {
                     if let Some(old) = self.current().insert(build.template.clone(), ready) {
                         self.db
                             .set_build_state(&old.id, build_state::REMOVED, now, None)?;
-                        old.retired.store(true, Ordering::SeqCst);
+                        self.retire(old);
                     }
                 }
                 Err(state) => {
@@ -819,6 +898,7 @@ impl Templates {
     }
 
     fn remove_unused_dirs(&self) -> Result<()> {
+        let roots = self.db.build_roots()?;
         let live = |state: &str| {
             matches!(
                 state,
@@ -828,7 +908,8 @@ impl Templates {
         for entry in std::fs::read_dir(&self.dir)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let used = ids::is_valid_id("bld", &name)
-                && self.db.get_build(&name)?.is_some_and(|b| live(&b.state));
+                && (roots.contains(&name)
+                    || self.db.get_build(&name)?.is_some_and(|b| live(&b.state)));
             if !used {
                 remove_dir(&entry.path());
             }
@@ -1254,7 +1335,7 @@ impl Templates {
         if let Some(old) = current.insert(build.template.clone(), ready) {
             self.db
                 .set_build_state(&old.id, build_state::REMOVED, now, None)?;
-            old.retired.store(true, Ordering::SeqCst);
+            self.retire(old);
         }
         eprintln!("template {:?} is ready ({})", build.template, build.id);
         Ok(())
@@ -1399,7 +1480,7 @@ impl Templates {
             return Err(template_not_found(name));
         }
         if let Some(old) = current.remove(&key) {
-            old.retired.store(true, Ordering::SeqCst);
+            self.retire(old);
         }
         Ok(())
     }
@@ -1518,7 +1599,7 @@ impl Templates {
             let mut current = self.current();
             self.db.delete_template(&template.name, now_ms())?;
             if let Some(old) = current.remove(&template.name) {
-                old.retired.store(true, Ordering::SeqCst);
+                self.retire(old);
             }
         }
         Ok(())
@@ -1622,7 +1703,7 @@ impl Templates {
             eprintln!("remove template {key:?}: {error}");
         }
         if let Some(old) = current.remove(key) {
-            old.retired.store(true, Ordering::SeqCst);
+            self.retire(old);
         }
         self.fresh
             .lock()

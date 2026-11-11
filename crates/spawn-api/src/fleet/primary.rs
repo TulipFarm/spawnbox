@@ -699,6 +699,10 @@ impl Created {
             vcpus: u32::from(vcpus),
             memory_mib,
             volumes: Vec::new(),
+            persistent: false,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
         })
     }
 }
@@ -780,7 +784,17 @@ async fn place_any(
             need = Some(Need::of(app, &refs)?);
         }
     }
-    let candidates = candidates(app, p, &tenant, &key, network, need.as_ref());
+    let mut candidates = candidates(app, p, &tenant, &key, network, need.as_ref());
+    if req.persistent {
+        // Persistent sandboxes stay on this host: they cannot move yet.
+        candidates.retain(|c| c.node.is_none());
+        if candidates.is_empty() {
+            if let Some(need) = &need {
+                need.gather(app, p, None).await?;
+            }
+            return crate::server::create_here(Arc::clone(app), tenant, req, origin).await;
+        }
+    }
     let mut local = Some(req);
     let mut last = None;
     for candidate in candidates {

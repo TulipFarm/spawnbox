@@ -69,6 +69,7 @@ These functions operate now:
 | Two backends | Run sandboxes in Firecracker microVMs on hosts with KVM. Run them in gVisor on hosts without KVM, for example usual cloud VMs. A tenant can require microVMs. |
 | Volumes | Keep files after a sandbox ends. Mount the same volume in the next sandbox. Mount one volume in many sandboxes to read only. |
 | Pause and resume | Save the memory, processes and files of a sandbox to disk. Resume in approximately 65 ms. An idle sandbox pauses automatically. A new request resumes it. |
+| Persistent sandboxes | Keep a sandbox until you delete it. If its VM is lost, the next request starts it again from its template, with the same ID, env, secrets, volumes and ports. One host only. |
 | Fork and snapshot | Start up to 16 copies of a running sandbox, with its memory, processes and files, in less than 1 s. Save a running sandbox as a new template. The sandbox continues to run. |
 | Preview URLs | Show a web app from a sandbox at a `public`, `token` or `private` URL. |
 | Network control | Allow all hosts, only listed hosts, or no hosts. Set a speed limit for each direction. Spawnbox records each connection and each DNS query. |
@@ -590,6 +591,30 @@ Usually, you do not need these commands. A sandbox pauses automatically
 after 10 minutes without requests. The next exec, file, terminal, clone or
 preview request resumes it.
 
+### Keep a sandbox until you delete it
+
+```sh
+S=$(curl -s -H "$A" -d '{"persistent": true}' $B/sandboxes | jq -r .id)
+```
+
+A persistent sandbox has no timeout. It pauses after 10 minutes without
+requests and stays paused until the next request. Paused retention does
+not delete it.
+
+If Spawnbox cannot keep its memory, the sandbox becomes `cold`. This
+occurs when the server crashes, the VM stops on its own, a pause or a
+resume fails, the `snapshot_storage_gib` quota has no room for its idle
+pause, or the server stops before the sandbox can pause. The `sandbox.cold`
+event has the reason. The next
+exec, file, terminal, clone, preview or resume request starts it again
+from its template build. The processes and the files outside its volumes
+are gone. Its ID, env, secrets, network rules, volumes and published
+ports are the same.
+
+A tenant needs the `persistent_sandboxes` quota. It is `0` by default.
+Persistent sandboxes run only on the primary. They cannot move to a
+worker yet.
+
 ### Fork a sandbox or save it as a template
 
 ```sh
@@ -757,7 +782,7 @@ Prometheus adds the `instance` label.
 | `spawnbox_api_errors_total` | `code` | Error responses |
 | `spawnbox_egress_connections_total` | `verdict` | Connections from sandboxes and template builds |
 | `spawnbox_dns_queries_total` | `verdict` | DNS queries from sandboxes and template builds |
-| `spawnbox_sandboxes` (gauge) | `state` | Sandboxes on the host that are `starting`, `running` or `paused` |
+| `spawnbox_sandboxes` (gauge) | `state` | Sandboxes on the host that are `starting`, `running`, `paused` or `cold` |
 | `spawnbox_node_committed_ratio` (gauge) | `resource` (`slots`, `memory`) | Part of the host in use, from 0 to 1 |
 | `spawnbox_warm_pool_ready` (gauge) | `template`, `build`, `network` | Warm VMs ready |
 | `spawnbox_warm_pool_hits_total`, `spawnbox_warm_pool_misses_total` | `build` | Creates that got or did not get a warm VM |
@@ -1319,7 +1344,11 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 
 - `POST /v1/sandboxes` creates a sandbox. Fields: `template` (default
   `base`), `timeout_s`, `idle_pause_s`, `env`, `labels`, `egress`,
-  `secrets`. Org keys can also send `tenant`.
+  `secrets`, `volumes`, `persistent`. Org keys can also send `tenant`.
+- `"persistent": true` keeps the sandbox until it is deleted. Do not send
+  `timeout_s`. `idle_pause_s` must be more than 0 (default 600). On a
+  fleet, the primary runs it. Refer to
+  [Keep a sandbox until you delete it](#keep-a-sandbox-until-you-delete-it).
 - The create response has `timings_ms` and `started_from`. The value of
   `started_from` is `warm_pool` or `build`.
 - Each host adds up the `memory_mib` of its running sandboxes. A create,
@@ -1336,18 +1365,32 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   sandbox uses only the memory it needs now. Templates built before this
   are rebuilt once.
 - `GET /v1/sandboxes` lists sandboxes. Org keys can add `?tenant=`.
-- `GET /v1/sandboxes/{id}` gets one sandbox.
-- `DELETE /v1/sandboxes/{id}` deletes a sandbox.
+- `GET /v1/sandboxes/{id}` gets one sandbox. It has `persistent`,
+  `generation` (1, plus 1 for each cold start), `cold_starts` and
+  `last_cold_start_at`. It never shows env values. A persistent sandbox
+  has no `expires_at`.
+- States: `starting`, `running`, `paused`, `cold`, `deleted`, `failed`.
+  Only persistent sandboxes become `cold`.
+- `DELETE /v1/sandboxes/{id}` deletes a sandbox. A `cold` sandbox, or one
+  that is starting again, is deleted at once. A start that ends after the
+  delete stops its VM.
 - Spawnbox deletes a sandbox when its `timeout_s` ends. The maximum is
   `--max-timeout-s`. Time in the paused state is not counted.
 - `POST /v1/sandboxes/{id}:pause` saves the memory and disk in
   `<data-dir>/paused/<id>` and stops the VM.
-- `POST /v1/sandboxes/{id}:resume` starts the VM again.
+- `POST /v1/sandboxes/{id}:resume` starts the VM again. For a `cold`
+  sandbox, it boots a new VM from the template build.
+- A cold start is given 120 seconds. Calls that come during a start wait
+  for it. If it fails or takes longer, the sandbox stays `cold` and the
+  next call tries again.
 - If the sandbox is already in the requested state, pause and resume do
   nothing.
 - A paused sandbox shows `"state": "paused"` and `paused_at`.
 - Paused sandboxes stay after a server restart. Spawnbox deletes them
-  after `--paused-retention-s` (default 7 days).
+  after `--paused-retention-s` (default 7 days). Persistent sandboxes are
+  not deleted.
+- Spawnbox encrypts the env of paused and persistent sandboxes on disk
+  with `--secrets-key-file`.
 - On Firecracker, a pause writes only the memory that changed since the
   sandbox was started or resumed. Spawnbox then merges it with the earlier
   memory in the background; a resume or a move waits for that merge. The
@@ -1603,8 +1646,11 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   | `monthly_egress_bytes` | No limit |
   | `snapshot_storage_gib` | No limit |
   | `volume_storage_gib` | No limit |
+  | `persistent_sandboxes` | 0 |
 
-  The `default` tenant has no limits. If a request goes over a quota, the
+  The `default` tenant has no limits, except `persistent_sandboxes`.
+  `persistent_sandboxes` counts persistent sandboxes in each state until
+  they are deleted. If a request goes over a quota, the
   response is `429 quota_exceeded`.
 
 ### Events
@@ -1616,7 +1662,9 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   event also has `tenant`, `sandbox` and `actor`.
 - Event types:
   - `sandbox.created` (with `forked_from` for a copy), `.paused`,
-    `.resumed`, `.forked`, `.snapshotted`, `.expired`, `.killed`, `.lost`
+    `.resumed`, `.forked`, `.snapshotted`, `.expired`, `.killed`, `.lost`,
+    `.cold` (with `reason`), `.cold_started` (with `generation`, `build`
+    and `duration_ms`)
   - `exec.started`, `exec.finished` (with the last 64 KiB of output)
   - `pty.opened`, `pty.closed`
   - `file.written` (with the SHA-256 hash), `file.deleted`
@@ -1738,6 +1786,7 @@ To change a setting:
    ```
 
 > **CAUTION:** A restart deletes running sandboxes. Paused sandboxes stay.
+> Running persistent sandboxes pause, or become `cold`.
 
 To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 
@@ -1758,7 +1807,8 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--ksm` | off | Let the kernel merge equal memory pages across Firecracker VMs. Saves memory when sandboxes run the same programs, but a sandbox can learn what another holds by timing its writes. Use it only when all sandboxes trust each other. Needs Linux 6.7 or later. |
 | `--pin-vcpus` | `auto` | Keep each Firecracker vCPU on one host CPU, spreading VMs over the least used CPUs. `auto` turns it on when the host is itself a VM. Under nested virtualization, VMs whose vCPUs move between CPUs can crash (`KVM_EXIT_FAIL_ENTRY` in the sandbox log) once many share each CPU. `on` or `off` overrides it. |
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
-| `--paused-retention-s` | 604800 | Delete paused sandboxes after this time |
+| `--paused-retention-s` | 604800 | Delete paused sandboxes after this time. Persistent sandboxes are kept. |
+| `--shutdown-pause-s` | 30 | On SIGTERM, time for running persistent sandboxes to pause. The ones that do not pause in this time stop and become `cold`. |
 | `--max-builds` | 2 | Maximum number of template builds at the same time |
 | `--egress-policy` | `{"mode":"allow_all"}` | Network policy for all sandboxes |
 | `--dns` | `1.1.1.1` | DNS server that the DNS forwarder sends queries to |

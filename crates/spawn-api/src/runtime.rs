@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +31,7 @@ use crate::metering::{Meter, Rate};
 use crate::metrics;
 use crate::model::{ApiError, BASE_TEMPLATE, Code, CreateSandbox, Exec, Timings};
 use crate::ports::{self, Access, Publish};
+use crate::secretbox::SecretBox;
 use crate::secrets::Secrets;
 use crate::templates::{ReadyBuild, Slots, Startable, Templates};
 use crate::tenancy::{Quotas, Tenant, Usage};
@@ -90,10 +93,26 @@ struct Record {
     /// Set while it is copied to another host: since when, and whether it
     /// ran before.
     moving: Option<(Instant, bool)>,
+    /// Counts the VMs a persistent sandbox has had. Updates for an older
+    /// VM are ignored.
+    generation: i64,
+    persistent: bool,
+}
+
+/// A cold sandbox's new VM, before it is recorded.
+struct Booted {
+    restored: Restored,
+    index: u32,
+    env: BTreeMap<String, String>,
+    secrets: Vec<Attached>,
+    mounted: bool,
 }
 
 /// A move that takes longer than this was abandoned.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a cold start may take before its claim is given up.
+const COLD_START_CLAIM: Duration = Duration::from_secs(120);
 
 impl Record {
     fn is_moving(&self) -> bool {
@@ -128,6 +147,8 @@ enum PauseReason {
     /// Host memory is short. Only if no call is running; not held to the
     /// snapshot quota.
     Pressure,
+    /// The server stops. Persistent sandboxes only.
+    Shutdown,
 }
 
 /// A paused sandbox ready to be copied to another host.
@@ -151,9 +172,14 @@ pub struct Published {
 }
 
 /// What a paused sandbox needs to resume, also after a server restart.
-#[derive(Serialize, Deserialize)]
+/// Stored with `env` sealed in `env_sealed`; sent to other hosts with it
+/// in plain.
+#[derive(Clone, Serialize, Deserialize)]
 struct Saved {
+    #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env_sealed: Option<String>,
     ports: BTreeMap<u16, Published>,
     /// Secret name and placeholder.
     secrets: Vec<(String, String)>,
@@ -170,6 +196,8 @@ struct Inner {
     /// Sandboxes being paused, by ID: their tenant and the snapshot bytes
     /// they may store. Counted against the snapshot quota until paused.
     pausing: HashMap<String, (String, u64)>,
+    /// Held while a cold sandbox starts, so that calls wait for one start.
+    waking: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Inner {
@@ -243,16 +271,19 @@ impl Drop for Admission {
 pub struct Reservation(#[expect(dead_code, reason = "held for its drop")] Admission);
 
 /// A VM in use. While one exists, the sandbox is not paused for being
-/// idle.
+/// idle. Bound to the VM of `generation`.
 pub struct Busy {
     inner: Arc<Mutex<Inner>>,
     id: String,
+    generation: i64,
 }
 
 impl Drop for Busy {
     fn drop(&mut self) {
         let mut inner = lock(&self.inner);
-        if let Some(record) = inner.records.get_mut(&self.id) {
+        if let Some(record) = inner.records.get_mut(&self.id)
+            && record.generation == self.generation
+        {
             record.busy = record.busy.saturating_sub(1);
             record.last_active = Instant::now();
         }
@@ -318,6 +349,8 @@ pub struct Settings {
     pub memory_limit_mib: u64,
     /// `--memory-pressure-pct`. 0 turns pausing for memory off.
     pub memory_pressure_pct: u8,
+    /// How long shutdown waits for running persistent sandboxes to pause.
+    pub shutdown_pause_s: u64,
 }
 
 #[derive(Clone)]
@@ -395,6 +428,7 @@ impl Sandboxes {
                 records: HashMap::new(),
                 starting: HashMap::new(),
                 pausing: HashMap::new(),
+                waking: HashMap::new(),
             })),
             closing: AtomicBool::new(false),
         }))
@@ -795,6 +829,15 @@ impl Sandboxes {
         usage
     }
 
+    /// `saved` as stored, with its env sealed to the sandbox.
+    fn stored(&self, id: &str, tenant: &str, saved: Saved) -> Result<String, ApiError> {
+        seal_saved(self.secrets.sbox(), tenant, id, saved)
+    }
+
+    fn parse_saved(&self, id: &str, tenant: &str, json: &str) -> Option<Saved> {
+        open_saved(self.secrets.sbox(), tenant, id, json)
+    }
+
     fn retention_ms(&self, quotas: &Quotas) -> i64 {
         let seconds = quotas.paused_retention_s(self.settings.paused_retention_s);
         i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
@@ -840,6 +883,7 @@ impl Sandboxes {
             return Err(Self::shutting_down());
         }
         let idle_pause_s = req.idle_pause_s.unwrap_or(self.settings.idle_pause_s);
+        let persistent = req.persistent;
         let egress = req.egress.take().unwrap_or_else(Policy::allow_all);
         let volumes = self.volumes.resolve(&tenant.id, &req.volumes)?;
         let mut attached = Vec::new();
@@ -934,21 +978,47 @@ impl Sandboxes {
             secrets: req.secrets,
             egress: egress.clone(),
             created_at: now,
-            expires_at: now.saturating_add(i64::try_from(timeout_s * 1000).unwrap_or(i64::MAX)),
+            expires_at: if persistent {
+                i64::MAX
+            } else {
+                now.saturating_add(i64::try_from(timeout_s * 1000).unwrap_or(i64::MAX))
+            },
             idle_pause_s,
             paused_at: None,
             node: None,
             vcpus: u32::from(ready.build.limits.vcpus),
             memory_mib: ready.build.limits.memory_mib,
             volumes,
+            persistent,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
         };
-        let inserted = match self.db.insert_sandbox(&sandbox) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(name)) => Err(ApiError::new(
+        let refused = |refused| match refused {
+            db::Refused::Volume(name) => ApiError::new(
                 Code::Conflict,
                 format!("volume {name:?} is in use by another sandbox"),
-            )),
-            Err(error) => Err(error.into()),
+            ),
+            db::Refused::Persistent(in_use) => tenant
+                .quotas
+                .admit_persistent(in_use)
+                .err()
+                .unwrap_or_else(|| ApiError::internal("persistent sandbox refused")),
+        };
+        let inserted = if persistent {
+            self.start_record(&sandbox, &ready, &req.env)
+                .and_then(|start| {
+                    let limit = tenant.quotas.persistent_sandboxes;
+                    Ok(self.db.insert_persistent(&sandbox, &start, limit)?)
+                })
+                .and_then(|inserted| inserted.map_err(refused))
+                .inspect(|()| self.templates.hold(&ready))
+        } else {
+            match self.db.insert_sandbox(&sandbox) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(name)) => Err(refused(db::Refused::Volume(name))),
+                Err(error) => Err(error.into()),
+            }
         };
         if let Err(error) = inserted {
             match warm {
@@ -1036,7 +1106,7 @@ impl Sandboxes {
                 eprintln!("create {}: {error:#}", sandbox.id);
                 self.node.remove_failed(&name, index).await;
                 self.release(index);
-                self.db.set_state(&sandbox.id, state::FAILED, now_ms())?;
+                self.db.set_state(&sandbox.id, 1, state::FAILED, now_ms())?;
                 self.event(
                     "sandbox.lost",
                     origin,
@@ -1110,7 +1180,7 @@ impl Sandboxes {
             volumes: !mounts.is_empty(),
         };
         if self.closing.load(Ordering::SeqCst) {
-            self.stop(&sandbox.id, live, state::DELETED).await;
+            self.stop(&sandbox.id, 1, live, state::DELETED).await;
             return Err(Self::shutting_down());
         }
         let created = json!({
@@ -1118,7 +1188,8 @@ impl Sandboxes {
             "build": sandbox.build,
             "vcpus": limits.vcpus,
             "memory_mib": limits.memory_mib,
-            "timeout_s": timeout_s,
+            "timeout_s": (!persistent).then_some(timeout_s),
+            "persistent": persistent,
             "idle_pause_s": idle_pause_s,
             "secrets": sandbox.secrets,
             "labels": sandbox.labels,
@@ -1146,18 +1217,34 @@ impl Sandboxes {
                 metered_at: now_ms(),
                 disk_bytes,
                 moving: None,
+                generation: 1,
+                persistent,
             },
         );
-        if let Err(error) = self.db.set_state(&sandbox.id, state::RUNNING, now_ms()) {
+        let started = match self.db.start_running(&sandbox.id, 1) {
+            Ok(true) => Ok(()),
+            // Only a delete moves it on while it starts.
+            Ok(false) => Err(ApiError::new(
+                Code::Conflict,
+                "sandbox was deleted while it started",
+            )),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = started {
             let record = self.inner().records.remove(&sandbox.id);
             if let Some(Record {
                 vm: VmState::Running(live),
                 ..
             }) = record
             {
-                self.stop(&sandbox.id, *live, state::FAILED).await;
+                let end = if error.code == Code::Conflict {
+                    state::DELETED
+                } else {
+                    state::FAILED
+                };
+                self.stop(&sandbox.id, 1, *live, end).await;
             }
-            return Err(error.into());
+            return Err(error);
         }
         sandbox.state = state::RUNNING.into();
         self.event("sandbox.created", origin, &tenant_id, &sandbox.id, created);
@@ -1167,11 +1254,42 @@ impl Sandboxes {
                 // An error means the VM stopped first, as it should.
                 if let Ok(why) = lost.await {
                     let reason = "memory pages could not be fetched";
-                    this.lose(&id, &origin, &why, reason).await;
+                    this.lose(&id, 1, &origin, &why, reason).await;
                 }
             });
         }
         Ok((sandbox, timings))
+    }
+
+    /// What a persistent sandbox starts from again once it is cold.
+    fn start_record(
+        &self,
+        sandbox: &db::Sandbox,
+        ready: &ReadyBuild,
+        env: &BTreeMap<String, String>,
+    ) -> Result<db::StartRecord, ApiError> {
+        let sealed = self
+            .secrets
+            .sbox()
+            .seal_env(&sandbox.tenant, &sandbox.id, env)
+            .map_err(ApiError::internal)?;
+        Ok(db::StartRecord {
+            sandbox: sandbox.id.clone(),
+            tenant: sandbox.tenant.clone(),
+            template: sandbox.template.clone(),
+            build: ready.id.clone(),
+            spec: serde_json::to_string(&ready.spec).map_err(ApiError::internal)?,
+            vcpus: sandbox.vcpus,
+            memory_mib: sandbox.memory_mib,
+            egress: sandbox.egress.clone(),
+            secrets: sandbox.secrets.clone(),
+            volumes: sandbox.volumes.clone(),
+            ports: "{}".into(),
+            idle_pause_s: sandbox.idle_pause_s,
+            env: sealed,
+            created_at: sandbox.created_at,
+            updated_at: sandbox.created_at,
+        })
     }
 
     /// Fails running sandboxes whose VM process ended on its own, as when
@@ -1180,35 +1298,41 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return;
         }
-        let exited: Vec<(String, String)> = self
+        let exited: Vec<(String, i64, String)> = self
             .inner()
             .records
             .iter_mut()
             .filter_map(|(id, record)| match &mut record.vm {
-                VmState::Running(live) => live.vm.exited().map(|why| (id.clone(), why)),
+                VmState::Running(live) => live
+                    .vm
+                    .exited()
+                    .map(|why| (id.clone(), record.generation, why)),
                 _ => None,
             })
             .collect();
-        for (id, why) in exited {
+        for (id, generation, why) in exited {
             let this = self.clone();
             tokio::spawn(async move {
-                this.lose(&id, &Origin::system(), &why, "the VM exited")
+                this.lose(&id, generation, &Origin::system(), &why, "the VM exited")
                     .await;
             });
         }
     }
 
     /// Fails a sandbox whose VM stopped without being asked to: its pager
-    /// could not fetch memory, or the VM exited.
-    async fn lose(&self, id: &str, origin: &Origin, why: &str, reason: &str) {
+    /// could not fetch memory, or the VM exited. A persistent one becomes
+    /// cold. Does nothing once a VM newer than `generation` runs it.
+    async fn lose(&self, id: &str, generation: i64, origin: &Origin, why: &str, reason: &str) {
         eprintln!("{id}: {why}; it was stopped");
         // A pause or move may hold it for a while; it fails without memory.
         for _ in 0..600 {
             let taken = {
                 let mut inner = self.inner();
                 let running = match inner.records.get(id) {
-                    None => return,
-                    Some(record) => matches!(record.vm, VmState::Running(_)),
+                    Some(record) if record.generation == generation => {
+                        matches!(record.vm, VmState::Running(_))
+                    }
+                    _ => return,
                 };
                 if running {
                     inner.records.remove(id)
@@ -1221,7 +1345,17 @@ impl Sandboxes {
                 let VmState::Running(live) = record.vm else {
                     return;
                 };
-                self.stop(id, *live, state::FAILED).await;
+                if record.persistent {
+                    self.stop(id, generation, *live, state::COLD).await;
+                    let code = if reason == "the VM exited" {
+                        "vm_exited"
+                    } else {
+                        "pages_lost"
+                    };
+                    self.cold_event(origin, &record.tenant, id, code);
+                    return;
+                }
+                self.stop(id, generation, *live, state::FAILED).await;
                 self.event(
                     "sandbox.lost",
                     origin,
@@ -1267,7 +1401,19 @@ impl Sandboxes {
         }
     }
 
-    /// Works from any state except `starting`.
+    fn cold_event(&self, origin: &Origin, tenant: &str, id: &str, reason: &str) {
+        eprintln!("{id} is cold: {reason}");
+        self.event(
+            "sandbox.cold",
+            origin,
+            tenant,
+            id,
+            json!({ "reason": reason }),
+        );
+    }
+
+    /// Works from any state except `starting`, unless the sandbox is
+    /// persistent: then a start in progress fails.
     pub async fn delete(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
         let sandbox = self.get(id)?;
         if let Some(lock) = self.record_lock(id) {
@@ -1284,6 +1430,20 @@ impl Sandboxes {
             }
         }
         let sandbox = self.get(id).unwrap_or(sandbox);
+        if sandbox.persistent
+            && (sandbox.state == state::COLD || sandbox.state == state::STARTING)
+            && self.db.delete_cold(id, now_ms())?
+        {
+            self.inner().waking.remove(id);
+            self.event(
+                "sandbox.killed",
+                origin,
+                &sandbox.tenant,
+                id,
+                json!({ "previous_state": sandbox.state }),
+            );
+            return Ok(());
+        }
         if sandbox.state == state::STARTING {
             return Err(ApiError::new(
                 Code::Conflict,
@@ -1291,7 +1451,8 @@ impl Sandboxes {
             ));
         }
         if sandbox.state != state::DELETED {
-            self.db.set_state(id, state::DELETED, now_ms())?;
+            self.db
+                .set_state(id, sandbox.generation, state::DELETED, now_ms())?;
             self.event(
                 "sandbox.killed",
                 origin,
@@ -1309,19 +1470,30 @@ impl Sandboxes {
     async fn remove(&self, id: &str, final_state: &str) -> Option<String> {
         let mut record = self.inner().records.remove(id)?;
         self.settle(id, &mut record, now_ms());
+        let generation = record.generation;
         match record.vm {
-            VmState::Running(live) => self.stop(id, *live, final_state).await,
+            VmState::Running(live) => self.stop(id, generation, *live, final_state).await,
             VmState::Paused { .. } | VmState::Changing => {
                 remove_dir(&self.paused_dir(id));
-                if let Err(error) = self.db.set_state(id, final_state, now_ms()) {
-                    eprintln!("record {id} as {final_state}: {error}");
-                }
+                self.record_end(id, generation, final_state);
             }
         }
         Some(record.tenant)
     }
 
-    async fn stop(&self, id: &str, live: Live, final_state: &str) {
+    /// Records that the VM of `generation` ended: `final_state`, or cold.
+    fn record_end(&self, id: &str, generation: i64, final_state: &str) {
+        let recorded = if final_state == state::COLD {
+            self.db.set_cold(id, generation).map(drop)
+        } else {
+            self.db.set_state(id, generation, final_state, now_ms())
+        };
+        if let Err(error) = recorded {
+            eprintln!("record {id} as {final_state}: {error}");
+        }
+    }
+
+    async fn stop(&self, id: &str, generation: i64, live: Live, final_state: &str) {
         let Live {
             vm,
             channel,
@@ -1336,35 +1508,43 @@ impl Sandboxes {
         vm.stop().await;
         // Only reuse the index once its jail and network are gone.
         self.release(index);
-        if let Err(error) = self.db.set_state(id, final_state, now_ms()) {
-            eprintln!("record {id} as {final_state}: {error}");
+        if final_state == state::COLD {
+            remove_dir(&self.paused_dir(id));
         }
+        self.record_end(id, generation, final_state);
     }
 
     /// The guest connection and environment for one call. Resumes a paused
-    /// sandbox first. Keep `busy` until the call is done.
+    /// sandbox, or starts a cold one, first. Keep `busy` until the call is
+    /// done.
     pub async fn open(&self, id: &str, origin: &Origin) -> Result<Opened, ApiError> {
         loop {
-            let lock = {
+            let found = {
                 let mut inner = self.inner();
-                let Some(record) = inner.records.get_mut(id) else {
-                    drop(inner);
-                    return Err(self.not_running(id));
-                };
-                if let VmState::Running(live) = &record.vm {
-                    record.busy += 1;
-                    record.last_active = Instant::now();
-                    return Ok(Opened {
-                        tenant: record.tenant.clone(),
-                        channel: live.channel.clone(),
-                        env: record.env.clone(),
-                        busy: Busy {
-                            inner: Arc::clone(&self.inner),
-                            id: id.to_owned(),
-                        },
-                    });
+                match inner.records.get_mut(id) {
+                    None => None,
+                    Some(record) => {
+                        if let VmState::Running(live) = &record.vm {
+                            record.busy += 1;
+                            record.last_active = Instant::now();
+                            return Ok(Opened {
+                                tenant: record.tenant.clone(),
+                                channel: live.channel.clone(),
+                                env: record.env.clone(),
+                                busy: Busy {
+                                    inner: Arc::clone(&self.inner),
+                                    id: id.to_owned(),
+                                    generation: record.generation,
+                                },
+                            });
+                        }
+                        Some(Arc::clone(&record.lock))
+                    }
                 }
-                Arc::clone(&record.lock)
+            };
+            let Some(lock) = found else {
+                self.wake_cold(id, origin).await?;
+                continue;
             };
             // In its own task: a client that disconnects must not stop a
             // resume halfway.
@@ -1380,6 +1560,301 @@ impl Sandboxes {
         }
     }
 
+    /// The lock of a sandbox that runs or is paused. Starts it first if it
+    /// is cold.
+    async fn waking_lock(
+        &self,
+        id: &str,
+        origin: &Origin,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ApiError> {
+        if let Some(lock) = self.record_lock(id) {
+            return Ok(lock);
+        }
+        self.wake_cold(id, origin).await?;
+        self.record_lock(id).ok_or_else(|| self.not_running(id))
+    }
+
+    /// Starts cold sandbox `id`, or waits for the start in progress. Fails
+    /// like a call to a sandbox that does not run if it is not cold.
+    async fn wake_cold(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
+        let sandbox = self.get(id)?;
+        let cold = sandbox.state == state::COLD || sandbox.state == state::STARTING;
+        if !sandbox.persistent || sandbox.node.is_some() || !cold {
+            return Err(self.not_running(id));
+        }
+        let gate = Arc::clone(self.inner().waking.entry(id.to_owned()).or_default());
+        // In its own task: a client that disconnects must not stop a start
+        // halfway.
+        let this = self.clone();
+        let (id, origin) = (id.to_owned(), origin.clone());
+        tokio::spawn(async move {
+            let _waking = gate.lock().await;
+            if this.inner().records.contains_key(&id) {
+                return Ok(());
+            }
+            this.start_cold(&id, &origin).await
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("task failed: {error}")))?
+    }
+
+    /// Boots a new VM for cold sandbox `id` from its start record. Hold its
+    /// waking lock.
+    async fn start_cold(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(Self::shutting_down());
+        }
+        let sandbox = self.get(id)?;
+        if sandbox.state == state::STARTING {
+            return Err(ApiError::new(
+                Code::Conflict,
+                "sandbox is starting; try again soon",
+            ));
+        }
+        if sandbox.state != state::COLD {
+            return Err(self.not_running(id));
+        }
+        let start = self
+            .db
+            .get_start_record(id)?
+            .ok_or_else(|| ApiError::internal(format!("sandbox {id} has no start record")))?;
+        let row = self.db.get_tenant(&start.tenant)?;
+        let quotas = row.as_ref().map(|t| t.quotas).unwrap_or_default();
+        quotas.admit_egress(self.meter.month_egress(&start.tenant, now_ms())?)?;
+        let limits = Limits {
+            vcpus: u8::try_from(start.vcpus).unwrap_or(u8::MAX),
+            memory_mib: start.memory_mib,
+        };
+        let _admission = self.admit(&start.tenant, &quotas, id, limits, true)?;
+        let ready = self.templates.root(&start.build)?;
+        let claim = ids::base32(&ids::random::<10>().map_err(ApiError::internal)?);
+        let claim_ms = i64::try_from(COLD_START_CLAIM.as_millis()).unwrap_or(i64::MAX);
+        let Some(generation) = self
+            .db
+            .claim_cold(id, &claim, now_ms().saturating_add(claim_ms))?
+        else {
+            return Err(self.not_running(id));
+        };
+        let begin = Instant::now();
+        let policies: Vec<Policy> = row
+            .and_then(|t| t.egress)
+            .into_iter()
+            .chain([start.egress.clone()])
+            .collect();
+        let mut slot = None;
+        let booted = tokio::time::timeout(
+            COLD_START_CLAIM,
+            self.boot_cold(&start, &ready, policies, &mut slot),
+        )
+        .await
+        .unwrap_or_else(|_| Err(ApiError::internal("the start took too long")));
+        drop(ready);
+        let booted = match booted {
+            Ok(booted) => booted,
+            Err(error) => {
+                eprintln!("cold start {id}: {}", error.message);
+                // A VM cut off by the timeout was killed when dropped.
+                if let Some(index) = slot {
+                    self.node.remove_failed(&ids::host_name(id), index).await;
+                    self.release(index);
+                }
+                if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+                    eprintln!("record {id} as cold: {error}");
+                }
+                return Err(match error.code {
+                    Code::Internal => ApiError::internal(format!(
+                        "sandbox {id} could not be started; see the server log"
+                    )),
+                    _ => error,
+                });
+            }
+        };
+        let Booted {
+            restored,
+            index,
+            env,
+            secrets,
+            mounted,
+        } = booted;
+        let Restored {
+            mut vm, channel, ..
+        } = restored;
+        let lost = vm.take_lost();
+        let live = Live {
+            vm,
+            channel,
+            index,
+            expires_at: i64::MAX,
+            volumes: mounted,
+        };
+        let disk_bytes = disk_bytes(&live.vm);
+        let lock: Arc<tokio::sync::Mutex<()>> = Arc::default();
+        // Held until the claim is ended, so a delete waits for it.
+        let changing = Arc::clone(&lock).lock_owned().await;
+        self.inner().records.insert(
+            id.to_owned(),
+            Record {
+                tenant: start.tenant.clone(),
+                vm: VmState::Running(Box::new(live)),
+                env,
+                ports: serde_json::from_str(&start.ports).unwrap_or_default(),
+                egress: start.egress.clone(),
+                secrets,
+                volumes: start.volumes.clone(),
+                limits,
+                idle_pause_s: start.idle_pause_s,
+                retention_ms: self.retention_ms(&quotas),
+                busy: 0,
+                last_active: Instant::now(),
+                lock,
+                metered_at: now_ms(),
+                disk_bytes,
+                moving: None,
+                generation,
+                persistent: true,
+            },
+        );
+        let finished = if self.closing.load(Ordering::SeqCst) {
+            Err(Self::shutting_down())
+        } else {
+            match self.db.finish_cold_start(id, generation, &claim, now_ms()) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ApiError::new(
+                    Code::Conflict,
+                    "sandbox was deleted while it started",
+                )),
+                Err(error) => Err(error.into()),
+            }
+        };
+        if let Err(error) = finished {
+            let record = self.inner().records.remove(id);
+            if let Some(Record {
+                vm: VmState::Running(live),
+                ..
+            }) = record
+            {
+                let Live {
+                    vm, channel, index, ..
+                } = *live;
+                drop(channel);
+                vm.stop().await;
+                self.release(index);
+            }
+            if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+                eprintln!("record {id} as cold: {error}");
+            }
+            return Err(error);
+        }
+        drop(changing);
+        let duration_ms = begin.elapsed().as_millis();
+        eprintln!("{id} started cold in {duration_ms} ms");
+        self.event(
+            "sandbox.cold_started",
+            origin,
+            &start.tenant,
+            id,
+            json!({
+                "generation": generation,
+                "build": start.build,
+                "duration_ms": u64::try_from(duration_ms).unwrap_or(u64::MAX),
+            }),
+        );
+        if let Some(lost) = lost {
+            let (this, id, origin) = (self.clone(), id.to_owned(), origin.clone());
+            tokio::spawn(async move {
+                if let Ok(why) = lost.await {
+                    let reason = "memory pages could not be fetched";
+                    this.lose(&id, generation, &origin, &why, reason).await;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Restores `start`'s build as its sandbox, with new secret
+    /// placeholders. Sets `slot` once it takes one. Warm VMs are not used:
+    /// their jail and network are named after other IDs.
+    async fn boot_cold(
+        &self,
+        start: &db::StartRecord,
+        ready: &Arc<ReadyBuild>,
+        policies: Vec<Policy>,
+        slot: &mut Option<u32>,
+    ) -> Result<Booted, ApiError> {
+        let lazy = match self.templates.ensure_startable(ready).await? {
+            Startable::Local { .. } => None,
+            Startable::Lazy(lazy) => Some(lazy),
+        };
+        let spec: crate::model::TemplateSpec =
+            serde_json::from_str(&start.spec).map_err(ApiError::internal)?;
+        let own = self
+            .secrets
+            .sbox()
+            .open_env(&start.tenant, &start.sandbox, &start.env)
+            .ok_or_else(|| ApiError::internal("the start record's env cannot be read"))?;
+        let mut env: BTreeMap<String, String> = CA_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        env.extend(spec.env);
+        env.extend(own);
+        let mut secrets = Vec::new();
+        for (key, spec) in self.secrets.specs(Some(&start.tenant), &start.secrets)? {
+            let placeholder = ids::placeholder().map_err(ApiError::internal)?;
+            if let Some(var) = &spec.env {
+                env.insert(var.clone(), placeholder.clone());
+            }
+            secrets.push(Attached {
+                name: key,
+                placeholder,
+            });
+        }
+        let mounts = self.volumes.prepare(&start.volumes).await?;
+        let attaches: Vec<_> = mounts.iter().map(|(attach, _)| attach.clone()).collect();
+        let mode = self.network.mode(&policies);
+        let (send, receive) = self.network.rates(&policies);
+        let index = self.take_slot(None).await?;
+        *slot = Some(index);
+        let name = ids::host_name(&start.sandbox);
+        self.network.register(
+            index,
+            &start.sandbox,
+            Some(&start.tenant),
+            policies,
+            secrets.clone(),
+        );
+        let restored = match &lazy {
+            Some(lazy) => {
+                let pages: Arc<dyn PageSource> = lazy.clone();
+                self.node
+                    .restore_lazy(&ready.build, &name, index, mode, &attaches, pages)
+                    .await
+            }
+            None => {
+                self.node
+                    .restore(&ready.build, &name, index, mode, &attaches)
+                    .await
+            }
+        }
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+        let fixups = async {
+            restored.vm.set_rates(send, receive).await?;
+            guest::apply(&restored.channel, new_identity(&name)?).await?;
+            guest::mount(&restored.channel, &mounts).await
+        };
+        if let Err(error) = fixups.await {
+            restored.vm.stop().await;
+            return Err(ApiError::internal(format!("{error:#}")));
+        }
+        Ok(Booted {
+            restored,
+            index,
+            env,
+            secrets,
+            mounted: !mounts.is_empty(),
+        })
+    }
+
     /// Pauses a running sandbox. Does nothing if it is paused.
     pub async fn pause(&self, id: &str, origin: &Origin) -> Result<db::Sandbox, ApiError> {
         let lock = self.record_lock(id).ok_or_else(|| self.not_running(id))?;
@@ -1390,9 +1865,10 @@ impl Sandboxes {
         self.get(id)
     }
 
-    /// Resumes a paused sandbox. Does nothing if it runs.
+    /// Resumes a paused sandbox, or starts a cold one. Does nothing if it
+    /// runs.
     pub async fn resume(&self, id: &str, origin: &Origin) -> Result<db::Sandbox, ApiError> {
-        let lock = self.record_lock(id).ok_or_else(|| self.not_running(id))?;
+        let lock = self.waking_lock(id, origin).await?;
         {
             let _changing = lock.lock().await;
             self.resume_locked(id, origin, "api").await?;
@@ -1421,7 +1897,7 @@ impl Sandboxes {
             .get_tenant(&tenant)?
             .map(|t| t.quotas)
             .unwrap_or_default();
-        let (live, tenant, _pausing) = {
+        let taken = 'take: {
             let mut inner = self.inner();
             let stored = inner.snapshot_bytes(&tenant);
             let record = inner.records.get_mut(id).ok_or_else(not_running)?;
@@ -1438,15 +1914,23 @@ impl Sandboxes {
             if let VmState::Running(_) = record.vm
                 && why != PauseReason::Migrate
                 && why != PauseReason::Pressure
+                && why != PauseReason::Shutdown
                 && let Err(error) = quotas.admit_snapshot(stored, asked)
             {
                 if !only_if_idle {
                     return Err(error);
                 }
-                eprintln!("{id} is idle but stays running: {}", error.message);
-                // Try again after another idle period.
-                record.last_active = Instant::now();
-                return Ok(());
+                if !record.persistent {
+                    eprintln!("{id} is idle but stays running: {}", error.message);
+                    // Try again after another idle period.
+                    record.last_active = Instant::now();
+                    return Ok(());
+                }
+                // A persistent sandbox does not run on unsaved; it stops.
+                eprintln!("{id} is idle but cannot be saved: {}", error.message);
+                let mut record = inner.records.remove(id).ok_or_else(not_running)?;
+                self.settle(id, &mut record, now_ms());
+                break 'take Err(record);
             }
             if only_if_idle {
                 eprintln!("{id} is idle; pausing");
@@ -1464,7 +1948,17 @@ impl Sandboxes {
                 inner: Arc::clone(&self.inner),
                 id: id.to_owned(),
             };
-            (live, tenant, pausing)
+            Ok((live, tenant, pausing))
+        };
+        let (live, tenant, _pausing) = match taken {
+            Ok(taken) => taken,
+            Err(record) => {
+                if let VmState::Running(live) = record.vm {
+                    self.stop(id, record.generation, *live, state::COLD).await;
+                    self.cold_event(origin, &record.tenant, id, "pause_failed");
+                }
+                return Ok(());
+            }
         };
         let begin = Instant::now();
         let dir = self.paused_dir(id);
@@ -1477,11 +1971,23 @@ impl Sandboxes {
             Ok(snapshot_ms) => snapshot_ms,
             Err(error) => {
                 eprintln!("pause {id}: {error:#}");
-                if error.downcast_ref::<spawn_node::Frozen>().is_some() {
+                let (generation, persistent) = self
+                    .inner()
+                    .records
+                    .get(id)
+                    .map_or((0, false), |r| (r.generation, r.persistent));
+                if persistent {
+                    // Its VM is stopped rather than left running unsaved.
                     if let Some(mut record) = self.inner().records.remove(id) {
                         self.settle(id, &mut record, now_ms());
                     }
-                    self.stop(id, *live, state::FAILED).await;
+                    self.stop(id, generation, *live, state::COLD).await;
+                    self.cold_event(origin, &tenant, id, "pause_failed");
+                } else if error.downcast_ref::<spawn_node::Frozen>().is_some() {
+                    if let Some(mut record) = self.inner().records.remove(id) {
+                        self.settle(id, &mut record, now_ms());
+                    }
+                    self.stop(id, generation, *live, state::FAILED).await;
                     self.event(
                         "sandbox.lost",
                         origin,
@@ -1527,13 +2033,16 @@ impl Sandboxes {
                     remaining_ms,
                 };
                 record.disk_bytes = snapshot_bytes;
-                saved(record, remaining_ms)
+                (record.generation, saved(record, remaining_ms))
             })
         };
-        if let Some(saved) = saved
-            && let Err(error) = self.db.set_paused(id, paused_at, &to_json(&saved))
-        {
-            eprintln!("record {id} as paused: {error}");
+        if let Some((generation, saved)) = saved {
+            let written = self
+                .stored(id, &tenant, saved)
+                .and_then(|saved| Ok(self.db.set_paused(id, generation, paused_at, &saved)?));
+            if let Err(error) = written {
+                eprintln!("record {id} as paused: {}", error.message);
+            }
         }
         let total_ms = begin.elapsed().as_millis();
         eprintln!(
@@ -1550,6 +2059,7 @@ impl Sandboxes {
                     PauseReason::Idle => "idle",
                     PauseReason::Migrate => "migrate",
                     PauseReason::Pressure => "memory_pressure",
+                    PauseReason::Shutdown => "shutdown",
                 },
                 "duration_ms": u64::try_from(total_ms).unwrap_or(u64::MAX),
             }),
@@ -1569,7 +2079,7 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
-        let (tenant, remaining_ms, limits, egress, secrets, volumes) = {
+        let (tenant, remaining_ms, limits, egress, secrets, volumes, generation, persistent) = {
             let inner = self.inner();
             let record = inner
                 .records
@@ -1589,6 +2099,8 @@ impl Sandboxes {
                     record.egress.clone(),
                     record.secrets.clone(),
                     record.volumes.clone(),
+                    record.generation,
+                    record.persistent,
                 ),
                 VmState::Running(_) => return Ok(()),
                 VmState::Changing => {
@@ -1610,7 +2122,7 @@ impl Sandboxes {
         let index = self.take_slot(None).await?;
         // If the server dies while the VM runs, the next start must not
         // resume the old snapshot: it treats running sandboxes as lost.
-        if let Err(error) = self.db.set_state(id, state::RUNNING, now_ms()) {
+        if let Err(error) = self.db.set_state(id, generation, state::RUNNING, now_ms()) {
             self.slots.release(index);
             return Err(error.into());
         }
@@ -1649,20 +2161,25 @@ impl Sandboxes {
                 self.node.remove_failed(&name, index).await;
                 self.release(index);
                 if let ResumeError::Before(_) = error {
-                    if let Err(error) = self.db.set_state(id, state::PAUSED, now_ms()) {
-                        eprintln!("record {id} as paused: {error}");
-                    }
+                    self.record_end(id, generation, state::PAUSED);
                 } else if reason == "migrate" {
                     if let Some(mut record) = self.inner().records.remove(id) {
                         self.settle(id, &mut record, now_ms());
                     }
                     remove_dir(&dir);
+                } else if persistent {
+                    if let Some(mut record) = self.inner().records.remove(id) {
+                        self.settle(id, &mut record, now_ms());
+                    }
+                    remove_dir(&dir);
+                    self.db.set_cold(id, generation)?;
+                    self.cold_event(origin, &tenant, id, "resume_failed");
                 } else {
                     if let Some(mut record) = self.inner().records.remove(id) {
                         self.settle(id, &mut record, now_ms());
                     }
                     remove_dir(&dir);
-                    self.db.set_state(id, state::FAILED, now_ms())?;
+                    self.db.set_state(id, generation, state::FAILED, now_ms())?;
                     self.event(
                         "sandbox.lost",
                         origin,
@@ -1676,7 +2193,11 @@ impl Sandboxes {
                 )));
             }
         };
-        let expires_at = now_ms().saturating_add(remaining_ms);
+        let expires_at = if persistent {
+            i64::MAX
+        } else {
+            now_ms().saturating_add(remaining_ms)
+        };
         let live = Live {
             vm: restored.vm,
             channel: restored.channel,
@@ -1684,7 +2205,7 @@ impl Sandboxes {
             expires_at,
             volumes: !volumes.is_empty(),
         };
-        if let Err(error) = self.db.set_resumed(id, expires_at) {
+        if let Err(error) = self.db.set_resumed(id, generation, expires_at) {
             eprintln!("record {id} as resumed: {error}");
         }
         let disk_bytes = disk_bytes(&live.vm);
@@ -1812,9 +2333,10 @@ impl Sandboxes {
         self.inner().records.get(id)?.ports.get(&port).cloned()
     }
 
-    /// Changes a running or paused sandbox. A paused one is saved again.
+    /// Changes a running or paused sandbox. A paused one is saved again,
+    /// and a persistent one's start record gets its ports.
     fn with_record<T>(&self, id: &str, f: impl FnOnce(&mut Record) -> T) -> Result<T, ApiError> {
-        let (result, saved) = {
+        let (result, saved, ports) = {
             let mut inner = self.inner();
             let Some(record) = inner.records.get_mut(id) else {
                 drop(inner);
@@ -1822,13 +2344,22 @@ impl Sandboxes {
             };
             let result = f(record);
             let saved = match record.vm {
-                VmState::Paused { remaining_ms, .. } => Some(saved(record, remaining_ms)),
+                VmState::Paused { remaining_ms, .. } => Some((
+                    record.tenant.clone(),
+                    record.generation,
+                    saved(record, remaining_ms),
+                )),
                 _ => None,
             };
-            (result, saved)
+            let ports = record.persistent.then(|| to_json(&record.ports));
+            (result, saved, ports)
         };
-        if let Some(saved) = saved {
-            self.db.set_saved(id, &to_json(&saved))?;
+        if let Some((tenant, generation, saved)) = saved {
+            let saved = self.stored(id, &tenant, saved)?;
+            self.db.set_saved(id, generation, &saved)?;
+        }
+        if let Some(ports) = ports {
+            self.db.set_start_ports(id, &ports, now_ms())?;
         }
         Ok(result)
     }
@@ -1890,7 +2421,7 @@ impl Sandboxes {
     }
 
     /// Deletes running sandboxes past their `expires_at` and paused ones
-    /// past their retention.
+    /// past their retention. Persistent sandboxes do not expire.
     pub fn expire(&self) {
         let now = now_ms();
         let due: Vec<(String, Arc<tokio::sync::Mutex<()>>, &'static str)> = self
@@ -1900,6 +2431,7 @@ impl Sandboxes {
             .filter(|(_, record)| !record.is_moving())
             .filter_map(|(id, record)| {
                 let reason = match &record.vm {
+                    _ if record.persistent => return None,
                     VmState::Running(live) if live.expires_at <= now => "timeout",
                     VmState::Paused { paused_at, .. }
                         if paused_at.saturating_add(record.retention_ms) <= now =>
@@ -1938,11 +2470,23 @@ impl Sandboxes {
         let files = self.templates.backend().snapshot_files();
         for (sandbox, saved) in self.db.paused_sandboxes()? {
             let dir = self.paused_dir(&sandbox.id);
-            let saved: Option<Saved> = saved.and_then(|s| serde_json::from_str(&s).ok());
+            let saved = saved.and_then(|s| self.parse_saved(&sandbox.id, &sandbox.tenant, &s));
             let complete = files.iter().all(|name| dir.join(name).exists());
             let (Some(saved), true) = (saved, complete) else {
+                if sandbox.persistent {
+                    self.db.set_cold(&sandbox.id, sandbox.generation)?;
+                    let origin = Origin::system();
+                    self.cold_event(
+                        &origin,
+                        &sandbox.tenant,
+                        &sandbox.id,
+                        "paused_files_missing",
+                    );
+                    continue;
+                }
                 eprintln!("{}: paused files are missing; marking failed", sandbox.id);
-                self.db.set_state(&sandbox.id, state::FAILED, now_ms())?;
+                self.db
+                    .set_state(&sandbox.id, sandbox.generation, state::FAILED, now_ms())?;
                 self.event(
                     "sandbox.lost",
                     &Origin::system(),
@@ -2006,6 +2550,8 @@ impl Sandboxes {
             metered_at: now_ms(),
             disk_bytes: stored_bytes(dir),
             moving: None,
+            generation: sandbox.generation,
+            persistent: sandbox.persistent,
         })
     }
 
@@ -2072,9 +2618,11 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
-        let parsed: Saved = serde_json::from_str(saved)
-            .map_err(|error| ApiError::invalid(format!("saved state: {error}")))?;
+        let parsed = self
+            .parse_saved(&sandbox.id, &sandbox.tenant, saved)
+            .ok_or_else(|| ApiError::invalid("saved state cannot be read"))?;
         let id = sandbox.id.clone();
+        let stored = self.stored(&id, &sandbox.tenant, parsed.clone())?;
         let dir = self.paused_dir(&id);
         let paused_at = sandbox.paused_at.unwrap_or_else(now_ms);
         let sandbox = db::Sandbox {
@@ -2105,7 +2653,7 @@ impl Sandboxes {
             inner.records.insert(id.clone(), record);
         }
         let _changing = lock.lock().await;
-        let prior = match self.db.take_over(&sandbox, paused_at, saved) {
+        let prior = match self.db.take_over(&sandbox, paused_at, &stored) {
             Ok(prior) => prior,
             Err(error) => {
                 self.inner().records.remove(&id);
@@ -2169,12 +2717,34 @@ impl Sandboxes {
         Ok(())
     }
 
-    /// Stops every running VM; paused sandboxes stay paused. New creates
+    /// Stops every running VM; paused sandboxes stay paused. Running
+    /// persistent sandboxes are paused first, for up to
+    /// `shutdown_pause_s`; ones not paused by then become cold. New creates
     /// and resumes fail from now on.
     pub async fn stop_all(&self) {
         self.closing.store(true, Ordering::SeqCst);
         for vm in self.warm.close() {
             self.stop_warm(vm).await;
+        }
+        let persistent: Vec<(String, Arc<tokio::sync::Mutex<()>>)> = self
+            .inner()
+            .records
+            .iter()
+            .filter(|(_, r)| r.persistent && matches!(r.vm, VmState::Running(_)))
+            .map(|(id, record)| (id.clone(), Arc::clone(&record.lock)))
+            .collect();
+        let pauses = persistent.into_iter().map(|(id, lock)| async move {
+            let _changing = lock.lock().await;
+            let _ = self
+                .pause_locked(&id, PauseReason::Shutdown, &Origin::system())
+                .await;
+        });
+        let limit = Duration::from_secs(self.settings.shutdown_pause_s);
+        if tokio::time::timeout(limit, futures_util::future::join_all(pauses))
+            .await
+            .is_err()
+        {
+            eprintln!("persistent sandboxes did not all pause in {limit:?}");
         }
         let all: Vec<(String, Arc<tokio::sync::Mutex<()>>)> = self
             .inner()
@@ -2188,20 +2758,45 @@ impl Sandboxes {
             if let Some(record) = record.as_mut() {
                 self.settle(&id, record, now_ms());
             }
-            if let Some(Record {
-                vm: VmState::Running(live),
-                tenant,
-                ..
-            }) = record
-            {
-                self.stop(&id, *live, state::DELETED).await;
-                self.event(
-                    "sandbox.killed",
-                    &Origin::system(),
-                    &tenant,
-                    &id,
-                    json!({ "reason": "server stopped" }),
-                );
+            match record {
+                Some(Record {
+                    vm: VmState::Running(live),
+                    tenant,
+                    persistent: true,
+                    generation,
+                    ..
+                }) => {
+                    self.stop(&id, generation, *live, state::COLD).await;
+                    self.cold_event(&Origin::system(), &tenant, &id, "shutdown");
+                }
+                // A pause cut short: its VM is gone with it.
+                Some(Record {
+                    vm: VmState::Changing,
+                    tenant,
+                    persistent: true,
+                    generation,
+                    ..
+                }) => {
+                    remove_dir(&self.paused_dir(&id));
+                    self.record_end(&id, generation, state::COLD);
+                    self.cold_event(&Origin::system(), &tenant, &id, "shutdown");
+                }
+                Some(Record {
+                    vm: VmState::Running(live),
+                    tenant,
+                    generation,
+                    ..
+                }) => {
+                    self.stop(&id, generation, *live, state::DELETED).await;
+                    self.event(
+                        "sandbox.killed",
+                        &Origin::system(),
+                        &tenant,
+                        &id,
+                        json!({ "reason": "server stopped" }),
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -2218,6 +2813,7 @@ fn is_idle(record: &Record) -> bool {
 fn saved(record: &Record, remaining_ms: i64) -> Saved {
     Saved {
         env: record.env.clone(),
+        env_sealed: None,
         ports: record.ports.clone(),
         secrets: record
             .secrets
@@ -2254,6 +2850,32 @@ fn stored_bytes(path: &Path) -> u64 {
     }
 }
 
+/// `saved` as stored, with its env sealed to the sandbox.
+fn seal_saved(
+    sbox: &SecretBox,
+    tenant: &str,
+    id: &str,
+    mut saved: Saved,
+) -> Result<String, ApiError> {
+    let sealed = sbox
+        .seal_env(tenant, id, &saved.env)
+        .map_err(ApiError::internal)?;
+    saved.env = BTreeMap::new();
+    saved.env_sealed = Some(B64.encode(sealed));
+    Ok(to_json(&saved))
+}
+
+/// Reads a stored or received `Saved`. Ones stored before env was sealed
+/// hold it in plain.
+fn open_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Saved> {
+    let mut saved: Saved = serde_json::from_str(json).ok()?;
+    if let Some(sealed) = saved.env_sealed.take() {
+        let sealed = B64.decode(sealed).ok()?;
+        saved.env = sbox.open_env(tenant, id, &sealed)?;
+    }
+    Some(saved)
+}
+
 fn to_json(value: &impl Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
@@ -2286,4 +2908,35 @@ pub fn now_ms() -> i64 {
 
 fn round(ms: f64) -> f64 {
     (ms * 10.0).round() / 10.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_env_is_sealed_to_its_sandbox() {
+        let sbox = SecretBox::new(&[7; 32]).unwrap();
+        let saved = Saved {
+            env: BTreeMap::from([("TOKEN".to_owned(), "hunter2".to_owned())]),
+            env_sealed: None,
+            ports: BTreeMap::new(),
+            secrets: Vec::new(),
+            vcpus: 1,
+            memory_mib: 256,
+            remaining_ms: 5,
+        };
+        let stored = seal_saved(&sbox, "t", "sbx_a", saved.clone()).unwrap();
+        assert!(!stored.contains("hunter2"));
+        let opened = open_saved(&sbox, "t", "sbx_a", &stored).unwrap();
+        assert_eq!(opened.env, saved.env);
+        assert!(open_saved(&sbox, "t", "sbx_b", &stored).is_none());
+        assert!(open_saved(&sbox, "u", "sbx_a", &stored).is_none());
+        // Rows stored before env was sealed still read.
+        let plain = to_json(&saved);
+        assert_eq!(
+            open_saved(&sbox, "t", "sbx_a", &plain).unwrap().env,
+            saved.env
+        );
+    }
 }

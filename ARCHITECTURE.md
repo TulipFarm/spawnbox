@@ -160,6 +160,8 @@ flowchart LR
 - A build is kept across restarts. It is rebuilt only when the kernel, base
   disk or Firecracker version changes, because a snapshot only restores
   on the same versions.
+- A build that a persistent sandbox's start record names is kept until
+  that sandbox is deleted.
 
 ### Build store
 
@@ -285,6 +287,13 @@ stateDiagram-v2
     running --> deleted: DELETE or timeout_s
     paused --> deleted: DELETE or paused retention
     running --> failed: VM lost or froze
+    running --> cold: persistent, VM lost, pause failed or refused
+    paused --> cold: persistent, resume failed
+    cold --> starting: any call that wakes it (claim)
+    starting --> running: cold start done
+    starting --> cold: start failed or claim expired
+    cold --> deleted: DELETE
+    starting --> deleted: DELETE
     deleted --> [*]
     failed --> [*]
 ```
@@ -299,6 +308,40 @@ stateDiagram-v2
   survive server restarts.
 - Each network namespace gives the guest's gateway the same fixed MAC
   address, so a resumed guest's cached ARP entry still works.
+- The env in a paused sandbox's saved row is sealed with ChaCha20-Poly1305
+  under `secrets.key`. The sandbox ID and tenant are its associated data.
+  Rows stored before this are read in plain.
+
+### Persistent sandboxes
+
+A persistent sandbox has no timeout and is never deleted by retention.
+Instead of `failed` or `deleted`, it becomes `cold` when its memory is
+lost. A cold sandbox has no VM.
+
+- **Start record.** The create writes a start record in the same
+  transaction as the sandbox row. It holds the template, build, a copy of
+  the template spec, limits, network rules, secret names, volumes,
+  `idle_pause_s`, published ports and the env, sealed like above. A
+  resume does not clear it. Publishing a port updates it.
+- **Build roots.** A build in a start record is a root. The host keeps
+  it, and the build store does not collect it, even after a newer build of
+  the template is ready.
+- **Cold start.** A call that wakes a cold sandbox moves its row from
+  `cold` to `starting` in one conditional update. That update adds 1 to
+  `generation` and writes a claim with a 120 s deadline. Calls on this
+  host wait for the same start. The start restores the build into a new
+  jail, with new secret placeholders and the env from the start record.
+  It does not use warm VMs: their jail and network have another ID. Only
+  an update for the same generation and claim makes the row `running`.
+  If the start fails or the deadline passes, the row goes back to `cold`
+  and the new VM is stopped.
+- **Delete.** A delete of a `cold` or `starting` sandbox marks it deleted
+  at once. A start that ends later fails its update and stops its VM.
+- **Generations.** Calls in progress and lifecycle updates carry the
+  generation they started with. An update from an older generation does
+  nothing.
+- **One host.** Persistent sandboxes are placed on the primary only.
+  Moving or draining one gives `409 conflict`.
 
 ## Volumes
 
@@ -528,7 +571,9 @@ flowchart TB
 - **Admission.** Create and resume count the tenant's running and starting
   sandboxes against `running_sandboxes`, `running_vcpus` and
   `running_memory_mib` under one lock, so parallel requests cannot
-  overshoot. Pause works the same way for `snapshot_storage_gib`.
+  overshoot. Pause works the same way for `snapshot_storage_gib`. An idle
+  sandbox that the quota refuses keeps running, except a persistent one:
+  it stops and becomes `cold` with the reason `pause_failed`.
 
 ## Events and usage
 
@@ -765,15 +810,18 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 
 ## Crash recovery and shutdown
 
-- **SIGTERM.** The server stops taking requests, stops every running VM,
-  flushes events and usage, and removes its firewall rules. Paused
-  sandboxes stay on disk.
+- **SIGTERM.** The server stops taking requests. It pauses running
+  persistent sandboxes, for up to `--shutdown-pause-s` (default 30).
+  Then it stops every running VM, flushes events and usage, and removes
+  its firewall rules. Paused sandboxes stay on disk. Persistent sandboxes
+  that did not pause become `cold`.
 - **Restart.** Ready builds and paused sandboxes are loaded again; nothing
   is rebuilt.
 - **Crash.** On the next start, leftover jails, namespaces, firewall
   rules, Firecracker processes and runsc containers are removed. Sandboxes that were running
   are marked deleted with a `sandbox.lost` event, because their memory is
-  gone.
+  gone. Persistent sandboxes that were running or starting become `cold`
+  with a `sandbox.cold` event instead. The next call starts them again.
 
 ## Security boundaries
 

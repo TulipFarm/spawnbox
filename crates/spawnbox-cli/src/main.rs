@@ -165,6 +165,9 @@ pub struct CreateArgs {
     /// Seconds without requests before the sandbox pauses (0: never)
     #[arg(long)]
     pub idle_pause: Option<u64>,
+    /// Keep the sandbox until it is deleted; it never expires
+    #[arg(long, conflicts_with = "timeout")]
+    pub persistent: bool,
     /// KEY=VALUE, can repeat
     #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
     pub env: Vec<String>,
