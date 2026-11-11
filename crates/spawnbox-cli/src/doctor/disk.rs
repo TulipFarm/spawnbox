@@ -95,13 +95,24 @@ pub fn encryption(host: &dyn Host, mountinfo: &str, data_dir: &Path, path: &Path
     }
 }
 
+/// Prefixes cryptsetup gives the device-mapper UUIDs of the formats that
+/// encrypt. Its integrity and verity devices also start with `CRYPT-` but
+/// do not.
+const ENCRYPTING: [&str; 5] = [
+    "CRYPT-LUKS1-",
+    "CRYPT-LUKS2-",
+    "CRYPT-PLAIN-",
+    "CRYPT-TCRYPT-",
+    "CRYPT-BITLK-",
+];
+
 /// `name` is under `/sys/class/block`. Encrypted if it is a dm-crypt
 /// device, or every device it is built on is encrypted.
 fn classify(host: &dyn Host, name: &str, depth: u8) -> Disk {
     let dir = format!("/sys/class/block/{name}");
     if host
         .read(&format!("{dir}/dm/uuid"))
-        .is_some_and(|uuid| uuid.starts_with("CRYPT-"))
+        .is_some_and(|uuid| ENCRYPTING.iter().any(|p| uuid.starts_with(p)))
     {
         return Disk::Crypt(name.to_owned());
     }
@@ -347,6 +358,35 @@ mod tests {
             panic!("not a warning");
         };
         assert!(detail.contains("sdb, which is not encrypted"), "{detail}");
+    }
+
+    #[test]
+    fn integrity_and_verity_devices_are_not_encryption() {
+        for uuid in ["CRYPT-INTEGRITY-x", "CRYPT-VERITY-x"] {
+            let plain = host(
+                &[("/sys/dev/block/253:1", "../dm-1")],
+                &[
+                    ("/sys/class/block/dm-1/dm/uuid", uuid),
+                    ("/sys/class/block/dm-1/slaves/sdb", ""),
+                ],
+            );
+            let Outcome::Warn(detail) = check(&plain, "/var/lib/spawn box") else {
+                panic!("{uuid} passed");
+            };
+            assert!(detail.contains("sdb, which is not encrypted"), "{detail}");
+            let over_luks = host(
+                &[("/sys/dev/block/253:1", "../dm-1")],
+                &[
+                    ("/sys/class/block/dm-1/dm/uuid", uuid),
+                    ("/sys/class/block/dm-1/slaves/dm-0", ""),
+                    ("/sys/class/block/dm-0/dm/uuid", "CRYPT-LUKS1-x"),
+                ],
+            );
+            assert_eq!(
+                check(&over_luks, "/var/lib/spawn box"),
+                Outcome::Pass("/var/lib/spawn box is on dm-crypt (dm-0)".to_owned())
+            );
+        }
     }
 
     #[test]
