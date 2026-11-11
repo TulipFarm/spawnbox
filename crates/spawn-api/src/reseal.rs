@@ -16,13 +16,15 @@ use crate::secretbox::{SandboxEnv, SecretBox};
 /// The key of the sealed blob in a stored saved state.
 pub const SEALED: &str = "sealed";
 
-/// Rows rewritten, and rows that could not be read, such as ones sealed
-/// under another key.
+/// Rows rewritten, and the sandboxes whose env could not be read, such as
+/// ones sealed under another key.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Resealed {
     pub start_records: usize,
     pub saved: usize,
     pub unreadable: Vec<String>,
+    /// Whether the SQLite file was rebuilt, which happens once.
+    pub vacuumed: bool,
 }
 
 pub fn reseal(db: &Db, sbox: &SecretBox) -> Result<Resealed> {
@@ -60,6 +62,7 @@ pub fn reseal(db: &Db, sbox: &SecretBox) -> Result<Resealed> {
     if done.start_records + done.saved > 0 {
         db.truncate_log()?;
     }
+    done.vacuumed = db.vacuum_once()?;
     Ok(done)
 }
 
@@ -68,7 +71,9 @@ pub fn reseal(db: &Db, sbox: &SecretBox) -> Result<Resealed> {
 /// services apart, in `env_sealed` and `services_sealed`.
 fn reseal_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Option<String>> {
     let mut saved: Map<String, Value> = serde_json::from_str(json).ok()?;
-    if saved.contains_key(SEALED) {
+    if let Some(sealed) = saved.get(SEALED) {
+        let sealed = B64.decode(sealed.as_str()?).ok()?;
+        sbox.open_sandbox_env(tenant, id, &sealed)?;
         return Some(None);
     }
     let mut legacy = |plain: &str, sealed: &str| -> Option<(Option<Vec<u8>>, Value)> {
@@ -271,6 +276,12 @@ pub(crate) mod tests {
 
         let again = reseal(&db, &sbox).unwrap();
         assert_eq!((again.start_records, again.saved), (0, 0));
+
+        // Under another key, none of it can be read, sealed rows included.
+        let other = SecretBox::new(&[3; 32]).unwrap();
+        let mut lost = reseal(&db, &other).unwrap().unreadable;
+        lost.sort();
+        assert_eq!(lost, ["sbx_foreign", "sbx_plain", "sbx_split", "sbx_start"]);
     }
 
     #[test]
@@ -319,6 +330,58 @@ pub(crate) mod tests {
         assert_eq!(reseal(&db, &sbox).unwrap().saved, 20);
         assert!(!on_disk(&path, CANARY));
         assert!(!on_disk(&path, "sandbox-secret-env"));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clears_env_that_earlier_versions_freed() {
+        let dir = std::env::temp_dir().join(format!("spawnbox-vacuum-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spawnbox.db");
+        let db = Db::open(&path).unwrap();
+        for i in 0..40 {
+            db.insert_sandbox(&row(&format!("sbx_{i}")))
+                .unwrap()
+                .unwrap();
+        }
+        drop(db);
+        // An earlier version: its schema, and no secure_delete.
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "PRAGMA secure_delete = OFF;
+             ALTER TABLE sandboxes RENAME COLUMN saved_state TO saved;
+             DROP TABLE upkeep;",
+        )
+        .unwrap();
+        let version: i64 = old
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        old.pragma_update(None, "user_version", version - 1)
+            .unwrap();
+        let json = serde_json::json!({
+            "env": { "TOKEN": "sandbox-secret-env" }, "ports": {}, "secrets": [],
+            "vcpus": 1, "memory_mib": 256, "remaining_ms": 5, "services": plain().services,
+        });
+        old.execute("UPDATE sandboxes SET saved = ?1", [json.to_string()])
+            .unwrap();
+        // Resumed, and ended and removed.
+        old.execute_batch(
+            "UPDATE sandboxes SET saved = NULL WHERE id LIKE 'sbx_1%';
+             DELETE FROM sandboxes WHERE id LIKE 'sbx_2%';
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        drop(old);
+        assert!(on_disk(&path, CANARY));
+
+        let db = Db::open(&path).unwrap();
+        let sbox = SecretBox::new(&[7; 32]).unwrap();
+        let done = reseal(&db, &sbox).unwrap();
+        assert!(done.vacuumed);
+        assert!(!on_disk(&path, CANARY));
+        assert!(!on_disk(&path, "sandbox-secret-env"));
+        assert!(!reseal(&db, &sbox).unwrap().vacuumed);
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
