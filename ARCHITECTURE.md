@@ -94,7 +94,7 @@ The Rust workspace has one crate per part:
 | `spawn-guest` | Inside every VM | PID 1: mounts the root overlay, sets up the network, keeps services running and starts the agent, which serves gRPC (exec, files, terminals, ports, identity, services) |
 | `spawn-proto` | Both | The gRPC contract between host and guest |
 | `spawn-bench` | Host | Boot, snapshot and restore benchmark |
-| `spawnbox-cli` | Anywhere | The `spawnbox` command: an HTTP and WebSocket client for the API, and `doctor` host checks |
+| `spawnbox-cli` | Anywhere | The `spawnbox` command: an HTTP and WebSocket client for the API, and `doctor` host checks, including whether the data directory is on an encrypted disk |
 
 Outside the workspace: `guest/kernel` (a Linux 6.18 LTS config for
 Firecracker), `guest/images/debian` (the Debian 13 base disk), and pinned
@@ -309,9 +309,18 @@ stateDiagram-v2
   survive server restarts.
 - Each network namespace gives the guest's gateway the same fixed MAC
   address, so a resumed guest's cached ARP entry still works.
-- The env in a paused sandbox's saved row is sealed with ChaCha20-Poly1305
-  under `secrets.key`. The sandbox ID and tenant are its associated data.
-  Rows stored before this are read in plain.
+- The env of a paused sandbox is sealed with ChaCha20-Poly1305 under
+  `secrets.key`. One blob holds the sandbox env and the env of every
+  service, so no value can be moved to another variable or service
+  without breaking the tag. The associated data is a format version, the
+  tenant and the sandbox ID. A fork seals the copy's env under its new ID.
+- At start, the lease holder seals env that earlier versions stored in
+  plain or in separate blobs (`reseal.rs`). Rows changed meanwhile are
+  left for the next start. SQLite runs with `secure_delete` and truncates
+  its WAL after this, so no plain copy stays in free pages. On Postgres,
+  old row versions stay until `VACUUM`.
+- Memory files and disks are not encrypted; `spawnbox doctor` warns when
+  `<data-dir>` is not on a dm-crypt disk.
 
 ### Persistent sandboxes
 
@@ -322,9 +331,12 @@ lost. A cold sandbox has no VM.
 - **Start record.** The create writes a start record in the same
   transaction as the sandbox row. It holds the template, build, a copy of
   the template spec, limits, network rules, secret names, volumes,
-  `idle_pause_s`, published ports, and the env and services, sealed like
-  above. A
-  resume does not clear it. Publishing a port updates it.
+  `idle_pause_s`, published ports, and the sandbox's own env and services,
+  sealed like above. A resume does not clear it. Publishing a port updates
+  it.
+- **Protected env.** A sandbox created with env values, its own or a
+  service's, cannot be snapshotted to a template: the template spec would
+  show them. The snapshot gives `409 protected_env`. Forks keep the flag.
 - **Build roots.** A build in a start record is a root. The host keeps
   it, and the build store does not collect it, even after a newer build of
   the template is ready.
@@ -392,9 +404,9 @@ flowchart LR
   watch ends when the VM pauses or stops, and opens again after a resume.
   A watch after a create or cold start begins from the last event before
   `Start`, so no event is lost.
-- **Storage.** The service list is part of the start record and the saved
-  row of a paused sandbox. Both are sealed under `secrets.key`, because
-  the service env can hold secrets. API responses show only names.
+- **Storage.** The service list is sealed with the sandbox env in the
+  start record and the saved row of a paused sandbox, because the service
+  env can hold secrets. API responses, events and logs show only names.
 - **Previews.** The service `port` is published with its `access` when
   the sandbox is created. A preview request to that port asks the guest
   for the service's state and waits up to 30 s for it to be healthy.
@@ -796,6 +808,10 @@ sequenceDiagram
   makes resume and delete return `409` on the source.
 - A move pauses for a moment; there is no live migration. Moves between
   CPU models are refused, as a snapshot depends on CPU features.
+- **Env.** Workers need not share `secrets.key`. The source opens the
+  saved env and sends it in plain inside the package, only over the
+  fleet's mutual TLS. The target seals it under its own key and refuses a
+  package with a sealed env.
 - **Safety.** A moved ID stays in the heartbeat `keep` list for 60
   seconds, so a late heartbeat does not mark it lost. If a worker still
   reports a sandbox that now lives elsewhere, the heartbeat reply tells

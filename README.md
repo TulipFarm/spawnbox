@@ -1398,6 +1398,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   [Keep a sandbox until you delete it](#keep-a-sandbox-until-you-delete-it).
 - The create response has `timings_ms` and `started_from`. The value of
   `started_from` is `warm_pool` or `build`.
+- For a token or password that the sandbox sends in an HTTP header, use a
+  secret with `env`, not `env`. The sandbox then sees only a placeholder,
+  and the value never enters the VM. Refer to [Secrets](#secrets).
+- Responses, events and logs never show env values.
 - Each host adds up the `memory_mib` of its running sandboxes. A create,
   fork or resume that goes over `--memory-overcommit-pct` of the host
   memory (default 150) gives `503 no_capacity` with `Retry-After: 30`.
@@ -1437,7 +1441,13 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   after `--paused-retention-s` (default 7 days). Persistent sandboxes are
   not deleted.
 - Spawnbox encrypts the env of paused and persistent sandboxes on disk
-  with `--secrets-key-file`.
+  with `--secrets-key-file`. The env of the sandbox and of all its
+  services is one ChaCha20-Poly1305 value, bound to the tenant and the
+  sandbox ID. A value cannot be moved to another variable, service or
+  sandbox. At start, Spawnbox encrypts env that an earlier version kept
+  in another form.
+- Memory files and disks are not encrypted. Put `<data-dir>` on an
+  encrypted disk; `spawnbox doctor` warns when it is not.
 - On Firecracker, a pause writes only the memory that changed since the
   sandbox was started or resumed. Spawnbox then merges it with the earlier
   memory in the background; a resume or a move waits for that merge. The
@@ -1451,15 +1461,19 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   - Each copy gets the memory, processes and files of the sandbox. It also
     gets its template, labels, env, secrets, network rules and the time
     that remains before its timeout.
-  - Each copy gets its own ID, hostname and random numbers.
+  - Each copy gets its own ID, hostname and random numbers. Its env is
+    encrypted again for its own ID.
   - Each copy counts against the quotas of the tenant.
   - On the test server, 10 copies take approximately 0.7 s.
 - `POST /v1/sandboxes/{id}:snapshot` saves a running sandbox as a new
   template. Field: `name`.
   - The response is `201` with `template`, `build` and `spec`.
   - The template is in the tenant of the sandbox. Its `env` is the env of
-    the sandbox. Secrets are not saved. Add them again when you create a
+    its template. Secrets are not saved. Add them again when you create a
     sandbox from the template.
+  - A sandbox created with `env`, or with a service that has `env`, gives
+    `409 protected_env`, because the template would show the values. Use
+    secrets for these values, or put them in the template spec.
   - The template has a `snapshot` field. You cannot rebuild the template.
   - Without a build store, sandboxes from the template start only on the
     host of the original sandbox. With a build store, a host with the same
@@ -1601,7 +1615,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 - These calls resume a paused or `cold` sandbox, and count as activity.
   The work of a service in the VM does not keep the sandbox awake.
 - Spawnbox never shows the env values of a service. It encrypts the
-  services of paused and persistent sandboxes on disk like the env.
+  services of paused and persistent sandboxes on disk, in one value with
+  the env of the sandbox.
 - A fork copies the services and their processes. A snapshot template
   does not keep the list of services.
 
@@ -1664,6 +1679,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   secret. They never show the value.
 - Spawnbox encrypts each value with ChaCha20-Poly1305. The key is in
   `<data-dir>/secrets.key`, or in `--secrets-key-file`.
+- Use a secret for each value that a sandbox sends in an HTTP header. With
+  `env`, the sandbox gets a placeholder in that variable, and the proxy
+  puts the value in the request. Code in the sandbox cannot read or leak
+  the value.
 
   > **CAUTION:** Make a backup copy of `secrets.key`. Without this file,
   > you cannot read your secrets.
@@ -1957,6 +1976,8 @@ Type these commands on the host.
 | A request gives `401 unauthorized` | The key is wrong or missing | Make sure that `$A` contains `Authorization: Bearer` and your full key. |
 | A request gives `429 quota_exceeded` | The tenant is at a quota limit | Delete or pause sandboxes, or increase the quota with `PATCH /v1/tenants/{id}`. |
 | A create request gives `409` | The template build is not ready | Wait until `latest_build.state` is `ready`. |
+| A snapshot gives `409 protected_env` | The sandbox was created with `env` values, which the template would show | Use secrets for the values, or create the sandbox without `env`. |
+| The log shows `cannot read the stored env of ...` at start | `secrets.key` is not the key that encrypted them | Put back the earlier `secrets.key`, or `--secrets-key-file`, and restart. |
 | A move gives `no host has the same backend, kernel, base disk, Firecracker or runsc, egress CA and CPU model` | The hosts have different backends, files or CPUs | Compare `fingerprint`, `backend` and `cpu` in `GET /v1/nodes`. Sandboxes cannot move between Firecracker and gVisor hosts. Copy `/opt/spawnbox/vmlinux` and `/opt/spawnbox/rootfs.ext4` from the primary to the worker, then restart the worker. |
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |
 | A worker stops with `the join token is unknown, used or expired` | The token was used or is older than one hour | Make a new token on the primary. |
@@ -1970,7 +1991,13 @@ spawnbox doctor
 
 `doctor` checks cgroup v2, and shows the backend that the host uses:
 Firecracker if KVM operates, or gVisor if it does not. Exit code `0`
-means that all checks passed.
+means that no check failed.
+
+`doctor` also gives `WARN` when `--data-dir` (default `/var/lib/spawnbox`)
+is not on a dm-crypt or LUKS disk. Memory files and disks of sandboxes are
+not encrypted. On AWS, the encryption of an EBS volume cannot be seen from
+the instance, so `doctor` says that it cannot tell. Check the volume in
+the EC2 console. Instance store disks are encrypted by AWS.
 
 To remove Spawnbox, type `sudo /opt/spawnbox/install.sh --uninstall`. This
 keeps your data. To remove the data too, type
