@@ -2865,6 +2865,7 @@ name = "spawn-guest"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "hyper-util",
  "libc",
  "nix",
  "oci-client",
@@ -2877,6 +2878,7 @@ dependencies = [
  "tokio-stream",
  "tokio-vsock",
  "tonic",
+ "tower",
 ]
 
 [[package]]

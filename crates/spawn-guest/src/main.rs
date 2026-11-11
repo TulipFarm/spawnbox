@@ -1,7 +1,7 @@
 //! `spawn-guest`: the agent inside every Spawnbox VM.
 //!
-//! As PID 1 it prepares the system, starts itself again as the agent, and
-//! reaps orphaned processes. The agent serves gRPC to the host over vsock,
+//! As PID 1 it prepares the system, starts itself again as the agent, keeps
+//! the sandbox's services running, and reaps orphaned processes. The agent serves gRPC to the host over vsock,
 //! or over TCP under gVisor.
 
 // Portable helpers are used only by the Linux agent but tested on every OS.
@@ -21,6 +21,10 @@ mod init;
 mod ports;
 #[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
+mod reaper;
+#[cfg(target_os = "linux")]
+mod supervisor;
 #[cfg(target_os = "linux")]
 mod unpack;
 #[cfg(target_os = "linux")]

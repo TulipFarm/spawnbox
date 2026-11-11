@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{Pid, chdir, pivot_root};
+use nix::unistd::{chdir, pivot_root};
+
+use crate::reaper::Reaper;
+use crate::supervisor::{self, Supervisor};
 
 /// Where the writable disk stays mounted after the switch to the overlay.
 pub const UPPER_MOUNT: &str = "/spawn/upper";
 
-const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 struct Mount {
     target: &'static str,
@@ -95,30 +97,61 @@ pub fn run() -> ExitCode {
         prepare_vm();
     }
 
+    // Reaps every orphan, and tells the agent's and the services' starters
+    // when their children exit.
+    let reaper = Reaper::pid1();
+    start_supervisor(&reaper);
+
     loop {
         let mut agent = Command::new("/proc/self/exe");
         agent.arg(crate::AGENT_FLAG).env_clear();
         if gvisor {
             agent.env(crate::BACKEND_ENV, "gvisor");
         }
-        let agent = match agent
+        agent
             .env("PATH", PATH)
             .env("HOME", "/root")
             .env("LANG", "C.UTF-8")
-            .current_dir("/")
-            .spawn()
-        {
-            Ok(child) => Pid::from_raw(child.id() as i32),
-            Err(error) => {
-                eprintln!("spawn-guest: cannot start agent: {error}");
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-        };
-
-        reap_until_exit(agent);
+            .current_dir("/");
+        let (exited, exit) = std::sync::mpsc::channel();
+        if let Err(error) = reaper.spawn(agent, move |_| {
+            let _ = exited.send(());
+        }) {
+            eprintln!("spawn-guest: cannot start agent: {error}");
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        let _ = exit.recv();
         eprintln!("spawn-guest: agent exited; restarting");
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Runs the services' supervisor on its own thread, so it outlives the
+/// agent.
+fn start_supervisor(reaper: &std::sync::Arc<Reaper>) {
+    let supervisor = Supervisor::new(supervisor::Config::vm(), std::sync::Arc::clone(reaper));
+    let started = std::thread::Builder::new()
+        .name("services".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("spawn-guest: cannot start the services runtime: {error}");
+                    return;
+                }
+            };
+            if let Err(error) =
+                runtime.block_on(supervisor::serve(supervisor, Path::new(supervisor::SOCKET)))
+            {
+                eprintln!("spawn-guest: services stopped: {error}");
+            }
+        });
+    if let Err(error) = started {
+        eprintln!("spawn-guest: cannot start the services thread: {error}");
     }
 }
 
@@ -220,23 +253,5 @@ fn mount_one(m: &Mount) -> nix::Result<()> {
         // The kernel may mount devtmpfs itself.
         Err(Errno::EBUSY) => Ok(()),
         result => result,
-    }
-}
-
-/// PID 1 adopts every orphaned process. Reap them all, and return when the
-/// agent itself exits. Commands started by the agent are its own children,
-/// so the agent still receives their exit status.
-fn reap_until_exit(agent: Pid) {
-    loop {
-        match waitpid(None, None) {
-            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) if pid == agent => {
-                return;
-            }
-            Ok(_) | Err(Errno::EINTR) => {}
-            Err(error) => {
-                eprintln!("spawn-guest: waitpid failed: {error}");
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
     }
 }
