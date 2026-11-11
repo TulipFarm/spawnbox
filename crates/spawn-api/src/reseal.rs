@@ -62,6 +62,9 @@ pub fn reseal(db: &Db, sbox: &SecretBox) -> Result<Resealed> {
     if done.start_records + done.saved > 0 {
         db.truncate_log()?;
     }
+    // A paused persistent sandbox has both a start record and saved state.
+    done.unreadable.sort();
+    done.unreadable.dedup();
     done.vacuumed = db.vacuum_once()?;
     Ok(done)
 }
@@ -277,10 +280,21 @@ pub(crate) mod tests {
         let again = reseal(&db, &sbox).unwrap();
         assert_eq!((again.start_records, again.saved), (0, 0));
 
-        // Under another key, none of it can be read, sealed rows included.
+        // Paused, so it has saved state as well as its start record.
+        let sealed = sbox.seal_sandbox_env("acme", "sbx_start", &want).unwrap();
+        let paused = serde_json::json!({ SEALED: B64.encode(sealed) }).to_string();
+        db.set_saved("sbx_start", 1, &paused).unwrap();
+        assert!(
+            db.saved_states()
+                .unwrap()
+                .iter()
+                .any(|(id, ..)| id == "sbx_start")
+        );
+
+        // Under another key, none of it can be read, sealed rows included,
+        // and each sandbox is named once.
         let other = SecretBox::new(&[3; 32]).unwrap();
-        let mut lost = reseal(&db, &other).unwrap().unreadable;
-        lost.sort();
+        let lost = reseal(&db, &other).unwrap().unreadable;
         assert_eq!(lost, ["sbx_foreign", "sbx_plain", "sbx_split", "sbx_start"]);
     }
 
