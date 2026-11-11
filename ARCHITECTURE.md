@@ -316,9 +316,21 @@ stateDiagram-v2
   tenant and the sandbox ID. A fork seals the copy's env under its new ID.
 - At start, the lease holder seals env that earlier versions stored in
   plain or in separate blobs (`reseal.rs`). Rows changed meanwhile are
-  left for the next start. SQLite runs with `secure_delete` and truncates
-  its WAL after this, so no plain copy stays in free pages. On Postgres,
-  old row versions stay until `VACUUM`.
+  left for the next start. SQLite runs with `secure_delete`. Pages that
+  earlier versions freed still hold plain env, so the first start after
+  the upgrade runs `VACUUM` once (an `upkeep` row marks it as due) and
+  truncates the WAL. On Postgres, old row versions stay until `VACUUM`.
+- Rows sealed this way look empty to earlier versions, which would then
+  overwrite them. So the same migration renames `sandboxes.saved` to
+  `saved_state`: earlier versions fail at start on the missing column
+  before they change anything. On Postgres, a trigger also refuses the
+  lower `schema_version` that earlier versions write. Both databases
+  refuse a schema version newer than the binary knows. Downgrades past
+  this version are not supported.
+- If the key cannot open some stored env, the server refuses to start
+  unless `--allow-unreadable-env` is set. Even then, those paused
+  sandboxes keep their state and snapshot files, so a start with the
+  right key resumes them.
 - Memory files and disks are not encrypted; `spawnbox doctor` warns when
   `<data-dir>` is not on a dm-crypt disk.
 
