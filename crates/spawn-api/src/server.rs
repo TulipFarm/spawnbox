@@ -173,9 +173,14 @@ pub struct Args {
     /// create request sets `idle_pause_s`. 0 means never.
     #[arg(long, default_value_t = 600)]
     idle_pause_s: u64,
-    /// Delete paused sandboxes after this many seconds.
+    /// Delete paused sandboxes after this many seconds. Persistent
+    /// sandboxes are kept.
     #[arg(long, default_value_t = 7 * 86_400)]
     paused_retention_s: u64,
+    /// On SIGTERM, how long to wait for running persistent sandboxes to
+    /// pause. Ones not paused by then are stopped and become cold.
+    #[arg(long, default_value_t = 30)]
+    shutdown_pause_s: u64,
     /// Host port the egress proxy listens on. Only sandboxes can reach it.
     #[arg(long, default_value_t = 15_001)]
     egress_port: u16,
@@ -609,6 +614,22 @@ async fn run(
     };
     let hub = Hub::start(db.clone(), otlp, usize::try_from(args.events_output_bytes)?);
     let meter = Arc::new(Meter::new(db.clone()));
+    let cooled = db.cool_unfinished()?;
+    if !cooled.is_empty() {
+        eprintln!(
+            "marked {} persistent sandboxes from the last run as cold",
+            cooled.len()
+        );
+    }
+    for (id, tenant) in &cooled {
+        hub.record(
+            "sandbox.cold",
+            &Origin::system(),
+            Some(tenant),
+            Some(id),
+            json!({ "reason": "server_restarted" }),
+        );
+    }
     let lost = db.delete_unfinished(now_ms())?;
     if !lost.is_empty() {
         eprintln!(
@@ -740,6 +761,7 @@ async fn run(
                 warm_reserve: usize::try_from(args.max_builds)?,
                 memory_limit_mib: host_memory_mib()? * u64::from(args.memory_overcommit_pct) / 100,
                 memory_pressure_pct: args.memory_pressure_pct,
+                shutdown_pause_s: args.shutdown_pause_s,
             },
         ),
         templates,
@@ -757,12 +779,14 @@ async fn run(
     if paused > 0 {
         eprintln!("{paused} paused sandboxes");
     }
+    app.templates.prune_roots();
     let reaper = {
         let app = Arc::clone(&app);
         let retention_ms =
             i64::try_from(args.events_retention_s.saturating_mul(1000)).unwrap_or(i64::MAX);
         tokio::spawn(async move {
             let mut next_prune = Instant::now();
+            let mut next_roots = Instant::now();
             let mut next_meter = Instant::now() + METER_EVERY;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -775,6 +799,10 @@ async fn run(
                     next_meter = Instant::now() + METER_EVERY;
                     app.volumes.meter();
                     app.sandboxes.meter();
+                }
+                if Instant::now() >= next_roots {
+                    next_roots = Instant::now() + Duration::from_secs(60);
+                    app.templates.prune_roots();
                 }
                 if retention_ms > 0 && Instant::now() >= next_prune {
                     next_prune = Instant::now() + Duration::from_secs(60);
@@ -1307,6 +1335,7 @@ pub fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
 
 fn view(sandbox: db::Sandbox, timings_ms: Option<Timings>) -> SandboxView {
     let paused = sandbox.state == state::PAUSED;
+    let expires = !paused && !sandbox.persistent;
     SandboxView {
         id: sandbox.id,
         tenant: sandbox.tenant,
@@ -1326,12 +1355,16 @@ fn view(sandbox: db::Sandbox, timings_ms: Option<Timings>) -> SandboxView {
             .collect(),
         egress: sandbox.egress,
         created_at: rfc3339_ms(sandbox.created_at),
-        expires_at: (!paused).then(|| rfc3339_ms(sandbox.expires_at)),
+        expires_at: expires.then(|| rfc3339_ms(sandbox.expires_at)),
         paused_at: sandbox.paused_at.filter(|_| paused).map(rfc3339_ms),
         idle_pause_s: sandbox.idle_pause_s,
         node: sandbox
             .node
             .or_else(|| fleet::self_node().map(str::to_owned)),
+        persistent: sandbox.persistent,
+        generation: sandbox.generation,
+        cold_starts: sandbox.cold_starts,
+        last_cold_start_at: sandbox.last_cold_start_at.map(rfc3339_ms),
         started_from: timings_ms.map(|t| if t.warm { "warm_pool" } else { "build" }),
         timings_ms,
     }
@@ -1352,6 +1385,12 @@ async fn create(
         .ok_or_else(tenant_not_found)?;
     if matches!(app.role, Role::Primary(_)) {
         return primary::create(&app, tenant, req, &headers, body, origin).await;
+    }
+    if req.persistent && matches!(app.role, Role::Worker(_)) {
+        return Err(ApiError::new(
+            Code::Conflict,
+            "persistent sandboxes run on the primary only",
+        ));
     }
     create_here(app, tenant, req, origin).await
 }

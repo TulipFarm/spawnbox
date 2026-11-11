@@ -1,7 +1,7 @@
 //! State in SQLite, or Postgres for primaries that fail over: tenants, API keys, sandbox records, templates and their
 //! builds, secrets, events and usage.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -191,6 +191,30 @@ const MIGRATIONS: &[&str] = &[
         ended_at INTEGER,
         failed_moves INTEGER NOT NULL DEFAULT 0
     );",
+    "ALTER TABLE sandboxes ADD COLUMN persistent INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN cold_starts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN last_cold_start_at INTEGER;
+    ALTER TABLE sandboxes ADD COLUMN claim TEXT;
+    ALTER TABLE sandboxes ADD COLUMN claim_deadline INTEGER;
+    CREATE TABLE start_records (
+        sandbox TEXT PRIMARY KEY,
+        tenant TEXT NOT NULL,
+        template TEXT NOT NULL,
+        build TEXT NOT NULL,
+        spec TEXT NOT NULL,
+        vcpus INTEGER NOT NULL,
+        memory_mib INTEGER NOT NULL,
+        egress TEXT NOT NULL,
+        secrets TEXT NOT NULL,
+        volumes TEXT NOT NULL,
+        ports TEXT NOT NULL,
+        idle_pause_s INTEGER NOT NULL,
+        env BLOB NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX start_records_build ON start_records (build);",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -381,6 +405,31 @@ const PG_MIGRATIONS: &[&str] = &[
         ended_at BIGINT,
         failed_moves BIGINT NOT NULL DEFAULT 0
     );"#,
+    r#"
+    ALTER TABLE sandboxes ADD COLUMN persistent BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN generation BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN cold_starts BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE sandboxes ADD COLUMN last_cold_start_at BIGINT;
+    ALTER TABLE sandboxes ADD COLUMN claim TEXT COLLATE "C";
+    ALTER TABLE sandboxes ADD COLUMN claim_deadline BIGINT;
+    CREATE TABLE start_records (
+        sandbox TEXT COLLATE "C" PRIMARY KEY,
+        tenant TEXT COLLATE "C" NOT NULL,
+        template TEXT COLLATE "C" NOT NULL,
+        build TEXT COLLATE "C" NOT NULL,
+        spec TEXT NOT NULL,
+        vcpus BIGINT NOT NULL,
+        memory_mib BIGINT NOT NULL,
+        egress TEXT NOT NULL,
+        secrets TEXT NOT NULL,
+        volumes TEXT NOT NULL,
+        ports TEXT NOT NULL,
+        idle_pause_s BIGINT NOT NULL,
+        env BYTEA NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    );
+    CREATE INDEX start_records_build ON start_records (build);"#,
 ];
 
 pub mod state {
@@ -389,7 +438,10 @@ pub mod state {
     pub const PAUSED: &str = "paused";
     pub const FAILED: &str = "failed";
     pub const DELETED: &str = "deleted";
-    pub const ALL: [&str; 5] = [STARTING, RUNNING, PAUSED, FAILED, DELETED];
+    /// A persistent sandbox with no VM and no snapshot. The next call
+    /// starts it again from its start record.
+    pub const COLD: &str = "cold";
+    pub const ALL: [&str; 6] = [STARTING, RUNNING, PAUSED, FAILED, DELETED, COLD];
 }
 
 pub mod build_state {
@@ -513,6 +565,48 @@ pub struct Sandbox {
     /// Absent in reports from older workers.
     #[serde(default)]
     pub volumes: Vec<VolumeRef>,
+    #[serde(default)]
+    pub persistent: bool,
+    /// Bumped by each cold start. Updates from an older VM are ignored.
+    #[serde(default)]
+    pub generation: i64,
+    #[serde(default)]
+    pub cold_starts: i64,
+    #[serde(default)]
+    pub last_cold_start_at: Option<i64>,
+}
+
+/// What starting a persistent sandbox again needs, kept until it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRecord {
+    pub sandbox: String,
+    pub tenant: String,
+    pub template: String,
+    pub build: String,
+    /// JSON of the build's `model::TemplateSpec`.
+    pub spec: String,
+    pub vcpus: u32,
+    pub memory_mib: u32,
+    pub egress: Policy,
+    /// Names only.
+    pub secrets: Vec<String>,
+    pub volumes: Vec<VolumeRef>,
+    /// JSON of the published ports.
+    pub ports: String,
+    pub idle_pause_s: u64,
+    /// The env map, sealed with `SecretBox::seal_env`.
+    pub env: Vec<u8>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Why a sandbox was not added.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The volume of this name is taken.
+    Volume(String),
+    /// The tenant has this many persistent sandboxes.
+    Persistent(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,18 +884,54 @@ impl Db {
     /// read-write by another sandbox, or read-only by another when this one
     /// writes. Then returns the volume's name.
     pub fn insert_sandbox(&self, sandbox: &Sandbox) -> Result<Result<(), String>> {
+        Ok(self
+            .insert(sandbox, None)?
+            .map_err(|refused| match refused {
+                Refused::Volume(name) => name,
+                Refused::Persistent(_) => unreachable!("only persistent sandboxes count"),
+            }))
+    }
+
+    /// Adds a persistent sandbox and its start record at once, unless a
+    /// volume is taken or its tenant already has `limit` of them.
+    pub fn insert_persistent(
+        &self,
+        sandbox: &Sandbox,
+        start: &StartRecord,
+        limit: Option<u64>,
+    ) -> Result<Result<(), Refused>> {
+        self.insert(sandbox, Some((start, limit)))
+    }
+
+    fn insert(
+        &self,
+        sandbox: &Sandbox,
+        start: Option<(&StartRecord, Option<u64>)>,
+    ) -> Result<Result<(), Refused>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         for volume in &sandbox.volumes {
             if let Some(name) = volume_taken(&tx, volume, &sandbox.id)? {
-                return Ok(Err(name));
+                return Ok(Err(Refused::Volume(name)));
+            }
+        }
+        if let Some((_, Some(limit))) = start {
+            let in_use: i64 = tx.query_row(
+                "SELECT count(*) FROM sandboxes
+                 WHERE tenant = ?1 AND persistent = 1 AND state NOT IN ('deleted', 'failed')",
+                [&sandbox.tenant],
+                |r| r.get(0),
+            )?;
+            let in_use = u64::try_from(in_use).unwrap_or(0);
+            if in_use >= limit {
+                return Ok(Err(Refused::Persistent(in_use)));
             }
         }
         tx.execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
-              idle_pause_s, tenant, node, vcpus, memory_mib, volumes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              idle_pause_s, tenant, node, vcpus, memory_mib, volumes, persistent, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 sandbox.id,
                 sandbox.state,
@@ -818,10 +948,183 @@ impl Db {
                 sandbox.vcpus,
                 sandbox.memory_mib,
                 volumes_json(&sandbox.volumes),
+                i64::from(sandbox.persistent),
+                sandbox.generation,
             ],
         )?;
+        if let Some((start, _)) = start {
+            tx.execute(
+                "INSERT INTO start_records
+                 (sandbox, tenant, template, build, spec, vcpus, memory_mib, egress, secrets,
+                  volumes, ports, idle_pause_s, env, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    start.sandbox,
+                    start.tenant,
+                    start.template,
+                    start.build,
+                    start.spec,
+                    start.vcpus,
+                    start.memory_mib,
+                    to_json(&start.egress),
+                    to_json(&start.secrets),
+                    to_json(&start.volumes),
+                    start.ports,
+                    i64::try_from(start.idle_pause_s).unwrap_or(i64::MAX),
+                    start.env.clone(),
+                    start.created_at,
+                    start.updated_at,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(Ok(()))
+    }
+
+    pub fn get_start_record(&self, sandbox: &str) -> Result<Option<StartRecord>> {
+        self.conn()
+            .query_row(
+                "SELECT sandbox, tenant, template, build, spec, vcpus, memory_mib, egress,
+                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at
+                 FROM start_records WHERE sandbox = ?1",
+                [sandbox],
+                |row| {
+                    Ok(StartRecord {
+                        sandbox: row.get(0)?,
+                        tenant: row.get(1)?,
+                        template: row.get(2)?,
+                        build: row.get(3)?,
+                        spec: row.get(4)?,
+                        vcpus: row.get(5)?,
+                        memory_mib: row.get(6)?,
+                        egress: json_column(row, 7)?,
+                        secrets: json_column(row, 8)?,
+                        volumes: json_column(row, 9)?,
+                        ports: row.get(10)?,
+                        idle_pause_s: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                        env: row.get(12)?,
+                        created_at: row.get(13)?,
+                        updated_at: row.get(14)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Records a persistent sandbox's published ports, for its next start.
+    pub fn set_start_ports(&self, sandbox: &str, ports: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE start_records SET ports = ?2, updated_at = ?3 WHERE sandbox = ?1",
+            params![sandbox, ports, now],
+        )?;
+        Ok(())
+    }
+
+    /// Builds that a persistent sandbox that has not ended starts from.
+    pub fn build_roots(&self) -> Result<HashSet<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT r.build FROM start_records r JOIN sandboxes s ON s.id = r.sandbox
+             WHERE s.state NOT IN ('deleted', 'failed')",
+        )?;
+        stmt.query_map((), |r| r.get(0))?.collect()
+    }
+
+    /// Claims a cold sandbox of this host to start it: it becomes
+    /// `starting` with the next generation, which is returned. `None` if it
+    /// is not cold.
+    pub fn claim_cold(&self, id: &str, claim: &str, deadline: i64) -> Result<Option<i64>> {
+        self.conn()
+            .query_row(
+                "UPDATE sandboxes
+                 SET state = 'starting', generation = generation + 1, claim = ?2,
+                     claim_deadline = ?3
+                 WHERE id = ?1 AND node IS NULL AND persistent = 1 AND state = 'cold'
+                 RETURNING generation",
+                params![id, claim, deadline],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Ends a claim with the sandbox running. `false` if the claim was
+    /// lost: the sandbox was deleted, or the claim expired.
+    pub fn finish_cold_start(
+        &self,
+        id: &str,
+        generation: i64,
+        claim: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes
+             SET state = 'running', claim = NULL, claim_deadline = NULL,
+                 cold_starts = cold_starts + 1, last_cold_start_at = ?4, paused_at = NULL,
+                 saved = NULL
+             WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
+               AND node IS NULL",
+            params![id, generation, claim, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Gives up a claim: the sandbox is cold again.
+    pub fn abandon_claim(&self, id: &str, generation: i64, claim: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes SET state = 'cold', claim = NULL, claim_deadline = NULL
+             WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
+               AND node IS NULL",
+            params![id, generation, claim],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Makes a persistent sandbox of this host cold, unless it ended or a
+    /// newer VM runs it.
+    pub fn set_cold(&self, id: &str, generation: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes
+             SET state = 'cold', paused_at = NULL, saved = NULL, claim = NULL,
+                 claim_deadline = NULL
+             WHERE id = ?1 AND generation = ?2 AND persistent = 1 AND node IS NULL
+               AND state NOT IN ('deleted', 'failed')",
+            params![id, generation],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Marks deleted a cold sandbox, or one being started. A start that
+    /// finishes later loses its claim.
+    pub fn delete_cold(&self, id: &str, now: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sandboxes
+             SET state = 'deleted', ended_at = ?2, claim = NULL, claim_deadline = NULL
+             WHERE id = ?1 AND node IS NULL AND persistent = 1
+               AND state IN ('cold', 'starting')",
+            params![id, now],
+        )?;
+        if changed > 0 {
+            tx.execute("DELETE FROM start_records WHERE sandbox = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Makes cold the persistent sandboxes whose VMs were lost when the
+    /// server stopped. Returns their IDs and tenants.
+    pub fn cool_unfinished(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "UPDATE sandboxes
+             SET state = 'cold', claim = NULL, claim_deadline = NULL, paused_at = NULL,
+                 saved = NULL
+             WHERE state IN ('starting', 'running') AND persistent = 1 AND node IS NULL
+             RETURNING id, tenant",
+        )?;
+        stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
     }
 
     /// Adds a volume. `false` if the tenant has one by that name.
@@ -959,30 +1262,32 @@ impl Db {
     }
 
     /// Records a pause, with what resuming needs.
-    pub fn set_paused(&self, id: &str, paused_at: i64, saved: &str) -> Result<()> {
+    /// Updates of a sandbox's state take the generation of the VM they are
+    /// about, and do nothing once a newer VM runs it.
+    pub fn set_paused(&self, id: &str, generation: i64, paused_at: i64, saved: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE sandboxes SET state = 'paused', paused_at = ?2, saved = ?3
-             WHERE id = ?1 AND node IS NULL",
-            params![id, paused_at, saved],
+             WHERE id = ?1 AND generation = ?4 AND node IS NULL",
+            params![id, paused_at, saved, generation],
         )?;
         Ok(())
     }
 
     /// Updates what a paused sandbox needs to resume.
-    pub fn set_saved(&self, id: &str, saved: &str) -> Result<()> {
+    pub fn set_saved(&self, id: &str, generation: i64, saved: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sandboxes SET saved = ?2 WHERE id = ?1 AND node IS NULL",
-            params![id, saved],
+            "UPDATE sandboxes SET saved = ?2 WHERE id = ?1 AND generation = ?3 AND node IS NULL",
+            params![id, saved, generation],
         )?;
         Ok(())
     }
 
-    pub fn set_resumed(&self, id: &str, expires_at: i64) -> Result<()> {
+    pub fn set_resumed(&self, id: &str, generation: i64, expires_at: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE sandboxes
              SET state = 'running', expires_at = ?2, paused_at = NULL, saved = NULL
-             WHERE id = ?1 AND node IS NULL",
-            params![id, expires_at],
+             WHERE id = ?1 AND generation = ?3 AND node IS NULL",
+            params![id, expires_at, generation],
         )?;
         Ok(())
     }
@@ -1001,15 +1306,21 @@ impl Db {
     }
 
     /// Moves a sandbox of this host to `state`. `failed` and `deleted`
-    /// record the time.
-    pub fn set_state(&self, id: &str, state: &str, now: i64) -> Result<()> {
+    /// record the time and drop its start record. `generation` as for
+    /// `set_paused`.
+    pub fn set_state(&self, id: &str, generation: i64, state: &str, now: i64) -> Result<()> {
         let ended = matches!(state, state::FAILED | state::DELETED).then_some(now);
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "UPDATE sandboxes SET state = ?2, ended_at = COALESCE(?3, ended_at)
-             WHERE id = ?1 AND node IS NULL",
-            params![id, state, ended],
+             WHERE id = ?1 AND generation = ?4 AND node IS NULL",
+            params![id, state, ended, generation],
         )?;
-        Ok(())
+        if changed > 0 && ended.is_some() {
+            tx.execute("DELETE FROM start_records WHERE sandbox = ?1", [id])?;
+        }
+        tx.commit()
     }
 
     pub fn get_sandbox(&self, id: &str) -> Result<Option<Sandbox>> {
@@ -1059,7 +1370,8 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "UPDATE sandboxes SET state = 'deleted', ended_at = ?1
-             WHERE state IN ('starting', 'running') AND node IS NULL RETURNING id, tenant",
+             WHERE state IN ('starting', 'running') AND persistent = 0 AND node IS NULL
+             RETURNING id, tenant",
         )?;
         stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect()
@@ -1821,7 +2133,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT state, COUNT(*) FROM sandboxes
-             WHERE node IS NULL AND state IN ('starting', 'running', 'paused')
+             WHERE node IS NULL AND state IN ('starting', 'running', 'paused', 'cold')
              GROUP BY state",
         )?;
         stmt.query_map((), |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -2037,10 +2349,13 @@ impl Db {
         self.conn().execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
-              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, ended_at, volumes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, ended_at, volumes,
+              generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)
              ON CONFLICT (id) DO UPDATE SET
                  state = excluded.state, build = excluded.build, labels = excluded.labels,
+                 generation = excluded.generation,
                  expires_at = excluded.expires_at, secrets = excluded.secrets,
                  volumes = excluded.volumes,
                  egress = excluded.egress, idle_pause_s = excluded.idle_pause_s,
@@ -2067,6 +2382,7 @@ impl Db {
                 sandbox.paused_at,
                 ended,
                 volumes_json(&sandbox.volumes),
+                sandbox.generation,
             ],
         )?;
         Ok(())
@@ -2183,11 +2499,13 @@ impl Db {
         tx.execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
-              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, saved, volumes)
+              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, saved, volumes,
+              generation)
              VALUES (?1, 'paused', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14,
-                     ?15)
+                     ?15, ?16)
              ON CONFLICT (id) DO UPDATE SET
                  state = 'paused', build = excluded.build, labels = excluded.labels,
+                 generation = excluded.generation,
                  expires_at = excluded.expires_at, secrets = excluded.secrets,
                  volumes = excluded.volumes,
                  egress = excluded.egress, idle_pause_s = excluded.idle_pause_s,
@@ -2209,6 +2527,7 @@ impl Db {
                 paused_at,
                 saved,
                 volumes_json(&sandbox.volumes),
+                sandbox.generation,
             ],
         )?;
         tx.commit()?;
@@ -2542,8 +2861,9 @@ fn to_json(value: &impl serde::Serialize) -> String {
 }
 
 const SANDBOX_COLUMNS: &str = "id, state, template, labels, created_at, expires_at, build, \
-    secrets, egress, idle_pause_s, paused_at, tenant, node, vcpus, memory_mib, volumes";
-const SANDBOX_COLUMN_COUNT: usize = 16;
+    secrets, egress, idle_pause_s, paused_at, tenant, node, vcpus, memory_mib, volumes, \
+    persistent, generation, cold_starts, last_cold_start_at";
+const SANDBOX_COLUMN_COUNT: usize = 20;
 const VOLUME_COLUMNS: &str = "id, tenant, name, size_gib, node, backend, created_at";
 const KEY_COLUMNS: &str = "id, tenant, scopes, name, created_at, revoked_at";
 const TENANT_COLUMNS: &str = "id, name, quotas, egress, created_at, updated_at, isolation";
@@ -2633,6 +2953,13 @@ fn build_from_row(row: &Row) -> Result<Build> {
     })
 }
 
+/// A JSON column that must parse: a start record must not start a
+/// sandbox with less than it was made with.
+fn json_column<T: serde::de::DeserializeOwned>(row: &Row, i: usize) -> Result<T> {
+    serde_json::from_str(&row.get::<_, String>(i)?)
+        .map_err(|e| sql::Error::Type(format!("column {i}: {e}")))
+}
+
 fn sandbox_from_row(row: &Row) -> Result<Sandbox> {
     let labels: String = row.get(3)?;
     Ok(Sandbox {
@@ -2661,6 +2988,10 @@ fn sandbox_from_row(row: &Row) -> Result<Sandbox> {
             .get::<_, Option<String>>(15)?
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
+        persistent: row.get::<_, i64>(16)? != 0,
+        generation: row.get(17)?,
+        cold_starts: row.get(18)?,
+        last_cold_start_at: row.get(19)?,
     })
 }
 
@@ -2754,7 +3085,211 @@ mod tests {
             vcpus: 2,
             memory_mib: 1024,
             volumes: Vec::new(),
+            persistent: false,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
         }
+    }
+
+    fn start_record(id: &str, build: &str) -> StartRecord {
+        StartRecord {
+            sandbox: id.into(),
+            tenant: "default".into(),
+            template: "base".into(),
+            build: build.into(),
+            spec: "{}".into(),
+            vcpus: 2,
+            memory_mib: 1024,
+            egress: Policy::allow_all(),
+            secrets: vec!["gh".into()],
+            volumes: Vec::new(),
+            ports: "{}".into(),
+            idle_pause_s: 600,
+            env: vec![1, 2, 3],
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn persistent(id: &str, state: &str) -> Sandbox {
+        Sandbox {
+            persistent: true,
+            expires_at: i64::MAX,
+            ..sandbox(id, state)
+        }
+    }
+
+    #[test]
+    fn persistent_sandboxes_keep_a_start_record_and_a_quota() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("a", state::RUNNING),
+            &start_record("a", "b1"),
+            Some(2),
+        )
+        .unwrap()
+        .unwrap();
+        db.insert_persistent(
+            &persistent("b", state::RUNNING),
+            &start_record("b", "b2"),
+            Some(2),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            db.insert_persistent(
+                &persistent("c", state::RUNNING),
+                &start_record("c", "b3"),
+                Some(2)
+            )
+            .unwrap(),
+            Err(Refused::Persistent(2))
+        );
+        // Refused, so nothing was written.
+        assert_eq!(db.get_start_record("c").unwrap(), None);
+        assert_eq!(
+            db.get_start_record("a").unwrap(),
+            Some(start_record("a", "b1"))
+        );
+        let a = db.get_sandbox("a").unwrap().unwrap();
+        assert!(a.persistent);
+        assert_eq!(a.expires_at, i64::MAX);
+
+        db.set_start_ports("a", r#"{"3000":{}}"#, 5).unwrap();
+        let record = db.get_start_record("a").unwrap().unwrap();
+        assert_eq!(
+            (record.ports.as_str(), record.updated_at),
+            (r#"{"3000":{}}"#, 5)
+        );
+        // Resuming leaves it.
+        db.set_paused("a", 1, 7, "{}").unwrap();
+        db.set_resumed("a", 1, i64::MAX).unwrap();
+        assert!(db.get_start_record("a").unwrap().is_some());
+
+        let roots = db.build_roots().unwrap();
+        assert_eq!(roots, HashSet::from(["b1".to_owned(), "b2".to_owned()]));
+        db.set_state("b", 1, state::DELETED, 9).unwrap();
+        assert_eq!(db.get_start_record("b").unwrap(), None);
+        assert_eq!(db.build_roots().unwrap(), HashSet::from(["b1".to_owned()]));
+        db.insert_persistent(
+            &persistent("c", state::RUNNING),
+            &start_record("c", "b3"),
+            Some(2),
+        )
+        .unwrap()
+        .unwrap();
+        db.insert_sandbox(&sandbox("d", state::RUNNING))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.insert_persistent(
+                &persistent("e", state::RUNNING),
+                &start_record("e", "b3"),
+                None
+            )
+            .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn cold_starts_are_claimed_once_and_bound_to_a_generation() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("a", state::RUNNING),
+            &start_record("a", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.insert_sandbox(&sandbox("n", state::RUNNING))
+            .unwrap()
+            .unwrap();
+        // Only a cold, persistent sandbox can be claimed.
+        assert_eq!(db.claim_cold("a", "c1", 100).unwrap(), None);
+        assert!(db.set_cold("a", 1).unwrap());
+        assert!(!db.set_cold("n", 1).unwrap());
+        assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::COLD);
+
+        assert_eq!(db.claim_cold("a", "c1", 100).unwrap(), Some(2));
+        assert_eq!(db.claim_cold("a", "c2", 100).unwrap(), None);
+        // Updates for the older VM do nothing.
+        db.set_state("a", 1, state::FAILED, 5).unwrap();
+        assert!(!db.set_cold("a", 1).unwrap());
+        assert!(!db.finish_cold_start("a", 2, "c2", 5).unwrap());
+        assert!(db.abandon_claim("a", 2, "c1").unwrap());
+        assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::COLD);
+
+        assert_eq!(db.claim_cold("a", "c3", 100).unwrap(), Some(3));
+        assert!(db.finish_cold_start("a", 3, "c3", 50).unwrap());
+        assert!(!db.abandon_claim("a", 3, "c3").unwrap());
+        let a = db.get_sandbox("a").unwrap().unwrap();
+        assert_eq!(
+            (
+                a.state.as_str(),
+                a.generation,
+                a.cold_starts,
+                a.last_cold_start_at
+            ),
+            (state::RUNNING, 3, 1, Some(50))
+        );
+
+        // A delete during a start wins over the start.
+        assert!(db.set_cold("a", 3).unwrap());
+        assert_eq!(db.claim_cold("a", "c4", 100).unwrap(), Some(4));
+        assert!(db.delete_cold("a", 60).unwrap());
+        assert!(!db.finish_cold_start("a", 4, "c4", 61).unwrap());
+        assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::DELETED);
+        assert_eq!(db.get_start_record("a").unwrap(), None);
+        assert!(!db.delete_cold("a", 62).unwrap());
+    }
+
+    #[test]
+    fn a_restart_makes_persistent_sandboxes_cold() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("a", state::RUNNING),
+            &start_record("a", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.insert_persistent(
+            &persistent("b", state::RUNNING),
+            &start_record("b", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.insert_persistent(
+            &persistent("p", state::RUNNING),
+            &start_record("p", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.set_paused("p", 1, 7, "{}").unwrap();
+        db.set_cold("b", 1).unwrap();
+        assert_eq!(db.claim_cold("b", "c", 100).unwrap(), Some(2));
+        db.insert_sandbox(&sandbox("n", state::RUNNING))
+            .unwrap()
+            .unwrap();
+        let mut cooled = db.cool_unfinished().unwrap();
+        cooled.sort();
+        assert_eq!(
+            cooled,
+            [
+                ("a".to_owned(), "default".to_owned()),
+                ("b".to_owned(), "default".to_owned())
+            ]
+        );
+        assert_eq!(
+            db.delete_unfinished(9).unwrap(),
+            [("n".to_owned(), "default".to_owned())]
+        );
+        assert_eq!(db.get_sandbox("p").unwrap().unwrap().state, state::PAUSED);
+        assert_eq!(db.build_roots().unwrap(), HashSet::from(["b1".to_owned()]));
     }
 
     fn volume(id: &str, name: &str) -> Volume {
@@ -2792,7 +3327,7 @@ mod tests {
         let taken = db.insert_sandbox(&with_volume("sbx_r", true)).unwrap();
         assert_eq!(taken, Err("data".to_owned()));
         assert!(db.delete_volume("vol_1", 5).unwrap().is_err());
-        db.set_state("sbx_w", state::DELETED, 5).unwrap();
+        db.set_state("sbx_w", 1, state::DELETED, 5).unwrap();
         db.insert_sandbox(&with_volume("sbx_r1", true))
             .unwrap()
             .unwrap();
@@ -3020,7 +3555,7 @@ mod tests {
             db.delete_tenant("acme", 3).unwrap(),
             Some(Err(InUse::Sandboxes(1)))
         );
-        db.set_state("a", state::DELETED, 3).unwrap();
+        db.set_state("a", 1, state::DELETED, 3).unwrap();
         assert_eq!(
             db.delete_tenant("acme", 3).unwrap(),
             Some(Err(InUse::Templates(1)))
@@ -3043,7 +3578,7 @@ mod tests {
         db.insert_sandbox(&sandbox("a", state::STARTING))
             .unwrap()
             .unwrap();
-        db.set_state("a", state::RUNNING, 5).unwrap();
+        db.set_state("a", 1, state::RUNNING, 5).unwrap();
         assert_eq!(
             db.get_sandbox("a").unwrap(),
             Some(sandbox("a", state::RUNNING))
@@ -3060,8 +3595,8 @@ mod tests {
         db.insert_sandbox(&sandbox("b", state::RUNNING))
             .unwrap()
             .unwrap();
-        db.set_paused("a", 7, "{}").unwrap();
-        db.set_saved("a", r#"{"x":1}"#).unwrap();
+        db.set_paused("a", 1, 7, "{}").unwrap();
+        db.set_saved("a", 1, r#"{"x":1}"#).unwrap();
         assert_eq!(
             db.delete_unfinished(9).unwrap(),
             [("b".to_owned(), "default".to_owned())]
@@ -3072,7 +3607,7 @@ mod tests {
         assert_eq!((a.state.as_str(), a.paused_at), (state::PAUSED, Some(7)));
         assert_eq!(saved.as_deref(), Some(r#"{"x":1}"#));
 
-        db.set_resumed("a", 100).unwrap();
+        db.set_resumed("a", 1, 100).unwrap();
         let a = db.get_sandbox("a").unwrap().unwrap();
         assert_eq!(
             (a.state.as_str(), a.paused_at, a.expires_at),

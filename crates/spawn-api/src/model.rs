@@ -15,6 +15,8 @@ pub const DEFAULT_TIMEOUT_S: u64 = 1800;
 pub const DEFAULT_EXEC_TIMEOUT_S: u32 = 300;
 pub const MAX_EXEC_TIMEOUT_S: u32 = 3600;
 const MAX_IDLE_PAUSE_S: u64 = 7 * 86_400;
+/// `idle_pause_s` of a persistent sandbox when not given.
+pub const PERSISTENT_IDLE_PAUSE_S: u64 = 600;
 const MAX_CMD_BYTES: usize = 64 * 1024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const MAX_ENV: usize = 128;
@@ -84,6 +86,10 @@ pub struct CreateSandbox {
     /// Volumes to mount, by name.
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
+    /// Kept until deleted: it has no timeout, and goes cold instead of
+    /// being lost.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 /// One volume of `CreateSandbox`.
@@ -111,6 +117,22 @@ impl CreateSandbox {
             return Err(ApiError::invalid(format!(
                 "template {template:?} is not a valid template name"
             )));
+        }
+        if self.persistent {
+            if self.timeout_s.is_some() {
+                return Err(ApiError::invalid(
+                    "a persistent sandbox has no timeout_s; delete it when done",
+                ));
+            }
+            match self.idle_pause_s {
+                Some(0) => {
+                    return Err(ApiError::invalid(
+                        "idle_pause_s must be at least 1 for a persistent sandbox",
+                    ));
+                }
+                None => self.idle_pause_s = Some(PERSISTENT_IDLE_PAUSE_S),
+                Some(_) => {}
+            }
         }
         let timeout = self
             .timeout_s
@@ -903,6 +925,11 @@ pub struct SandboxView {
     pub idle_pause_s: u64,
     /// The fleet node it runs on; null on the primary or a single server.
     pub node: Option<String>,
+    pub persistent: bool,
+    /// Counts the VMs it has had: 1 at create, one more per cold start.
+    pub generation: i64,
+    pub cold_starts: i64,
+    pub last_cold_start_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings_ms: Option<Timings>,
     /// Only on create: `warm_pool` or `build`.
@@ -1186,6 +1213,22 @@ mod tests {
             ),
             Ok(60)
         );
+    }
+
+    #[test]
+    fn persistent_create_has_no_timeout_and_pauses_when_idle() {
+        let mut req: CreateSandbox = serde_json::from_str(r#"{"persistent":true}"#).unwrap();
+        req.check(86_400).unwrap();
+        assert_eq!(req.idle_pause_s, Some(PERSISTENT_IDLE_PAUSE_S));
+        let mut req: CreateSandbox =
+            serde_json::from_str(r#"{"persistent":true,"idle_pause_s":30}"#).unwrap();
+        req.check(86_400).unwrap();
+        assert_eq!(req.idle_pause_s, Some(30));
+        let error = create(r#"{"persistent":true,"timeout_s":60}"#).unwrap_err();
+        assert!(error.contains("timeout_s"), "{error}");
+        let error = create(r#"{"persistent":true,"idle_pause_s":0}"#).unwrap_err();
+        assert!(error.contains("idle_pause_s"), "{error}");
+        assert!(create(r#"{"persistent":"yes"}"#).is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Encrypts secret values and the egress CA key at rest with
 //! ChaCha20-Poly1305, under one key per install.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -60,6 +61,33 @@ impl SecretBox {
             .ok()?;
         Some(plain.to_vec())
     }
+
+    /// Seals a sandbox's whole env map, bound to the tenant and sandbox.
+    pub fn seal_env(
+        &self,
+        tenant: &str,
+        sandbox: &str,
+        env: &BTreeMap<String, String>,
+    ) -> io::Result<Vec<u8>> {
+        let plain = serde_json::to_vec(env).map_err(io::Error::other)?;
+        self.seal(&env_label(tenant, sandbox), &plain)
+    }
+
+    pub fn open_env(
+        &self,
+        tenant: &str,
+        sandbox: &str,
+        sealed: &[u8],
+    ) -> Option<BTreeMap<String, String>> {
+        let plain = self.open(&env_label(tenant, sandbox), sealed)?;
+        serde_json::from_slice(&plain).ok()
+    }
+}
+
+/// The format version is part of the label so that a later format cannot
+/// be read as this one.
+fn env_label(tenant: &str, sandbox: &str) -> String {
+    format!("env:v1:{tenant}:{sandbox}")
 }
 
 /// The bytes of a key file, created with `KEY_LEN` random bytes if it is
@@ -118,6 +146,18 @@ mod tests {
             SecretBox::new(&[8; 32]).unwrap().open("secret:gh", &sealed),
             None
         );
+    }
+
+    #[test]
+    fn env_is_bound_to_its_tenant_and_sandbox() {
+        let sb = SecretBox::new(&[7; 32]).unwrap();
+        let env = BTreeMap::from([("TOKEN".to_owned(), "s3cret".to_owned())]);
+        let sealed = sb.seal_env("acme", "sbx_1", &env).unwrap();
+        assert!(!sealed.windows(6).any(|w| w == b"s3cret"));
+        assert_eq!(sb.open_env("acme", "sbx_1", &sealed), Some(env));
+        assert_eq!(sb.open_env("acme", "sbx_2", &sealed), None);
+        assert_eq!(sb.open_env("other", "sbx_1", &sealed), None);
+        assert_eq!(sb.open("env:v2:acme:sbx_1", &sealed), None);
     }
 
     #[test]

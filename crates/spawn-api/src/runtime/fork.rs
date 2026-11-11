@@ -37,6 +37,7 @@ struct Source {
     expires_at: i64,
     has_layer: bool,
     own_rootfs: bool,
+    persistent: bool,
 }
 
 /// A copy with its quota and slot, before it starts.
@@ -70,7 +71,7 @@ impl Sandboxes {
                 "name must be a template name other than \"base\"",
             ));
         }
-        let lock = self.record_lock(id).ok_or_else(|| self.not_running(id))?;
+        let lock = self.waking_lock(id, origin).await?;
         let _changing = lock.lock().await;
         let source = self.source(id)?;
         let row = self.get(id)?;
@@ -156,12 +157,19 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
-        let lock = self.record_lock(id).ok_or_else(|| self.not_running(id))?;
+        let lock = self.waking_lock(id, origin).await?;
         let _changing = lock.lock().await;
-        let source = self.source(id)?;
+        let mut source = self.source(id)?;
         let row = self.get(id)?;
         let tenant = self.db.get_tenant(&source.tenant)?;
         let quotas = tenant.as_ref().map(|t| t.quotas).unwrap_or_default();
+        // Copies of a persistent sandbox are not persistent: they get the
+        // longest timeout.
+        if source.persistent {
+            let timeout_s = quotas.max_timeout_s(self.settings.max_timeout_s);
+            source.expires_at =
+                now_ms().saturating_add(i64::try_from(timeout_s * 1000).unwrap_or(i64::MAX));
+        }
         let mut children: Vec<Child> = Vec::new();
         let mut taken = Ok(());
         for _ in 0..count {
@@ -280,6 +288,7 @@ impl Sandboxes {
             expires_at: live.expires_at,
             has_layer: live.vm.has_layer(),
             own_rootfs: live.vm.owns_rootfs(self.templates.base_rootfs()),
+            persistent: record.persistent,
         })
     }
 
@@ -307,10 +316,18 @@ impl Sandboxes {
         if let Err(error) = &saved {
             eprintln!("save {id}: {error:#}");
             if error.downcast_ref::<Frozen>().is_some() {
+                let mut generation = 0;
+                let mut persistent = false;
                 if let Some(mut record) = self.inner().records.remove(id) {
                     self.settle(id, &mut record, now_ms());
+                    (generation, persistent) = (record.generation, record.persistent);
                 }
-                self.stop(id, *live, state::FAILED).await;
+                if persistent {
+                    self.stop(id, generation, *live, state::COLD).await;
+                    self.cold_event(origin, &tenant, id, "froze_while_saving");
+                    return Err(failed());
+                }
+                self.stop(id, generation, *live, state::FAILED).await;
                 self.event(
                     "sandbox.lost",
                     origin,
@@ -373,6 +390,10 @@ impl Sandboxes {
             vcpus: u32::from(source.limits.vcpus),
             memory_mib: source.limits.memory_mib,
             volumes: Vec::new(),
+            persistent: false,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
         };
         if !matches!(self.db.insert_sandbox(&sandbox), Ok(Ok(()))) {
             eprintln!("fork {}: could not record copy {id}", row.id);
@@ -408,7 +429,7 @@ impl Sandboxes {
                 eprintln!("fork {} into {id}: {error:#}", row.id);
                 self.node.remove_failed(&name, index).await;
                 self.release(index);
-                let _ = self.db.set_state(&id, state::FAILED, now_ms());
+                let _ = self.db.set_state(&id, 1, state::FAILED, now_ms());
                 self.event(
                     "sandbox.lost",
                     origin,
@@ -446,10 +467,12 @@ impl Sandboxes {
                 metered_at: now_ms(),
                 disk_bytes,
                 moving: None,
+                generation: 1,
+                persistent: false,
             },
         );
         drop(admission);
-        if let Err(error) = self.db.set_state(&id, state::RUNNING, now_ms()) {
+        if let Err(error) = self.db.set_state(&id, 1, state::RUNNING, now_ms()) {
             eprintln!("record {id} as running: {error}");
             let removed = self.inner().records.remove(&id);
             if let Some(Record {
@@ -457,7 +480,7 @@ impl Sandboxes {
                 ..
             }) = removed
             {
-                self.stop(&id, *live, state::FAILED).await;
+                self.stop(&id, 1, *live, state::FAILED).await;
             }
             return None;
         }
