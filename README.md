@@ -1453,9 +1453,16 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   in another form. On SQLite, the first start after the upgrade also
   compacts the database file, to clear the plain copies.
 - If `secrets.key` cannot read the stored env of a sandbox, the server
-  does not start. With `--allow-unreadable-env` it starts, and leaves
-  those sandboxes and their files as they are, so a later start with the
-  right key resumes them.
+  does not start. Usually the key is not the one that encrypted it; put
+  back the right key. With `--allow-unreadable-env` the server starts,
+  and leaves those sandboxes and their files as they are, so a later
+  start with the right key resumes them. This helps only when the key
+  reads everything else: `secrets.key` also encrypts the egress CA key,
+  the stored secrets and, with Postgres, the files that primaries share.
+  With a different key, the server still stops at those. Use the flag
+  when the key is right but the env of some sandboxes cannot be read,
+  for example rows that were damaged or copied from another
+  installation.
 - Memory files and disks are not encrypted. Put `<data-dir>` on an
   encrypted disk; `spawnbox doctor` warns when it is not.
 - On Firecracker, a pause writes only the memory that changed since the
@@ -1936,7 +1943,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--dns` | `1.1.1.1` | DNS server that the DNS forwarder sends queries to |
 | `--dns-port` | 15053 | Host port (UDP and TCP) of the DNS forwarder. Only sandboxes can connect to it. |
 | `--secrets-key-file` | `<data-dir>/secrets.key` | Key that encrypts secrets |
-| `--allow-unreadable-env` | Off | Start even if the secrets key cannot read the stored env of some sandboxes. Spawnbox leaves those sandboxes as they are. |
+| `--allow-unreadable-env` | Off | Start even if the secrets key cannot read the stored env of some sandboxes. Spawnbox leaves those sandboxes as they are. It does not help with a different key: the egress CA key and stored secrets need the right one. |
 | `--database-url` | None | Keep the state in this Postgres database, not in SQLite. Primaries on the same database fail over. You can also use `SPAWNBOX_DATABASE_URL`. Refer to [Keep the API up when the primary stops](#keep-the-api-up-when-the-primary-stops). |
 | `--database-ca-file` | None | PEM CA certificates for the TLS certificate of the database |
 | `--import-sqlite` | None | On the first start, copy this SQLite database into the empty Postgres database |
@@ -1988,7 +1995,7 @@ Type these commands on the host.
 | A request gives `429 quota_exceeded` | The tenant is at a quota limit | Delete or pause sandboxes, or increase the quota with `PATCH /v1/tenants/{id}`. |
 | A create request gives `409` | The template build is not ready | Wait until `latest_build.state` is `ready`. |
 | A snapshot gives `409 protected_env` | The sandbox was created with `env` values, which the template would show | Use secrets for the values, or create the sandbox without `env`. |
-| The server stops at start with `cannot read the stored env of ...` | `secrets.key` is not the key that encrypted them | Put back the earlier `secrets.key`, or set `--secrets-key-file`, and restart. To start without them, add `--allow-unreadable-env`; those sandboxes stay paused until a start with the right key. |
+| The server stops at start with `cannot read the stored env of ...` | `secrets.key` is not the key that encrypted them, or their rows are damaged | Put back the earlier `secrets.key`, or set `--secrets-key-file`, and restart. If the key is right, add `--allow-unreadable-env` to start without those sandboxes; they stay as they are. |
 | The server stops at start with `downgrades are not supported` | An earlier release runs on a database that a newer release changed | Install the newer release again, or restore the backup from before the upgrade. |
 | A move gives `no host has the same backend, kernel, base disk, Firecracker or runsc, egress CA and CPU model` | The hosts have different backends, files or CPUs | Compare `fingerprint`, `backend` and `cpu` in `GET /v1/nodes`. Sandboxes cannot move between Firecracker and gVisor hosts. Copy `/opt/spawnbox/vmlinux` and `/opt/spawnbox/rootfs.ext4` from the primary to the worker, then restart the worker. |
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |

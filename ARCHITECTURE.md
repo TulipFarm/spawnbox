@@ -330,7 +330,10 @@ stateDiagram-v2
 - If the key cannot open some stored env, the server refuses to start
   unless `--allow-unreadable-env` is set. Even then, those paused
   sandboxes keep their state and snapshot files, so a start with the
-  right key resumes them.
+  right key resumes them. The flag cannot help with a wholly different
+  key: the egress CA key, stored secrets and the Postgres shared files
+  are sealed with it too, and fail to open later in the start. It is
+  for a key that is right for everything except some env rows.
 - Memory files and disks are not encrypted; `spawnbox doctor` warns when
   `<data-dir>` is not on a dm-crypt disk.
 
