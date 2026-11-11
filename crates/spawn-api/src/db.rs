@@ -1093,8 +1093,9 @@ impl Db {
         Ok(changed > 0)
     }
 
-    /// Marks deleted a cold sandbox, or one being started. A start that
-    /// finishes later loses its claim.
+    /// Marks deleted a cold sandbox, or one being started again under a
+    /// claim. A start that finishes later loses its claim. A first create
+    /// is not deleted here.
     pub fn delete_cold(&self, id: &str, now: i64) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1102,7 +1103,7 @@ impl Db {
             "UPDATE sandboxes
              SET state = 'deleted', ended_at = ?2, claim = NULL, claim_deadline = NULL
              WHERE id = ?1 AND node IS NULL AND persistent = 1
-               AND state IN ('cold', 'starting')",
+               AND (state = 'cold' OR (state = 'starting' AND claim IS NOT NULL))",
             params![id, now],
         )?;
         if changed > 0 {
@@ -1308,6 +1309,17 @@ impl Db {
     /// Moves a sandbox of this host to `state`. `failed` and `deleted`
     /// record the time and drop its start record. `generation` as for
     /// `set_paused`.
+    /// Ends a create: `starting` becomes `running`. `false` if the row
+    /// left `starting`, as after a delete.
+    pub fn start_running(&self, id: &str, generation: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes SET state = 'running'
+             WHERE id = ?1 AND generation = ?2 AND node IS NULL AND state = 'starting'",
+            params![id, generation],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn set_state(&self, id: &str, generation: i64, state: &str, now: i64) -> Result<()> {
         let ended = matches!(state, state::FAILED | state::DELETED).then_some(now);
         let mut conn = self.conn();
@@ -2763,6 +2775,7 @@ const IMPORT_TABLES: &[&str] = &[
     "builds",
     "secrets",
     "sandboxes",
+    "start_records",
     "events",
     "usage_hourly",
     "nodes",
@@ -3246,6 +3259,30 @@ mod tests {
     }
 
     #[test]
+    fn a_first_create_is_not_deleted_as_cold_and_ends_only_from_starting() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("a", state::STARTING),
+            &start_record("a", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // No claim: the create still owns it.
+        assert!(!db.delete_cold("a", 5).unwrap());
+        assert!(db.get_start_record("a").unwrap().is_some());
+        assert!(db.start_running("a", 1).unwrap());
+        assert!(!db.start_running("a", 1).unwrap());
+
+        db.insert_sandbox(&sandbox("n", state::STARTING))
+            .unwrap()
+            .unwrap();
+        db.set_state("n", 1, state::DELETED, 6).unwrap();
+        assert!(!db.start_running("n", 1).unwrap());
+        assert_eq!(db.get_sandbox("n").unwrap().unwrap().state, state::DELETED);
+    }
+
+    #[test]
     fn a_restart_makes_persistent_sandboxes_cold() {
         let db = Db::memory().unwrap();
         db.insert_persistent(
@@ -3367,6 +3404,13 @@ mod tests {
         old.insert_sandbox(&sandbox("sbx_1", state::RUNNING))
             .unwrap()
             .unwrap();
+        old.insert_persistent(
+            &persistent("sbx_p", state::COLD),
+            &start_record("sbx_p", "bld_1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         drop(old);
         let (db, _) = Db::test_postgres(&url).unwrap();
         assert!(db.import_sqlite(&path).unwrap().is_some());
@@ -3379,6 +3423,14 @@ mod tests {
             sandbox("sbx_1", state::RUNNING)
         );
         assert!(db.get_tenant("default").unwrap().is_some());
+        assert_eq!(
+            db.get_start_record("sbx_p").unwrap(),
+            Some(start_record("sbx_p", "bld_1"))
+        );
+        assert_eq!(
+            db.build_roots().unwrap(),
+            HashSet::from(["bld_1".to_owned()])
+        );
         db.insert_sandbox(&sandbox("sbx_2", state::RUNNING))
             .unwrap()
             .unwrap();

@@ -287,7 +287,7 @@ stateDiagram-v2
     running --> deleted: DELETE or timeout_s
     paused --> deleted: DELETE or paused retention
     running --> failed: VM lost or froze
-    running --> cold: persistent, VM lost or pause failed
+    running --> cold: persistent, VM lost, pause failed or refused
     paused --> cold: persistent, resume failed
     cold --> starting: any call that wakes it (claim)
     starting --> running: cold start done
@@ -571,7 +571,9 @@ flowchart TB
 - **Admission.** Create and resume count the tenant's running and starting
   sandboxes against `running_sandboxes`, `running_vcpus` and
   `running_memory_mib` under one lock, so parallel requests cannot
-  overshoot. Pause works the same way for `snapshot_storage_gib`.
+  overshoot. Pause works the same way for `snapshot_storage_gib`. An idle
+  sandbox that the quota refuses keeps running, except a persistent one:
+  it stops and becomes `cold` with the reason `pause_failed`.
 
 ## Events and usage
 

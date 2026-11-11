@@ -1221,16 +1221,30 @@ impl Sandboxes {
                 persistent,
             },
         );
-        if let Err(error) = self.db.set_state(&sandbox.id, 1, state::RUNNING, now_ms()) {
+        let started = match self.db.start_running(&sandbox.id, 1) {
+            Ok(true) => Ok(()),
+            // Only a delete moves it on while it starts.
+            Ok(false) => Err(ApiError::new(
+                Code::Conflict,
+                "sandbox was deleted while it started",
+            )),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = started {
             let record = self.inner().records.remove(&sandbox.id);
             if let Some(Record {
                 vm: VmState::Running(live),
                 ..
             }) = record
             {
-                self.stop(&sandbox.id, 1, *live, state::FAILED).await;
+                let end = if error.code == Code::Conflict {
+                    state::DELETED
+                } else {
+                    state::FAILED
+                };
+                self.stop(&sandbox.id, 1, *live, end).await;
             }
-            return Err(error.into());
+            return Err(error);
         }
         sandbox.state = state::RUNNING.into();
         self.event("sandbox.created", origin, &tenant_id, &sandbox.id, created);
@@ -1883,7 +1897,7 @@ impl Sandboxes {
             .get_tenant(&tenant)?
             .map(|t| t.quotas)
             .unwrap_or_default();
-        let (live, tenant, _pausing) = {
+        let taken = 'take: {
             let mut inner = self.inner();
             let stored = inner.snapshot_bytes(&tenant);
             let record = inner.records.get_mut(id).ok_or_else(not_running)?;
@@ -1906,10 +1920,17 @@ impl Sandboxes {
                 if !only_if_idle {
                     return Err(error);
                 }
-                eprintln!("{id} is idle but stays running: {}", error.message);
-                // Try again after another idle period.
-                record.last_active = Instant::now();
-                return Ok(());
+                if !record.persistent {
+                    eprintln!("{id} is idle but stays running: {}", error.message);
+                    // Try again after another idle period.
+                    record.last_active = Instant::now();
+                    return Ok(());
+                }
+                // A persistent sandbox does not run on unsaved; it stops.
+                eprintln!("{id} is idle but cannot be saved: {}", error.message);
+                let mut record = inner.records.remove(id).ok_or_else(not_running)?;
+                self.settle(id, &mut record, now_ms());
+                break 'take Err(record);
             }
             if only_if_idle {
                 eprintln!("{id} is idle; pausing");
@@ -1927,7 +1948,17 @@ impl Sandboxes {
                 inner: Arc::clone(&self.inner),
                 id: id.to_owned(),
             };
-            (live, tenant, pausing)
+            Ok((live, tenant, pausing))
+        };
+        let (live, tenant, _pausing) = match taken {
+            Ok(taken) => taken,
+            Err(record) => {
+                if let VmState::Running(live) = record.vm {
+                    self.stop(id, record.generation, *live, state::COLD).await;
+                    self.cold_event(origin, &record.tenant, id, "pause_failed");
+                }
+                return Ok(());
+            }
         };
         let begin = Instant::now();
         let dir = self.paused_dir(id);

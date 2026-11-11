@@ -603,7 +603,9 @@ not delete it.
 
 If Spawnbox cannot keep its memory, the sandbox becomes `cold`. This
 occurs when the server crashes, the VM stops on its own, a pause or a
-resume fails, or the server stops before the sandbox can pause. The next
+resume fails, the `snapshot_storage_gib` quota has no room for its idle
+pause, or the server stops before the sandbox can pause. The `sandbox.cold`
+event has the reason. The next
 exec, file, terminal, clone, preview or resume request starts it again
 from its template build. The processes and the files outside its volumes
 are gone. Its ID, env, secrets, network rules, volumes and published
