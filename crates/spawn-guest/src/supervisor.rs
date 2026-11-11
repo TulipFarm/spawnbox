@@ -235,7 +235,9 @@ impl Supervisor {
             specs.into_iter().map(|s| (s.name.clone(), s)).collect();
         let changed: Vec<String> = services
             .iter()
-            .filter(|(name, handle)| wanted.get(*name) != Some(&handle.spec))
+            .filter(|(name, handle)| {
+                wanted.get(*name) != Some(&handle.spec) || handle.task.is_finished()
+            })
             .map(|(name, _)| name.clone())
             .collect();
         let mut stopping = Vec::new();
@@ -281,7 +283,7 @@ impl Supervisor {
         );
         let (control, rx) = mpsc::channel(4);
         let shared = Arc::clone(&self.0);
-        let task = tokio::spawn(shared.supervise(spec.clone(), log, rx));
+        let task = tokio::spawn(shared.keep(spec.clone(), log, rx));
         Handle {
             spec,
             control,
@@ -294,14 +296,18 @@ impl Supervisor {
     }
 
     pub async fn restart(&self, name: &str) -> Result<(), Status> {
-        let control = self
-            .0
-            .services
-            .lock()
-            .await
-            .get(name)
-            .map(|h| h.control.clone())
-            .ok_or_else(|| Status::not_found(format!("no service {name}")))?;
+        let control = {
+            let mut services = self.0.services.lock().await;
+            let handle = services
+                .get(name)
+                .ok_or_else(|| Status::not_found(format!("no service {name}")))?;
+            if handle.task.is_finished() {
+                let spec = handle.spec.clone();
+                services.insert(name.to_owned(), self.launch(spec));
+                return Ok(());
+            }
+            handle.control.clone()
+        };
         control
             .send(Control::Restart)
             .await
@@ -356,19 +362,61 @@ impl Shared {
         }
     }
 
+    /// Runs [`Self::supervise`], and runs it again after a backoff if it
+    /// panics, so a bug cannot leave a service that is never restarted.
+    async fn keep(
+        self: Arc<Self>,
+        spec: ServiceSpec,
+        log: Arc<Log>,
+        control: mpsc::Receiver<Control>,
+    ) {
+        let name = spec.name.clone();
+        let control = Arc::new(tokio::sync::Mutex::new(control));
+        let mut reason = None;
+        loop {
+            let task = tokio::spawn(Arc::clone(&self).supervise(
+                spec.clone(),
+                Arc::clone(&log),
+                Arc::clone(&control),
+                reason,
+            ));
+            if task.await.is_ok() {
+                return;
+            }
+            log.append(format!("spawnbox: supervising {name} failed\n").as_bytes());
+            self.set(&name, |s| {
+                s.pid = 0;
+                s.state = BACKOFF.into();
+            });
+            let mut control = control.lock().await;
+            tokio::select! {
+                () = tokio::time::sleep(self.config.backoff_max) => reason = Some("exit"),
+                c = control.recv() => match c {
+                    Some(Control::Restart) => reason = Some("request"),
+                    Some(Control::Stop) | None => {
+                        self.set(&name, |s| s.state = STOPPED.into());
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
     /// Keeps one service running until it is told to stop.
     async fn supervise(
         self: Arc<Self>,
         spec: ServiceSpec,
         log: Arc<Log>,
-        mut control: mpsc::Receiver<Control>,
+        control: Arc<tokio::sync::Mutex<mpsc::Receiver<Control>>>,
+        mut reason: Option<&'static str>,
     ) {
+        let mut control = control.lock_owned().await;
+        let control = &mut *control;
         let config = &self.config;
         let name = spec.name.as_str();
         let on_failure = spec.restart == ServiceRestart::OnFailure as i32;
         let mut backoff = config.backoff_min;
-        let mut restarts = 0;
-        let mut reason: Option<&str> = None;
+        let mut restarts = lock(&self.status).get(name).map_or(0, |s| s.restarts);
         loop {
             if let Some(reason) = reason.take() {
                 restarts += 1;
@@ -381,7 +429,10 @@ impl Shared {
                 });
             }
             let began = Instant::now();
-            let ended = match self.spawn(&spec, &log) {
+            let spawned =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.spawn(&spec, &log)))
+                    .unwrap_or_else(|_| Err(std::io::Error::other("the spawn panicked")));
+            let ended = match spawned {
                 Ok((pid, exit)) => {
                     let state = if check_of(&spec).is_some() {
                         STARTING
@@ -397,7 +448,7 @@ impl Shared {
                         pid,
                         ..event(name, "started")
                     });
-                    let ended = self.run(&spec, pid, exit, &mut control).await;
+                    let ended = self.run(&spec, pid, exit, control).await;
                     // Children it left behind would hold its port.
                     signal_group(pid, Signal::SIGKILL);
                     ended

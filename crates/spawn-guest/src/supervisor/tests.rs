@@ -347,3 +347,82 @@ async fn watchers_catch_up_from_a_sequence_number() {
     assert!(past.is_empty());
     assert_eq!(last, seq + 1);
 }
+
+/// Runs `inner` alone in a new test process, where the reaper can reap
+/// every child as PID 1 does.
+fn alone(inner: &str) {
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            inner,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("SPAWN_GUEST_ALONE", "1")
+        .status()
+        .expect("run the test alone");
+    assert!(status.success(), "{inner} failed");
+}
+
+#[test]
+fn a_service_that_cannot_start_keeps_retrying_with_the_real_reaper() {
+    alone("supervisor::tests::cannot_start_with_the_real_reaper");
+}
+
+#[tokio::test]
+#[ignore = "run alone by a_service_that_cannot_start_keeps_retrying_with_the_real_reaper"]
+async fn cannot_start_with_the_real_reaper() {
+    if std::env::var_os("SPAWN_GUEST_ALONE").is_none() {
+        return;
+    }
+    static PANICS: AtomicU64 = AtomicU64::new(0);
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        PANICS.fetch_add(1, Ordering::SeqCst);
+        hook(info);
+    }));
+    let me = nix::unistd::User::from_uid(nix::unistd::getuid())
+        .expect("look up user")
+        .expect("this user")
+        .name;
+    let sup = Supervisor::new(
+        Config {
+            as_user: true,
+            backoff_min: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(5),
+            ..config()
+        },
+        Reaper::pid1(),
+    );
+    // Keeps the reaper waiting for a child, as in a VM.
+    let mut keeper = spec("keeper", "sleep 1000");
+    keeper.user.clone_from(&me);
+    // Set uid and gid make std fork and exec, which fails on the cwd.
+    let broken = |name: &str| ServiceSpec {
+        user: "nobody".into(),
+        cwd: "/no/such/dir".into(),
+        ..spec(name, "true")
+    };
+    let mut specs = vec![keeper];
+    specs.extend(["a", "b", "c", "d"].map(broken));
+    sup.start(specs.clone()).await.expect("start");
+    running(&sup, "keeper").await;
+    for name in ["a", "b", "c", "d"] {
+        until(name, || {
+            status(&sup, name).is_some_and(|s| s.restarts >= 50)
+        })
+        .await;
+        assert!(log_text(&sup, name).contains("cannot start"));
+    }
+    assert_eq!(PANICS.load(Ordering::SeqCst), 0, "a spawn panicked");
+    sup.restart("a").await.expect("restart");
+    sup.start(specs).await.expect("start again");
+    let before = status(&sup, "a").map_or(0, |s| s.restarts);
+    until("a", || {
+        status(&sup, "a").is_some_and(|s| s.restarts > before)
+    })
+    .await;
+    sup.start(Vec::new()).await.expect("stop all");
+    assert!(sup.list().is_empty());
+}

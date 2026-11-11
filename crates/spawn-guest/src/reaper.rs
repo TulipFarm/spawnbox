@@ -4,6 +4,10 @@
 //! `waitpid(-1)`. That would steal the exit status of its own children, the
 //! agent and the services, so one thread reaps every process and hands the
 //! status of a known child to whoever started it.
+//!
+//! The reaper must not reap a child while it is being spawned: when a
+//! spawn fails between fork and exec, std waits for that child itself and
+//! panics if it is gone.
 
 use std::collections::HashMap;
 use std::io;
@@ -12,12 +16,16 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use nix::errno::Errno;
+use nix::sys::wait::{Id, WaitPidFlag, waitid};
+
 type Notify = Box<dyn FnOnce(ExitStatus) + Send>;
 
 pub struct Reaper(Mode);
 
 enum Mode {
-    /// Reaps every process; calls back for the ones started here.
+    /// Reaps every process; calls back for the ones started here. The lock
+    /// is held across each spawn, and while a process is reaped.
     Pid1(Mutex<HashMap<i32, Notify>>),
     /// Not PID 1, as in tests: a thread waits for each child.
     #[cfg(test)]
@@ -52,8 +60,9 @@ impl Reaper {
     ) -> io::Result<u32> {
         match &self.0 {
             Mode::Pid1(waiting) => {
-                // Held across the spawn: the reaper may see the child exit
-                // before it is recorded, and then waits for this lock.
+                // Held across the spawn, so the reaper leaves the child to
+                // std if the spawn fails, and finds its notify if it does
+                // not.
                 let mut waiting = lock(waiting);
                 let child = cmd.spawn()?;
                 let pid = child.id();
@@ -81,27 +90,35 @@ impl Reaper {
             return;
         };
         loop {
+            // Waits for any process to end, but leaves it unreaped.
+            let pid = match waitid(Id::All, WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {
+                Ok(status) => match status.pid() {
+                    Some(pid) => pid.as_raw(),
+                    None => continue,
+                },
+                Err(Errno::EINTR) => continue,
+                // No children right now.
+                Err(Errno::ECHILD) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("spawn-guest: waitid failed: {error}");
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+            // Blocks while a spawn is in progress.
+            let mut waiting = lock(waiting);
             let mut raw = 0;
             // SAFETY: `raw` is a valid place for the status.
-            let pid = unsafe { libc::waitpid(-1, &raw mut raw, 0) };
-            if pid > 0 {
-                let notify = lock(waiting).remove(&pid);
-                if let Some(notify) = notify {
-                    notify(ExitStatus::from_raw(raw));
-                }
-                continue;
-            }
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => {}
-                // No children right now.
-                Some(libc::ECHILD) => std::thread::sleep(Duration::from_millis(50)),
-                _ => {
-                    eprintln!(
-                        "spawn-guest: waitpid failed: {}",
-                        io::Error::last_os_error()
-                    );
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+            let reaped = unsafe { libc::waitpid(pid, &raw mut raw, libc::WNOHANG) };
+            // Otherwise a failed spawn reaped it already.
+            if reaped == pid
+                && let Some(notify) = waiting.remove(&pid)
+            {
+                drop(waiting);
+                notify(ExitStatus::from_raw(raw));
             }
         }
     }
