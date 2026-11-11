@@ -11,7 +11,8 @@ use serde_json::{Map, Value, json};
 use crate::api::{Api, ApiError, seg};
 use crate::{
     Cli, Command, CreateArgs, EgressArgs, EventsArgs, ExecArgs, KeysCommand, PortsCommand,
-    SecretsCommand, TemplatesCommand, TenantsCommand, VolumesCommand, config, files, pty,
+    SecretsCommand, ServicesArgs, ServicesCommand, TemplatesCommand, TenantsCommand,
+    VolumesCommand, config, files, pty,
 };
 
 const DEFAULT_URL: &str = "http://127.0.0.1:8080";
@@ -124,6 +125,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Ports(command) => ports(&api, &out, command).await,
+        Command::Services(args) => services(&api, &out, args).await,
         Command::Templates(command) => templates(&api, &out, command).await,
         Command::Secrets(command) => secrets(&api, &out, command).await,
         Command::Volumes(command) => volumes(&api, &out, command).await,
@@ -288,6 +290,13 @@ async fn create(api: &Api, out: &Out, args: CreateArgs) -> Result<i32> {
         .iter()
         .map(|v| volume_mount(v))
         .collect::<Result<Vec<_>>>()?;
+    let file = match &args.service_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let services = service_list(&args.services, file.as_deref())?;
     let body = object([
         ("template", args.template.map(Value::from)),
         ("tenant", args.tenant.map(Value::from)),
@@ -301,6 +310,7 @@ async fn create(api: &Api, out: &Out, args: CreateArgs) -> Result<i32> {
             (!args.secrets.is_empty()).then(|| json!(args.secrets)),
         ),
         ("volumes", (!volumes.is_empty()).then(|| json!(volumes))),
+        ("services", (!services.is_empty()).then(|| json!(services))),
         ("egress", egress(args.egress)),
     ]);
     let sandbox = api.post("/sandboxes", &body).await?;
@@ -468,6 +478,106 @@ async fn ports(api: &Api, out: &Out, command: PortsCommand) -> Result<i32> {
         PortsCommand::Rm { id, port } => {
             api.delete(&format!("/sandboxes/{}/ports/{port}", seg(&id)))
                 .await?;
+        }
+    }
+    Ok(0)
+}
+
+/// The services of `--service` values, then those of a `--service-file`
+/// that holds a list.
+fn service_list(items: &[String], file: Option<&str>) -> Result<Vec<Value>> {
+    let mut services = items
+        .iter()
+        .map(|item| {
+            let service: Value = serde_json::from_str(item)
+                .with_context(|| format!("--service {item:?} is not JSON"))?;
+            anyhow::ensure!(
+                service.is_object(),
+                "--service {item:?} must be a JSON object"
+            );
+            Ok(service)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(file) = file {
+        let listed: Vec<Value> =
+            serde_json::from_str(file).context("--service-file must hold a JSON list")?;
+        services.extend(listed);
+    }
+    Ok(services)
+}
+
+async fn services(api: &Api, out: &Out, args: ServicesArgs) -> Result<i32> {
+    let command = match (args.command, args.id) {
+        (Some(command), _) => command,
+        (None, Some(id)) => ServicesCommand::Ls { id },
+        (None, None) => bail!("give a sandbox ID, or a command: ls, restart or logs"),
+    };
+    match command {
+        ServicesCommand::Ls { id } => {
+            let list = api
+                .get(&format!("/sandboxes/{}/services", seg(&id)))
+                .await?;
+            let items = list["services"].as_array().cloned().unwrap_or_default();
+            let items: Vec<Value> = items
+                .into_iter()
+                .map(|mut item| {
+                    item["last_exit"] = match &item["last_exit"] {
+                        Value::Null => Value::Null,
+                        exit if !exit["code"].is_null() => json!(format!("code {}", exit["code"])),
+                        exit => json!(format!("signal {}", exit["signal"])),
+                    };
+                    item
+                })
+                .collect();
+            out.table(
+                &list,
+                &items,
+                &[
+                    ("NAME", "name"),
+                    ("STATE", "state"),
+                    ("PID", "pid"),
+                    ("RESTARTS", "restarts"),
+                    ("LAST EXIT", "last_exit"),
+                    ("STARTED", "started_at"),
+                ],
+            );
+        }
+        ServicesCommand::Restart { id, name } => {
+            api.post(
+                &format!("/sandboxes/{}/services/{}:restart", seg(&id), seg(&name)),
+                &json!({}),
+            )
+            .await?;
+        }
+        ServicesCommand::Logs { id, name, follow } => {
+            let path = format!("/sandboxes/{}/services/{}/logs", seg(&id), seg(&name));
+            let mut stdout = std::io::stdout();
+            if !follow {
+                let response = api.send(api.request(Method::GET, &path)).await?;
+                stdout.write_all(&response.bytes().await?)?;
+                return Ok(0);
+            }
+            let request = api.request(Method::GET, &path).query(&[("follow", "true")]);
+            api.events(request, |event| {
+                let data: Value = serde_json::from_str(&event.data).unwrap_or_default();
+                match event.event.as_str() {
+                    "output" => {
+                        stdout.write_all(text(&data["text"]).as_bytes())?;
+                        stdout.flush()?;
+                    }
+                    "error" => {
+                        let error = ApiError::from_body(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            event.data.as_bytes(),
+                        );
+                        return Err(error.into());
+                    }
+                    _ => {}
+                }
+                Ok(None::<()>)
+            })
+            .await?;
+            bail!("the log stream ended");
         }
     }
     Ok(0)
@@ -1090,6 +1200,20 @@ mod tests {
             json!({"running_sandboxes": 5, "monthly_egress_bytes": null})
         );
         assert!(quotas(&["running_sandboxes=lots".into()]).is_err());
+    }
+
+    #[test]
+    fn reads_services_from_flags_and_a_file() {
+        let services = service_list(
+            &[r#"{"name":"web","command":["srv"]}"#.into()],
+            Some(r#"[{"name":"job","command":["work"]}]"#),
+        )
+        .unwrap();
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[1]["name"], "job");
+        assert!(service_list(&["web".into()], None).is_err());
+        assert!(service_list(&["[]".into()], None).is_err());
+        assert!(service_list(&[], Some(r#"{"name":"web"}"#)).is_err());
     }
 
     #[test]
