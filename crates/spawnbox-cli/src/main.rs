@@ -153,7 +153,11 @@ pub enum Command {
         by_sandbox: bool,
     },
     /// Check this host's prerequisites for running Spawnbox (operators)
-    Doctor,
+    Doctor {
+        /// The server's data directory, whose disk should be encrypted
+        #[arg(long, default_value = "/var/lib/spawnbox")]
+        data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -460,8 +464,8 @@ pub struct EventsArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Doctor) {
-        return doctor::run();
+    if let Command::Doctor { data_dir } = &cli.command {
+        return doctor::run(data_dir);
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let runtime = match tokio::runtime::Runtime::new() {

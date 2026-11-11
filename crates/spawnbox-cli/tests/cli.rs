@@ -74,6 +74,7 @@ fn doctor_reports_all_checks_and_its_limits() {
         "x86_64 architecture",
         "Sandbox backend",
         "cgroup v2 controllers",
+        "Data directory encryption",
         "not a sandbox test",
     ] {
         assert!(stdout.contains(name), "missing {name}: {stdout}");

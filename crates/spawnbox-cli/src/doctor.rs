@@ -1,37 +1,63 @@
+use std::path::Path;
+
+#[cfg(any(target_os = "linux", test))]
+mod disk;
 use std::process::ExitCode;
 
 struct Check {
     name: &'static str,
-    result: Result<String, String>,
+    result: Outcome,
 }
 
-pub fn run() -> ExitCode {
+/// A warning does not fail the run.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Pass(String),
+    Warn(String),
+    Fail(String),
+}
+
+impl From<Result<String, String>> for Outcome {
+    fn from(result: Result<String, String>) -> Self {
+        match result {
+            Ok(detail) => Self::Pass(detail),
+            Err(detail) => Self::Fail(detail),
+        }
+    }
+}
+
+pub fn run(data_dir: &Path) -> ExitCode {
     println!("Spawnbox: basic host checks\n");
 
     let checks = [
         Check {
             name: "Linux host",
-            result: require_linux(std::env::consts::OS),
+            result: require_linux(std::env::consts::OS).into(),
         },
         Check {
             name: "x86_64 architecture",
-            result: require_architecture(std::env::consts::ARCH),
+            result: require_architecture(std::env::consts::ARCH).into(),
         },
         Check {
             name: "Sandbox backend",
-            result: check_backend(),
+            result: check_backend().into(),
         },
         Check {
             name: "cgroup v2 controllers",
-            result: check_cgroups(),
+            result: check_cgroups().into(),
+        },
+        Check {
+            name: "Data directory encryption",
+            result: check_encryption(data_dir),
         },
     ];
 
     let mut passed = true;
     for check in checks {
         match check.result {
-            Ok(detail) => println!("PASS  {}: {detail}", check.name),
-            Err(detail) => {
+            Outcome::Pass(detail) => println!("PASS  {}: {detail}", check.name),
+            Outcome::Warn(detail) => println!("WARN  {}: {detail}", check.name),
+            Outcome::Fail(detail) => {
                 passed = false;
                 println!("FAIL  {}: {detail}", check.name);
             }
@@ -41,7 +67,7 @@ pub fn run() -> ExitCode {
     println!(
         "\nThis is a prerequisite check, not a sandbox test. \
          It does not check cgroup delegation, Firecracker or runsc installation, \
-         guest images, storage, or network setup."
+         guest images, free storage, or network setup."
     );
 
     if passed {
@@ -139,6 +165,28 @@ fn require_controllers(controllers: &str) -> Result<String, String> {
             missing.join(", ")
         ))
     }
+}
+
+/// Paused sandboxes' memory and disks are stored in the data directory in
+/// plain, so it should be on an encrypted disk.
+#[cfg(target_os = "linux")]
+fn check_encryption(data_dir: &Path) -> Outcome {
+    use disk::{Host, SysFs};
+
+    // The directory may not exist yet: the disk is that of its nearest
+    // parent that does.
+    let Some(path) = data_dir.ancestors().find_map(|p| p.canonicalize().ok()) else {
+        return Outcome::Warn(format!("cannot resolve {}", data_dir.display()));
+    };
+    let Some(mountinfo) = SysFs.read("/proc/self/mountinfo") else {
+        return Outcome::Warn("cannot read /proc/self/mountinfo".to_owned());
+    };
+    disk::encryption(&SysFs, &mountinfo, data_dir, &path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_encryption(_data_dir: &Path) -> Outcome {
+    Outcome::Warn("requires Linux; disk encryption not checked".to_owned())
 }
 
 #[cfg(test)]
