@@ -14,7 +14,7 @@ pub const GUEST_VSOCK_PORT: u32 = 1024;
 /// The TCP port `spawn-guest` listens on under gVisor, which has no vsock.
 pub const GUEST_TCP_PORT: u16 = 1024;
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 5 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 6 };
 
 /// The host accepts guests with the same major version and at most
 /// two minor versions apart, so older builds keep working after upgrades.

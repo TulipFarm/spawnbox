@@ -29,7 +29,7 @@ use crate::hub::{ExecLog, Hub};
 use crate::ids;
 use crate::metering::{Meter, Rate};
 use crate::metrics;
-use crate::model::{ApiError, BASE_TEMPLATE, Code, CreateSandbox, Exec, Timings};
+use crate::model::{ApiError, BASE_TEMPLATE, Code, CreateSandbox, Exec, Service, Timings};
 use crate::ports::{self, Access, Publish};
 use crate::secretbox::SecretBox;
 use crate::secrets::Secrets;
@@ -41,6 +41,7 @@ use crate::warm::{self, PoolView};
 
 mod fork;
 mod pressure;
+pub mod services;
 
 pub use fork::MAX_FORK;
 
@@ -97,6 +98,8 @@ struct Record {
     /// VM are ignored.
     generation: i64,
     persistent: bool,
+    /// Programs the guest keeps running, as created.
+    services: Vec<Service>,
 }
 
 /// A cold sandbox's new VM, before it is recorded.
@@ -106,6 +109,9 @@ struct Booted {
     env: BTreeMap<String, String>,
     secrets: Vec<Attached>,
     mounted: bool,
+    services: Vec<Service>,
+    /// The guest's last service event before they started.
+    seq: u64,
 }
 
 /// A move that takes longer than this was abandoned.
@@ -172,8 +178,8 @@ pub struct Published {
 }
 
 /// What a paused sandbox needs to resume, also after a server restart.
-/// Stored with `env` sealed in `env_sealed`; sent to other hosts with it
-/// in plain.
+/// Stored with `env` and `services` sealed in `env_sealed` and
+/// `services_sealed`; sent to other hosts with them in plain.
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
@@ -186,6 +192,10 @@ struct Saved {
     vcpus: u8,
     memory_mib: u32,
     remaining_ms: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    services: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    services_sealed: Option<String>,
 }
 
 struct Inner {
@@ -904,6 +914,8 @@ impl Sandboxes {
                 placeholder,
             });
         }
+        services::check_env(&req.services, &placeholders)?;
+        let service_ports = services::ports(&req.services)?;
         let template = req.template.as_deref().unwrap_or(BASE_TEMPLATE);
         // Held until the VM is restored, so the build's files stay in place.
         let (_, ready) = self.templates.ready(Some(&tenant.id), template)?;
@@ -1006,7 +1018,7 @@ impl Sandboxes {
                 .unwrap_or_else(|| ApiError::internal("persistent sandbox refused")),
         };
         let inserted = if persistent {
-            self.start_record(&sandbox, &ready, &req.env)
+            self.start_record(&sandbox, &ready, &req.env, &req.services, &service_ports)
                 .and_then(|start| {
                     let limit = tenant.quotas.persistent_sandboxes;
                     Ok(self.db.insert_persistent(&sandbox, &start, limit)?)
@@ -1050,6 +1062,13 @@ impl Sandboxes {
             policies,
             attached.clone(),
         );
+        let mut env: BTreeMap<String, String> = CA_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        env.extend(ready.spec.env.clone());
+        env.extend(req.env);
+        env.extend(placeholders);
         let restoring = Instant::now();
         let started = async {
             let cold = async {
@@ -1091,16 +1110,25 @@ impl Sandboxes {
             let fixups = async {
                 restored.vm.set_rates(send, receive).await?;
                 guest::apply(&restored.channel, new_identity(&name)?).await?;
-                guest::mount(&restored.channel, &mounts).await
+                guest::mount(&restored.channel, &mounts).await?;
+                if req.services.is_empty() {
+                    return anyhow::Ok(None);
+                }
+                Ok(Some(
+                    services::start(&restored.channel, &env, &req.services).await?,
+                ))
             };
-            if let Err(error) = fixups.await {
-                restored.vm.stop().await;
-                return Err(error);
-            }
-            anyhow::Ok((restored, apply_start, warmed))
+            let seq = match fixups.await {
+                Ok(seq) => seq,
+                Err(error) => {
+                    restored.vm.stop().await;
+                    return Err(error);
+                }
+            };
+            anyhow::Ok((restored, apply_start, warmed, seq))
         }
         .await;
-        let (restored, apply_start, from_pool) = match started {
+        let (restored, apply_start, from_pool, seq) = match started {
             Ok(ok) => ok,
             Err(error) => {
                 eprintln!("create {}: {error:#}", sandbox.id);
@@ -1114,6 +1142,9 @@ impl Sandboxes {
                     &sandbox.id,
                     json!({ "reason": "failed to start" }),
                 );
+                if services::unsupported(&error) {
+                    return Err(services::unsupported_error());
+                }
                 return Err(ApiError::internal(format!(
                     "sandbox {} failed to start; see the server log",
                     sandbox.id
@@ -1130,13 +1161,6 @@ impl Sandboxes {
         let applying = started + apply_start;
         span.step("restore", restoring, applying);
         span.step("fixups", applying, Instant::now());
-        let mut env: BTreeMap<String, String> = CA_ENV
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        env.extend(ready.spec.env.clone());
-        env.extend(req.env);
-        env.extend(placeholders);
         let limits = ready.build.limits;
         drop(ready);
         let ms = |d: Duration| round(d.as_secs_f64() * 1000.0);
@@ -1195,6 +1219,7 @@ impl Sandboxes {
             "labels": sandbox.labels,
             "timings_ms": timings,
             "warm": from_pool,
+            "services": req.services.iter().map(|s| &s.name).collect::<Vec<_>>(),
         });
         let tenant_id = tenant.id.clone();
         let disk_bytes = disk_bytes(&live.vm);
@@ -1204,7 +1229,7 @@ impl Sandboxes {
                 tenant: tenant.id,
                 vm: VmState::Running(Box::new(live)),
                 env,
-                ports: BTreeMap::new(),
+                ports: service_ports,
                 egress,
                 secrets: attached,
                 volumes: sandbox.volumes.clone(),
@@ -1219,6 +1244,7 @@ impl Sandboxes {
                 moving: None,
                 generation: 1,
                 persistent,
+                services: req.services,
             },
         );
         let started = match self.db.start_running(&sandbox.id, 1) {
@@ -1248,6 +1274,9 @@ impl Sandboxes {
         }
         sandbox.state = state::RUNNING.into();
         self.event("sandbox.created", origin, &tenant_id, &sandbox.id, created);
+        if let Some(seq) = seq {
+            self.watch_services(&sandbox.id, 1, Some(seq));
+        }
         if let Some(lost) = lost {
             let (this, id, origin) = (self.clone(), sandbox.id.clone(), origin.clone());
             tokio::spawn(async move {
@@ -1267,11 +1296,15 @@ impl Sandboxes {
         sandbox: &db::Sandbox,
         ready: &ReadyBuild,
         env: &BTreeMap<String, String>,
+        services: &[Service],
+        ports: &BTreeMap<u16, Published>,
     ) -> Result<db::StartRecord, ApiError> {
-        let sealed = self
-            .secrets
-            .sbox()
+        let sbox = self.secrets.sbox();
+        let sealed = sbox
             .seal_env(&sandbox.tenant, &sandbox.id, env)
+            .map_err(ApiError::internal)?;
+        let services = sbox
+            .seal_services(&sandbox.tenant, &sandbox.id, services)
             .map_err(ApiError::internal)?;
         Ok(db::StartRecord {
             sandbox: sandbox.id.clone(),
@@ -1284,11 +1317,12 @@ impl Sandboxes {
             egress: sandbox.egress.clone(),
             secrets: sandbox.secrets.clone(),
             volumes: sandbox.volumes.clone(),
-            ports: "{}".into(),
+            ports: to_json(ports),
             idle_pause_s: sandbox.idle_pause_s,
             env: sealed,
             created_at: sandbox.created_at,
             updated_at: sandbox.created_at,
+            services,
         })
     }
 
@@ -1675,6 +1709,8 @@ impl Sandboxes {
             env,
             secrets,
             mounted,
+            services,
+            seq,
         } = booted;
         let Restored {
             mut vm, channel, ..
@@ -1712,6 +1748,7 @@ impl Sandboxes {
                 moving: None,
                 generation,
                 persistent: true,
+                services,
             },
         );
         let finished = if self.closing.load(Ordering::SeqCst) {
@@ -1759,6 +1796,7 @@ impl Sandboxes {
                 "duration_ms": u64::try_from(duration_ms).unwrap_or(u64::MAX),
             }),
         );
+        self.watch_services(id, generation, Some(seq));
         if let Some(lost) = lost {
             let (this, id, origin) = (self.clone(), id.to_owned(), origin.clone());
             tokio::spawn(async move {
@@ -1792,6 +1830,11 @@ impl Sandboxes {
             .sbox()
             .open_env(&start.tenant, &start.sandbox, &start.env)
             .ok_or_else(|| ApiError::internal("the start record's env cannot be read"))?;
+        let services = self
+            .secrets
+            .sbox()
+            .open_services(&start.tenant, &start.sandbox, &start.services)
+            .ok_or_else(|| ApiError::internal("the start record's services cannot be read"))?;
         let mut env: BTreeMap<String, String> = CA_ENV
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -1840,18 +1883,30 @@ impl Sandboxes {
         let fixups = async {
             restored.vm.set_rates(send, receive).await?;
             guest::apply(&restored.channel, new_identity(&name)?).await?;
-            guest::mount(&restored.channel, &mounts).await
+            guest::mount(&restored.channel, &mounts).await?;
+            if services.is_empty() {
+                return anyhow::Ok(0);
+            }
+            services::start(&restored.channel, &env, &services).await
         };
-        if let Err(error) = fixups.await {
-            restored.vm.stop().await;
-            return Err(ApiError::internal(format!("{error:#}")));
-        }
+        let seq = match fixups.await {
+            Ok(seq) => seq,
+            Err(error) => {
+                restored.vm.stop().await;
+                if services::unsupported(&error) {
+                    return Err(services::unsupported_error());
+                }
+                return Err(ApiError::internal(format!("{error:#}")));
+            }
+        };
         Ok(Booted {
             restored,
             index,
             env,
             secrets,
             mounted: !mounts.is_empty(),
+            services,
+            seq,
         })
     }
 
@@ -2498,8 +2553,12 @@ impl Sandboxes {
             };
             let id = sandbox.id.clone();
             let record = self.paused_record(sandbox, saved, &dir)?;
+            let watch = (!record.services.is_empty()).then_some(record.generation);
             loaded.insert(id.clone());
-            self.inner().records.insert(id, record);
+            self.inner().records.insert(id.clone(), record);
+            if let Some(generation) = watch {
+                self.watch_services(&id, generation, None);
+            }
         }
         if let Ok(entries) = std::fs::read_dir(&self.settings.paused_dir) {
             for entry in entries.flatten() {
@@ -2552,6 +2611,7 @@ impl Sandboxes {
             moving: None,
             generation: sandbox.generation,
             persistent: sandbox.persistent,
+            services: saved.services,
         })
     }
 
@@ -2645,12 +2705,16 @@ impl Sandboxes {
             }
         };
         let lock = Arc::clone(&record.lock);
+        let watch = (!record.services.is_empty()).then_some(record.generation);
         {
             let mut inner = self.inner();
             if here(&inner) {
                 return Err(ApiError::new(Code::Conflict, "sandbox is already here"));
             }
             inner.records.insert(id.clone(), record);
+        }
+        if let Some(generation) = watch {
+            self.watch_services(&id, generation, None);
         }
         let _changing = lock.lock().await;
         let prior = match self.db.take_over(&sandbox, paused_at, &stored) {
@@ -2823,6 +2887,8 @@ fn saved(record: &Record, remaining_ms: i64) -> Saved {
         vcpus: record.limits.vcpus,
         memory_mib: record.limits.memory_mib,
         remaining_ms,
+        services: record.services.clone(),
+        services_sealed: None,
     }
 }
 
@@ -2862,6 +2928,13 @@ fn seal_saved(
         .map_err(ApiError::internal)?;
     saved.env = BTreeMap::new();
     saved.env_sealed = Some(B64.encode(sealed));
+    if !saved.services.is_empty() {
+        let sealed = sbox
+            .seal_services(tenant, id, &saved.services)
+            .map_err(ApiError::internal)?;
+        saved.services = Vec::new();
+        saved.services_sealed = Some(B64.encode(sealed));
+    }
     Ok(to_json(&saved))
 }
 
@@ -2872,6 +2945,10 @@ fn open_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Sa
     if let Some(sealed) = saved.env_sealed.take() {
         let sealed = B64.decode(sealed).ok()?;
         saved.env = sbox.open_env(tenant, id, &sealed)?;
+    }
+    if let Some(sealed) = saved.services_sealed.take() {
+        let sealed = B64.decode(sealed).ok()?;
+        saved.services = sbox.open_services(tenant, id, &sealed)?;
     }
     Some(saved)
 }
@@ -2925,11 +3002,18 @@ mod tests {
             vcpus: 1,
             memory_mib: 256,
             remaining_ms: 5,
+            services: serde_json::from_str(
+                r#"[{"name":"web","command":["srv"],"env":{"KEY":"swordfish"}}]"#,
+            )
+            .unwrap(),
+            services_sealed: None,
         };
         let stored = seal_saved(&sbox, "t", "sbx_a", saved.clone()).unwrap();
         assert!(!stored.contains("hunter2"));
+        assert!(!stored.contains("swordfish"));
         let opened = open_saved(&sbox, "t", "sbx_a", &stored).unwrap();
         assert_eq!(opened.env, saved.env);
+        assert_eq!(opened.services, saved.services);
         assert!(open_saved(&sbox, "t", "sbx_b", &stored).is_none());
         assert!(open_saved(&sbox, "u", "sbx_a", &stored).is_none());
         // Rows stored before env was sealed still read.

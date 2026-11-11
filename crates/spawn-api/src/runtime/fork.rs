@@ -19,7 +19,7 @@ use crate::egress::CA_ENV;
 use crate::events::Origin;
 use crate::ids;
 use crate::model::{
-    ApiError, BASE_TEMPLATE, Code, Resources, SnapshotOf, TemplateSpec, is_template_name,
+    ApiError, BASE_TEMPLATE, Code, Resources, Service, SnapshotOf, TemplateSpec, is_template_name,
 };
 use crate::tenancy::{Quotas, scoped};
 
@@ -38,6 +38,7 @@ struct Source {
     has_layer: bool,
     own_rootfs: bool,
     persistent: bool,
+    services: Vec<Service>,
 }
 
 /// A copy with its quota and slot, before it starts.
@@ -289,6 +290,7 @@ impl Sandboxes {
             has_layer: live.vm.has_layer(),
             own_rootfs: live.vm.owns_rootfs(self.templates.base_rootfs()),
             persistent: record.persistent,
+            services: record.services.clone(),
         })
     }
 
@@ -454,7 +456,8 @@ impl Sandboxes {
                 tenant: source.tenant.clone(),
                 vm: VmState::Running(Box::new(live)),
                 env: source.env.clone(),
-                ports: BTreeMap::new(),
+                // The copy's services run already, from the snapshot.
+                ports: super::services::ports(&source.services).unwrap_or_default(),
                 egress: source.egress.clone(),
                 secrets: source.secrets.clone(),
                 volumes: Vec::new(),
@@ -469,6 +472,7 @@ impl Sandboxes {
                 moving: None,
                 generation: 1,
                 persistent: false,
+                services: source.services.clone(),
             },
         );
         drop(admission);
@@ -494,12 +498,16 @@ impl Sandboxes {
                 "template": sandbox.template,
                 "build": sandbox.build,
                 "forked_from": row.id,
+                "services": source.services.iter().map(|s| &s.name).collect::<Vec<_>>(),
                 "vcpus": source.limits.vcpus,
                 "memory_mib": source.limits.memory_mib,
                 "labels": sandbox.labels,
                 "secrets": sandbox.secrets,
             }),
         );
+        if !source.services.is_empty() {
+            self.watch_services(&id, 1, None);
+        }
         Some(sandbox)
     }
 }

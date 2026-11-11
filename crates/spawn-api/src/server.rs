@@ -62,6 +62,7 @@ use crate::otlp::Otlp;
 use crate::runtime::{Busy, Parts, Sandboxes, Settings, now_ms};
 use crate::secretbox::SecretBox;
 use crate::secrets::{self, Secrets};
+use crate::services;
 use crate::store::BuildStore;
 use crate::templates::{Inputs, Slots, Templates};
 use crate::tenancy::{
@@ -1057,6 +1058,12 @@ pub fn router(app: AppState) -> Router {
         .route(
             "/v1/sandboxes/{id}/ports/{port}",
             axum::routing::delete(preview::unpublish),
+        )
+        .route("/v1/sandboxes/{id}/services", get(services::list))
+        .route("/v1/sandboxes/{id}/services/{name}", post(services::action))
+        .route(
+            "/v1/sandboxes/{id}/services/{name}/logs",
+            get(services::logs),
         )
         .route(
             "/v1/sandboxes/{id}/files",

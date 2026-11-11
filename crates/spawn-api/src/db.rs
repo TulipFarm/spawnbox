@@ -215,6 +215,7 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     CREATE INDEX start_records_build ON start_records (build);",
+    "ALTER TABLE start_records ADD COLUMN services BLOB NOT NULL DEFAULT X'';",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -430,6 +431,7 @@ const PG_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL
     );
     CREATE INDEX start_records_build ON start_records (build);"#,
+    "ALTER TABLE start_records ADD COLUMN services BYTEA NOT NULL DEFAULT '';",
 ];
 
 pub mod state {
@@ -596,6 +598,8 @@ pub struct StartRecord {
     pub idle_pause_s: u64,
     /// The env map, sealed with `SecretBox::seal_env`.
     pub env: Vec<u8>,
+    /// The services, sealed with `SecretBox::seal_services`. Empty if none.
+    pub services: Vec<u8>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -956,8 +960,8 @@ impl Db {
             tx.execute(
                 "INSERT INTO start_records
                  (sandbox, tenant, template, build, spec, vcpus, memory_mib, egress, secrets,
-                  volumes, ports, idle_pause_s, env, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  volumes, ports, idle_pause_s, env, created_at, updated_at, services)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     start.sandbox,
                     start.tenant,
@@ -974,6 +978,7 @@ impl Db {
                     start.env.clone(),
                     start.created_at,
                     start.updated_at,
+                    start.services.clone(),
                 ],
             )?;
         }
@@ -985,7 +990,8 @@ impl Db {
         self.conn()
             .query_row(
                 "SELECT sandbox, tenant, template, build, spec, vcpus, memory_mib, egress,
-                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at
+                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at,
+                        services
                  FROM start_records WHERE sandbox = ?1",
                 [sandbox],
                 |row| {
@@ -1005,6 +1011,7 @@ impl Db {
                         env: row.get(12)?,
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
+                        services: row.get(15)?,
                     })
                 },
             )
@@ -3120,6 +3127,7 @@ mod tests {
             ports: "{}".into(),
             idle_pause_s: 600,
             env: vec![1, 2, 3],
+            services: vec![4, 5],
             created_at: 1,
             updated_at: 1,
         }

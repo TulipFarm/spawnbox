@@ -64,6 +64,25 @@ service Volumes {
   rpc Mount(MountRequest) returns (MountResponse);
 }
 
+// Programs that the guest keeps running. PID 1 runs them, so they outlive
+// a restart of the agent, which forwards these calls to it. Guests before
+// protocol 0.6 answer UNIMPLEMENTED.
+service Services {
+  // Makes the running services match the list, by name: a service with the
+  // same spec is left alone, a changed one is restarted, a missing one is
+  // started and one not in the list is stopped.
+  rpc Start(ServicesStartRequest) returns (ServicesStartResponse);
+  rpc List(ServicesListRequest) returns (ServicesListResponse);
+  // Stops one service and starts it again at once. NOT_FOUND if unknown.
+  rpc Restart(ServiceRestartRequest) returns (ServiceRestartResponse);
+  // The service's recent output: stdout and stderr together. With
+  // `follow`, the stream then carries new output as it comes.
+  rpc Logs(ServiceLogsRequest) returns (stream ServiceLogChunk);
+  // Changes of state, in order. Each has a sequence number; the guest
+  // keeps the last few, so a watcher can reconnect without gaps.
+  rpc Watch(ServicesWatchRequest) returns (stream ServiceEvent);
+}
+
 message ProtocolVersion {
   uint32 major = 1;
   uint32 minor = 2;
@@ -263,4 +282,115 @@ message PortInput {
 
 message PortOutput {
   bytes data = 1;
+}
+
+message ServiceSpec {
+  // `a-z`, digits and `-`. Unique in a sandbox.
+  string name = 1;
+  // Program and arguments. Run through a login shell, with `exec`, so the
+  // program is found on the user's PATH and gets the signals itself.
+  repeated string command = 2;
+  // Empty means /workspace.
+  string cwd = 3;
+  // The service's whole environment, on top of PATH, HOME, USER, LOGNAME
+  // and LANG.
+  map<string, string> env = 4;
+  // Empty means `user` (uid 1000).
+  string user = 5;
+  // The port it listens on, or 0. Health checks use it.
+  uint32 port = 6;
+  // None: a service whose process runs is healthy.
+  ServiceHealth health = 7;
+  ServiceRestart restart = 8;
+}
+
+enum ServiceRestart {
+  // Start it again whenever it ends.
+  SERVICE_RESTART_ALWAYS = 0;
+  // Only when it ends with a non-zero code or a signal.
+  SERVICE_RESTART_ON_FAILURE = 1;
+}
+
+message ServiceHealth {
+  oneof check {
+    // GET this path on 127.0.0.1 at the service's port; any 2xx passes.
+    string http = 1;
+    // Passes when the port accepts a connection.
+    bool tcp = 2;
+  }
+  uint32 interval_s = 3;
+  // Failed checks in a row that restart the service.
+  uint32 failures = 4;
+}
+
+message ServicesStartRequest {
+  repeated ServiceSpec services = 1;
+}
+
+message ServicesStartResponse {
+  // The last event before this start. Watch after it to see its events.
+  uint64 seq = 1;
+}
+
+message ServicesListRequest {}
+
+message ServiceExit {
+  // Set when the process exited normally.
+  optional int32 code = 1;
+  // Set when the process was killed by a signal.
+  optional int32 signal = 2;
+}
+
+message ServiceStatus {
+  string name = 1;
+  // `starting`, `healthy`, `unhealthy`, `backoff` or `stopped`.
+  string state = 2;
+  // 0 when no process runs.
+  uint32 pid = 3;
+  uint32 restarts = 4;
+  ServiceExit last_exit = 5;
+  // When the current process started, in ms since the Unix epoch. 0 when
+  // no process runs.
+  int64 started_at_ms = 6;
+}
+
+message ServicesListResponse {
+  repeated ServiceStatus services = 1;
+}
+
+message ServiceRestartRequest {
+  string name = 1;
+}
+
+message ServiceRestartResponse {}
+
+message ServiceLogsRequest {
+  string name = 1;
+  bool follow = 2;
+}
+
+message ServiceLogChunk {
+  bytes data = 1;
+}
+
+message ServicesWatchRequest {
+  // Events after this one; the guest still has up to its last 256.
+  uint64 after = 1;
+  // Only events from now on; `after` is ignored.
+  bool from_now = 2;
+}
+
+message ServiceEvent {
+  uint64 seq = 1;
+  string name = 2;
+  // `started`, `exited`, `unhealthy` or `restarted`.
+  string kind = 3;
+  // `started`: its process.
+  uint32 pid = 4;
+  // `exited`: how it ended.
+  ServiceExit exit = 5;
+  // `restarted`: `exit`, `unhealthy` or `request`.
+  string reason = 6;
+  // `restarted`: the count so far. `unhealthy`: failed checks in a row.
+  uint32 count = 7;
 }

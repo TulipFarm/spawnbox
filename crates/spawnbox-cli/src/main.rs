@@ -119,6 +119,9 @@ pub enum Command {
     /// Preview URLs for ports in a sandbox
     #[command(subcommand)]
     Ports(PortsCommand),
+    /// Services: programs Spawnbox keeps running in a sandbox. With an ID, list them
+    #[command(alias = "service", args_conflicts_with_subcommands = true)]
+    Services(ServicesArgs),
     /// Templates: start images with your packages
     #[command(subcommand, alias = "template")]
     Templates(TemplatesCommand),
@@ -180,6 +183,12 @@ pub struct CreateArgs {
     /// Mount a volume: NAME:/path, or NAME:/path:ro to read only. Can repeat
     #[arg(long = "volume", short = 'v', value_name = "NAME:PATH[:ro]")]
     pub volumes: Vec<String>,
+    /// A service as JSON, for example '{"name":"web","command":["python3","-m","http.server"],"port":8000}'. Can repeat
+    #[arg(long = "service", value_name = "JSON")]
+    pub services: Vec<String>,
+    /// A JSON file with a list of services
+    #[arg(long, value_name = "PATH")]
+    pub service_file: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub egress: EgressArgs,
 }
@@ -235,6 +244,29 @@ pub enum PortsCommand {
     Ls { id: String },
     /// Remove a published port
     Rm { id: String, port: u16 },
+}
+
+#[derive(Args)]
+pub struct ServicesArgs {
+    pub id: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<ServicesCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum ServicesCommand {
+    /// List a sandbox's services and their state
+    Ls { id: String },
+    /// Stop a service and start it again
+    Restart { id: String, name: String },
+    /// Print a service's recent output
+    Logs {
+        id: String,
+        name: String,
+        /// Keep the connection open and print new output
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
 }
 
 #[derive(Subcommand)]

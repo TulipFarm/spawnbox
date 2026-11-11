@@ -9,12 +9,16 @@ use spawn_proto::guest::v1::image_server::{Image, ImageServer};
 use spawn_proto::guest::v1::ports_server::{Ports, PortsServer};
 use spawn_proto::guest::v1::process_server::{Process, ProcessServer};
 use spawn_proto::guest::v1::pty_server::{Pty, PtyServer};
+use spawn_proto::guest::v1::services_client::ServicesClient;
+use spawn_proto::guest::v1::services_server::{Services, ServicesServer};
 use spawn_proto::guest::v1::volumes_server::{Volumes, VolumesServer};
 use spawn_proto::guest::v1::{
     ApplyRequest, ApplyResponse, ExecEvent, ExecRequest, FileInfo, HelloRequest, HelloResponse,
     ListResponse, MountRequest, MountResponse, PathRequest, PortInput, PortOutput, PtyInput,
-    PtyOutput, ReadChunk, RemoveRequest, RemoveResponse, SealRequest, SealResponse, UnpackEvent,
-    UnpackRequest, WriteChunk, port_input, pty_input,
+    PtyOutput, ReadChunk, RemoveRequest, RemoveResponse, SealRequest, SealResponse, ServiceEvent,
+    ServiceLogChunk, ServiceLogsRequest, ServiceRestartRequest, ServiceRestartResponse,
+    ServicesListRequest, ServicesListResponse, ServicesStartRequest, ServicesStartResponse,
+    ServicesWatchRequest, UnpackEvent, UnpackRequest, WriteChunk, port_input, pty_input,
 };
 use spawn_proto::{GUEST_TCP_PORT, GUEST_VSOCK_PORT, PROTOCOL_VERSION};
 use tokio::net::TcpListener;
@@ -22,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::{Stream, StreamExt};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
+use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{exec, files, identity, ports, pty, unpack, volumes};
@@ -82,6 +87,7 @@ fn services() -> tonic::transport::server::Router {
         .add_service(PtyServer::new(Agent))
         .add_service(PortsServer::new(Agent))
         .add_service(VolumesServer::new(Agent))
+        .add_service(ServicesServer::new(Agent))
 }
 
 struct Agent;
@@ -258,5 +264,60 @@ impl Ports for Agent {
         let (tx, rx) = mpsc::channel(16);
         ports::run(stream, input, tx);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+/// The supervisor in PID 1, which runs the services.
+async fn supervisor() -> Result<ServicesClient<Channel>, Status> {
+    let channel = Endpoint::from_static("http://supervisor")
+        .connect_with_connector(tower::service_fn(|_: Uri| async {
+            tokio::net::UnixStream::connect(crate::supervisor::SOCKET)
+                .await
+                .map(hyper_util::rt::TokioIo::new)
+        }))
+        .await
+        .map_err(|e| Status::unavailable(format!("the services supervisor is not running: {e}")))?;
+    Ok(ServicesClient::new(channel))
+}
+
+/// The agent forwards the host's calls to the supervisor.
+#[tonic::async_trait]
+impl Services for Agent {
+    type LogsStream = Streaming<ServiceLogChunk>;
+    type WatchStream = Streaming<ServiceEvent>;
+
+    async fn start(
+        &self,
+        req: Request<ServicesStartRequest>,
+    ) -> Result<Response<ServicesStartResponse>, Status> {
+        supervisor().await?.start(req.into_inner()).await
+    }
+
+    async fn list(
+        &self,
+        req: Request<ServicesListRequest>,
+    ) -> Result<Response<ServicesListResponse>, Status> {
+        supervisor().await?.list(req.into_inner()).await
+    }
+
+    async fn restart(
+        &self,
+        req: Request<ServiceRestartRequest>,
+    ) -> Result<Response<ServiceRestartResponse>, Status> {
+        supervisor().await?.restart(req.into_inner()).await
+    }
+
+    async fn logs(
+        &self,
+        req: Request<ServiceLogsRequest>,
+    ) -> Result<Response<Self::LogsStream>, Status> {
+        supervisor().await?.logs(req.into_inner()).await
+    }
+
+    async fn watch(
+        &self,
+        req: Request<ServicesWatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        supervisor().await?.watch(req.into_inner()).await
     }
 }
