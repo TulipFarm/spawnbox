@@ -72,6 +72,7 @@ These functions operate now:
 | Persistent sandboxes | Keep a sandbox until you delete it. If its VM is lost, the next request starts it again from its template, with the same ID, env, secrets, volumes and ports. One host only. |
 | Fork and snapshot | Start up to 16 copies of a running sandbox, with its memory, processes and files, in less than 1 s. Save a running sandbox as a new template. The sandbox continues to run. |
 | Preview URLs | Show a web app from a sandbox at a `public`, `token` or `private` URL. |
+| Services | Keep programs such as web servers running in a sandbox. Restart them when they stop or fail a health check. Keep their recent output. |
 | Network control | Allow all hosts, only listed hosts, or no hosts. Set a speed limit for each direction. Spawnbox records each connection and each DNS query. |
 | Secrets | Keep secrets encrypted. Add them to HTTPS requests only for allowed hosts. |
 | Tenants | Give each customer its own API keys, quotas, templates, secrets and network rules. |
@@ -315,6 +316,10 @@ spawnbox cp ./src $S:/workspace/src           # copy files into a sandbox
 spawnbox cp $S:/workspace/out.txt .           # copy files from a sandbox
 spawnbox clone $S https://github.com/octocat/Hello-World
 spawnbox ports publish $S 3000                # show the preview URL
+spawnbox create --service-file services.json  # start services in a new sandbox
+spawnbox services $S                          # show the state of its services
+spawnbox services restart $S web
+spawnbox services logs $S web --follow
 spawnbox pause $S
 spawnbox resume $S
 spawnbox fork $S --count 3                    # print the IDs of 3 copies
@@ -580,6 +585,46 @@ curl -s -H "$A" -d '{"url": "https://github.com/octocat/Hello-World", "depth": 1
 
 3. Open the `url` from the output in your browser.
 
+### Keep a program running with a service
+
+A service is a program that Spawnbox keeps running in the sandbox. Give
+the services when you create the sandbox:
+
+```sh
+curl -s -H "$A" $B/sandboxes -d '{
+  "services": [{
+    "name": "web",
+    "command": ["python3", "-m", "http.server", "8000"],
+    "cwd": "/workspace",
+    "env": {"LOG_LEVEL": "info"},
+    "port": 8000,
+    "access": "private",
+    "health": {"http": "/", "interval_s": 10, "failures": 3},
+    "restart": "always"
+  }]
+}'
+```
+
+- Spawnbox starts each service as `user`, with the env of the sandbox
+  and then the env of the service.
+- If a service stops, Spawnbox starts it again. It waits 1 s, then 2 s,
+  4 s and up to 30 s. After 60 s of good operation, the wait is 1 s
+  again. With `"restart": "on-failure"`, a service that exits with code 0
+  stays stopped.
+- A health check is `{"http": "/path"}` (a `GET` must give a 2xx status)
+  or `{"tcp": true}` (the port must accept a connection). If the check
+  fails `failures` times one after the other, Spawnbox restarts the
+  service.
+- Spawnbox publishes the `port` of a service with its `access` (default
+  `private`). A preview request waits up to 30 s for the service to be
+  healthy.
+- The last 1 MiB of output of each service is in
+  `/var/log/spawnbox/<name>.log` in the sandbox.
+- A pause keeps the services and their processes. A resume does not
+  restart them. A cold start of a persistent sandbox starts them again.
+- Sandboxes from a template made before services were added cannot have
+  services. The create gives `409 conflict`. Build the template again.
+
 ### Pause and resume a sandbox
 
 ```sh
@@ -788,6 +833,7 @@ Prometheus adds the `instance` label.
 | `spawnbox_warm_pool_hits_total`, `spawnbox_warm_pool_misses_total` | `build` | Creates that got or did not get a warm VM |
 | `spawnbox_fleet_nodes` (gauge) | `state` | Primary only: workers in each state |
 | `spawnbox_fleet_load` (gauge) | None | Primary only: load of the primary and the ready workers that are not drained, from 0 to 1 |
+| `spawnbox_service_restarts_total` (counter) | `reason` | Restarts of services |
 | `spawnbox_fleet_create_refused_total` (counter) | `reason` | Primary only: creates refused with `no_capacity` |
 | `spawnbox_fleet_retirements` (gauge) | `state` | Primary only: workers that retire, in each state (`draining`, `blocked`, `ready_to_terminate`) |
 
@@ -1344,7 +1390,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 
 - `POST /v1/sandboxes` creates a sandbox. Fields: `template` (default
   `base`), `timeout_s`, `idle_pause_s`, `env`, `labels`, `egress`,
-  `secrets`, `volumes`, `persistent`. Org keys can also send `tenant`.
+  `secrets`, `volumes`, `persistent`, `services`. Org keys can also send
+  `tenant`.
 - `"persistent": true` keeps the sandbox until it is deleted. Do not send
   `timeout_s`. `idle_pause_s` must be more than 0 (default 600). On a
   fleet, the primary runs it. Refer to
@@ -1518,6 +1565,46 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   base disk or Firecracker version changes.
 - Spawnbox runs a maximum of `--max-builds` builds at the same time.
 
+### Services
+
+- `services` in `POST /v1/sandboxes` is a list of up to 8 services. Each
+  has these fields:
+  - `name`: 1 to 63 of `a-z`, `0-9` and `-`. It cannot start with `-`.
+    Each name must be different.
+  - `command`: the program and its arguments. It cannot be empty.
+  - `cwd` (optional): an absolute path.
+  - `env` (optional): it cannot set the CA variables, such as
+    `SSL_CERT_FILE`, or the variable of a secret of the sandbox.
+  - `port` (optional): 1 to 65535. Each port must be different.
+  - `access` (optional, needs `port`): `private` (default), `token` or
+    `public`.
+  - `health` (optional, needs `port`): `{"http": "/path"}` or
+    `{"tcp": true}`, with `interval_s` (1 to 3600, default 10) and
+    `failures` (1 to 100, default 3).
+  - `restart` (optional): `always` (default) or `on-failure`.
+- A wrong value gives `400 invalid_argument`. A template without support
+  for services gives `409 conflict`.
+- `GET /v1/sandboxes/{id}/services` gives the state of each service:
+  `{"services": [{"name", "state", "pid", "restarts", "last_exit",
+  "started_at"}]}`.
+  - `state` is `starting` (until the first good health check),
+    `healthy`, `unhealthy`, `backoff` (it waits to start again) or
+    `stopped`.
+  - `last_exit` is `{"code": 1}`, `{"signal": 9}` or `null`.
+- `POST /v1/sandboxes/{id}/services/{name}:restart` stops a service and
+  starts it again. The response is `204`. An unknown name gives `404`.
+- `GET /v1/sandboxes/{id}/services/{name}/logs` gives the last 1 MiB of
+  output as text. With `?follow=true`, the response is a stream of
+  `output` events (`{"text": "..."}`) that continues with new output.
+- A stop sends `SIGTERM` to the process group of the service, and
+  `SIGKILL` after 5 s.
+- These calls resume a paused or `cold` sandbox, and count as activity.
+  The work of a service in the VM does not keep the sandbox awake.
+- Spawnbox never shows the env values of a service. It encrypts the
+  services of paused and persistent sandboxes on disk like the env.
+- A fork copies the services and their processes. A snapshot template
+  does not keep the list of services.
+
 ### Preview URLs
 
 - `POST /v1/sandboxes/{id}/ports` publishes a port and gives its URL.
@@ -1535,6 +1622,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 - Spawnbox serves previews on `--preview-listen` at `--preview-url`. It
   finds the sandbox from the host name.
 - HTTP/1.1 and WebSockets are supported.
+- A request to the port of a service waits up to 30 s until the service
+  is healthy. Then it gives `503`.
 
 ### Network access (egress)
 
@@ -1667,6 +1756,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     and `duration_ms`)
   - `exec.started`, `exec.finished` (with the last 64 KiB of output)
   - `pty.opened`, `pty.closed`
+  - `service.started` (with `pid`), `service.exited` (with `exit`),
+    `service.unhealthy` (with `failures`), `service.restarted` (with
+    `restarts` and the `reason` `exit`, `unhealthy` or `request`). Each
+    has `name`.
   - `file.written` (with the SHA-256 hash), `file.deleted`
   - `port.published`, `port.unpublished`
   - `net.connection`, `net.blocked`

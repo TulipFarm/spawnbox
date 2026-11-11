@@ -91,7 +91,7 @@ The Rust workspace has one crate per part:
 | `spawn-api` | Host | HTTP API, auth, tenants, quotas, sandbox lifecycle, templates, secrets, previews, events, usage, SQLite |
 | `spawn-node` | Host (library) | Builds template snapshots and restores, pauses and resumes jailed Firecracker VMs or gVisor containers; per-sandbox network namespaces and firewall rules |
 | `spawn-egress` | Host (library) | Transparent TCP proxy: egress policy, connection logging, TLS interception for secret injection |
-| `spawn-guest` | Inside every VM | PID 1: mounts the root overlay, sets up the network, then serves gRPC (exec, files, terminals, ports, identity) |
+| `spawn-guest` | Inside every VM | PID 1: mounts the root overlay, sets up the network, keeps services running and starts the agent, which serves gRPC (exec, files, terminals, ports, identity, services) |
 | `spawn-proto` | Both | The gRPC contract between host and guest |
 | `spawn-bench` | Host | Boot, snapshot and restore benchmark |
 | `spawnbox-cli` | Anywhere | The `spawnbox` command: an HTTP and WebSocket client for the API, and `doctor` host checks |
@@ -272,6 +272,7 @@ instead (see [gVisor](#hosts-without-kvm-gvisor)).
 | `Pty.Open` | The terminal WebSocket |
 | `Ports.Dial` | The preview proxy, to reach a port inside the VM |
 | `Image.Seal` | Template builds |
+| `Services` (`Start`, `List`, `Restart`, `Logs`, `Watch`) | Services; see [Services](#services) |
 
 The agent runs commands with the user's uid and gid, so file permissions
 work as usual. The host treats everything the guest sends as untrusted:
@@ -321,7 +322,8 @@ lost. A cold sandbox has no VM.
 - **Start record.** The create writes a start record in the same
   transaction as the sandbox row. It holds the template, build, a copy of
   the template spec, limits, network rules, secret names, volumes,
-  `idle_pause_s`, published ports and the env, sealed like above. A
+  `idle_pause_s`, published ports, and the env and services, sealed like
+  above. A
   resume does not clear it. Publishing a port updates it.
 - **Build roots.** A build in a start record is a root. The host keeps
   it, and the build store does not collect it, even after a newer build of
@@ -342,6 +344,62 @@ lost. A cold sandbox has no VM.
   nothing.
 - **One host.** Persistent sandboxes are placed on the primary only.
   Moving or draining one gives `409 conflict`.
+
+## Services
+
+A service is a program that the guest keeps running. The host sends the
+whole list, and the guest makes its services match it.
+
+```mermaid
+flowchart LR
+    h["Host<br/>(create, cold start, API calls)"] -->|"Services over vsock"| a["Agent"]
+    a -->|"/run/spawn/services.sock"| s["Supervisor<br/>(thread in PID 1)"]
+    s --> p1["web (process group, as 'user')"]
+    s --> p2["worker"]
+    r["Reaper (PID 1)"] -->|"exit status"| s
+```
+
+- **Where it runs.** The supervisor is a thread in PID 1, not in the
+  agent. PID 1 restarts the agent when it stops, so services outlive the
+  agent. The agent forwards the host's `Services` calls to the
+  supervisor's Unix socket, which only root can open.
+- **Reaping.** PID 1 must reap all orphans with `waitpid(-1)`. One reaper
+  thread does this, and gives the exit status of a child that it knows,
+  the agent or a service, to the code that started it. Other statuses are
+  dropped.
+- **Start.** `Start` has the full list. A service with the same name and
+  spec is left alone. A changed one is restarted. A new one starts and a
+  removed one stops. A repeated `Start` never starts a second copy.
+- **Env.** The host merges each service's env: the CA variables, the
+  template env, the sandbox env, the secret placeholders, then the
+  service env. The create refuses a service env that sets a CA variable
+  or a secret's variable.
+- **Restarts.** A stopped service starts again after 1 s, doubling to
+  30 s. The wait goes back to 1 s after 60 s of uptime. A health check
+  that fails `failures` times one after the other restarts the service.
+  A stop sends `SIGTERM` to the process group, then `SIGKILL` after 5 s.
+- **Logs.** Each service's stdout and stderr go to
+  `/var/log/spawnbox/<name>.log`. When the file passes 1.25 MiB, it is
+  cut to its last 1 MiB.
+- **When they start.** The host sends `Start` after the create's fixups
+  and after a cold start, only when there are services. A pause keeps
+  the processes and the supervisor's state in memory, so a resume does
+  not send it again. A guest without `Services` gives `Unimplemented`;
+  the host stops the new VM and answers `409 conflict`.
+- **Events.** For each running sandbox with services, the host keeps a
+  `Watch` stream open and turns the guest's changes into
+  `service.started`, `.exited`, `.unhealthy` and `.restarted` events. A
+  watch ends when the VM pauses or stops, and opens again after a resume.
+  A watch after a create or cold start begins from the last event before
+  `Start`, so no event is lost.
+- **Storage.** The service list is part of the start record and the saved
+  row of a paused sandbox. Both are sealed under `secrets.key`, because
+  the service env can hold secrets. API responses show only names.
+- **Previews.** The service `port` is published with its `access` when
+  the sandbox is created. A preview request to that port asks the guest
+  for the service's state and waits up to 30 s for it to be healthy.
+- **Fleet.** Service calls are routed to the sandbox's host like exec.
+  A move sends the services with the saved state.
 
 ## Volumes
 
