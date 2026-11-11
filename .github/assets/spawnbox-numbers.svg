@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 200" width="1280" height="200" role="img" aria-label="6,484 sandboxes at the same time. 768 AI agents at once. About 8 ms to start. 0 failures from Spawnbox in 3,707 agent runs."><style>
+  .paper{fill:#fbfcfe}.grid{fill:none;stroke:rgba(29,78,216,.07)}
+  .solid .t{fill:#f2f6ff}.solid .l{fill:#c9dafd}.solid .r{fill:#93b4fb}
+  .solid polygon,.deep polygon,.pale polygon{stroke:#1d4ed8;stroke-width:1.2;stroke-linejoin:round}
+  .deep .t{fill:#1d4ed8}.deep .l{fill:#0a1f4d}.deep .r{fill:#163a8f}
+  .pale .t{fill:#fff}.pale .l{fill:#e8f0ff}.pale .r{fill:#c9dafd}
+  .wire polygon{fill:none;stroke:#1d4ed8;stroke-width:1.2;stroke-dasharray:4 4}
+  .leader{fill:none;stroke:#4a5f86;stroke-width:1}
+  .wirep{fill:none;stroke:#3b82f6;stroke-width:1.2;stroke-dasharray:2 5;opacity:.7}
+  .pk{fill:#1d4ed8}
+  .h{font:700 64px 'IBM Plex Sans Condensed','Arial Narrow','Helvetica Neue',Arial,sans-serif;fill:#0a1f4d;letter-spacing:-1px}
+  .hl{fill:#1d4ed8}
+  .p{font:400 21px 'IBM Plex Sans','Helvetica Neue',Arial,sans-serif;fill:#4a5f86}
+  .m{font:500 13px 'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;fill:#0a1f4d;letter-spacing:1.5px}
+  .mut{fill:#4a5f86}
+  .term{fill:#fff;stroke:rgba(29,78,216,.35)}
+  .cmd{font:400 17px 'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;fill:#0a1f4d}
+  .bob{animation:bob 3.2s ease-in-out infinite}.blink{animation:blink 1.6s steps(2) infinite}
+  @keyframes bob{50%{transform:translateY(-5px)}}@keyframes blink{50%{opacity:.25}}
+  @media (prefers-reduced-motion:reduce){.bob,.blink{animation:none}}</style><defs><pattern id="g" width="41.57" height="24" patternUnits="userSpaceOnUse"><path d="M0 12 20.78 0 41.57 12 20.78 24z" class="grid"/></pattern></defs><rect class="paper" width="1280" height="200"/><rect width="1280" height="200" fill="url(#g)"/><path class="leader" d="M64,40 v10 M328,40 v10 M64,45 H328"/><text class="h" x="64" y="122" style="font-size:56px">6,484<tspan class="m mut" dx="10" style="font-size:15px">SANDBOXES</tspan></text><text class="p" x="64" y="160" style="font-size:18px">Running at the same time</text><path class="leader" d="M360,40 v10 M624,40 v10 M360,45 H624"/><text class="h" x="360" y="122" style="font-size:56px">768<tspan class="m mut" dx="10" style="font-size:15px">AI AGENTS</tspan></text><text class="p" x="360" y="160" style="font-size:18px">At once. Every one finished.</text><path class="leader" d="M656,40 v10 M920,40 v10 M656,45 H920"/><text class="h" x="656" y="122" style="font-size:56px">≈8<tspan class="m mut" dx="10" style="font-size:15px">ms</tspan></text><text class="p" x="656" y="160" style="font-size:18px">To start a fresh sandbox</text><path class="leader" d="M952,40 v10 M1216,40 v10 M952,45 H1216"/><text class="h" x="952" y="122" style="font-size:56px">0<tspan class="m mut" dx="10" style="font-size:15px">FAILURES</tspan></text><text class="p" x="952" y="160" style="font-size:18px">From Spawnbox in 3,707 agent runs</text></svg>
