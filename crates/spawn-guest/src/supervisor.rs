@@ -166,6 +166,22 @@ fn signal_group(pid: u32, signal: Signal) {
     }
 }
 
+/// A service's process group, killed when dropped: after its process
+/// ends, children it left behind would hold its port, and if its
+/// supervisor panics, the next one must not start a second copy.
+struct Group(u32);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        signal_group(self.0, Signal::SIGKILL);
+    }
+}
+
+/// The name of a service whose supervisor panics once, after its process
+/// started.
+#[cfg(test)]
+static PANIC_AFTER_SPAWN: Mutex<Option<String>> = Mutex::new(None);
+
 fn check_of(spec: &ServiceSpec) -> Option<Check> {
     match &spec.health.as_ref()?.check {
         Some(ProtoCheck::Http(path)) => Some(Check::Http(path.clone())),
@@ -434,6 +450,7 @@ impl Shared {
                     .unwrap_or_else(|_| Err(std::io::Error::other("the spawn panicked")));
             let ended = match spawned {
                 Ok((pid, exit)) => {
+                    let group = Group(pid);
                     let state = if check_of(&spec).is_some() {
                         STARTING
                     } else {
@@ -449,8 +466,7 @@ impl Shared {
                         ..event(name, "started")
                     });
                     let ended = self.run(&spec, pid, exit, control).await;
-                    // Children it left behind would hold its port.
-                    signal_group(pid, Signal::SIGKILL);
+                    drop(group);
                     ended
                 }
                 Err(error) => {
@@ -581,6 +597,15 @@ impl Shared {
         control: &mut mpsc::Receiver<Control>,
     ) -> Ended {
         let name = spec.name.as_str();
+        #[cfg(test)]
+        {
+            let mut panic = lock(&PANIC_AFTER_SPAWN);
+            if panic.as_deref() == Some(name) {
+                *panic = None;
+                drop(panic);
+                panic!("supervising {name} failed");
+            }
+        }
         let second = self.config.second;
         let health = spec.health.as_ref();
         let check = check_of(spec);

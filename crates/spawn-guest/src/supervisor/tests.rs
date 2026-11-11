@@ -188,12 +188,16 @@ async fn restart_stops_with_sigterm_then_sigkill() {
     let (_, mut rx, _) = sup.watch(None);
     sup.start(vec![
         spec("polite", "sleep 100"),
-        spec("stubborn", "trap '' TERM; while true; do sleep 0.05; done"),
+        spec(
+            "stubborn",
+            "trap '' TERM; echo ready; while true; do sleep 0.05; done",
+        ),
     ])
     .await
     .unwrap();
     let first = running(&sup, "polite").await;
     running(&sup, "stubborn").await;
+    until("the trap", || log_text(&sup, "stubborn").contains("ready")).await;
 
     sup.restart("polite").await.unwrap();
     let exited = next(&mut rx, "polite", "exited").await;
@@ -425,4 +429,32 @@ async fn cannot_start_with_the_real_reaper() {
     .await;
     sup.start(Vec::new()).await.expect("stop all");
     assert!(sup.list().is_empty());
+}
+
+fn alive(pid: u32) -> bool {
+    nix::sys::signal::kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
+}
+
+#[tokio::test]
+async fn a_failed_supervisor_stops_the_process_before_starting_another() {
+    let sup = Supervisor::new(
+        Config {
+            backoff_max: Duration::from_millis(100),
+            ..config()
+        },
+        Reaper::direct(),
+    );
+    let (_, mut rx, _) = sup.watch(None);
+    *lock(&PANIC_AFTER_SPAWN) = Some("panics".into());
+    sup.start(vec![spec("panics", "sleep 1000")])
+        .await
+        .expect("start");
+    let first = next(&mut rx, "panics", "started").await.pid;
+    let second = next(&mut rx, "panics", "started").await.pid;
+    assert_ne!(first, second);
+    until("the first process to stop", || !alive(first)).await;
+    assert!(alive(second));
+    assert!(log_text(&sup, "panics").contains("supervising panics failed"));
+    sup.start(Vec::new()).await.expect("stop");
+    until("the second process to stop", || !alive(second)).await;
 }
