@@ -56,6 +56,11 @@ const METRICS: &[(&str, &str, &str)] = &[
         "Warm VMs ready, by template, build and network.",
     ),
     (
+        "spawnbox_service_restarts_total",
+        "counter",
+        "Restarts of services in sandboxes, by reason: exit, unhealthy or request.",
+    ),
+    (
         "spawnbox_warm_pool_hits_total",
         "counter",
         "Creates that took a warm VM, by build.",

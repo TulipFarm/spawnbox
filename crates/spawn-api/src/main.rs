@@ -36,6 +36,8 @@ mod runtime;
 #[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
+mod services;
+#[cfg(target_os = "linux")]
 mod store;
 #[cfg(target_os = "linux")]
 mod templates;

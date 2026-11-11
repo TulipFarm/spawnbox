@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 
 use crate::ids::random;
+use crate::model::Service;
 
 const KEY_LEN: usize = 32;
 
@@ -82,12 +83,44 @@ impl SecretBox {
         let plain = self.open(&env_label(tenant, sandbox), sealed)?;
         serde_json::from_slice(&plain).ok()
     }
+
+    /// Seals a sandbox's services, whose env may hold secrets. Nothing is
+    /// sealed for none.
+    pub fn seal_services(
+        &self,
+        tenant: &str,
+        sandbox: &str,
+        services: &[Service],
+    ) -> io::Result<Vec<u8>> {
+        if services.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plain = serde_json::to_vec(services).map_err(io::Error::other)?;
+        self.seal(&services_label(tenant, sandbox), &plain)
+    }
+
+    pub fn open_services(
+        &self,
+        tenant: &str,
+        sandbox: &str,
+        sealed: &[u8],
+    ) -> Option<Vec<Service>> {
+        if sealed.is_empty() {
+            return Some(Vec::new());
+        }
+        let plain = self.open(&services_label(tenant, sandbox), sealed)?;
+        serde_json::from_slice(&plain).ok()
+    }
 }
 
 /// The format version is part of the label so that a later format cannot
 /// be read as this one.
 fn env_label(tenant: &str, sandbox: &str) -> String {
     format!("env:v1:{tenant}:{sandbox}")
+}
+
+fn services_label(tenant: &str, sandbox: &str) -> String {
+    format!("services:v1:{tenant}:{sandbox}")
 }
 
 /// The bytes of a key file, created with `KEY_LEN` random bytes if it is
@@ -158,6 +191,22 @@ mod tests {
         assert_eq!(sb.open_env("acme", "sbx_2", &sealed), None);
         assert_eq!(sb.open_env("other", "sbx_1", &sealed), None);
         assert_eq!(sb.open("env:v2:acme:sbx_1", &sealed), None);
+    }
+
+    #[test]
+    fn services_are_bound_to_their_tenant_and_sandbox() {
+        let sb = SecretBox::new(&[7; 32]).unwrap();
+        let services: Vec<Service> = serde_json::from_str(
+            r#"[{"name":"web","command":["srv"],"env":{"TOKEN":"s3cret"},"port":80}]"#,
+        )
+        .unwrap();
+        let sealed = sb.seal_services("acme", "sbx_1", &services).unwrap();
+        assert!(!sealed.windows(6).any(|w| w == b"s3cret"));
+        assert_eq!(sb.open_services("acme", "sbx_1", &sealed), Some(services));
+        assert_eq!(sb.open_services("acme", "sbx_2", &sealed), None);
+        assert_eq!(sb.open_env("acme", "sbx_1", &sealed), None);
+        assert_eq!(sb.seal_services("acme", "sbx_1", &[]).unwrap(), b"");
+        assert_eq!(sb.open_services("acme", "sbx_1", b""), Some(Vec::new()));
     }
 
     #[test]

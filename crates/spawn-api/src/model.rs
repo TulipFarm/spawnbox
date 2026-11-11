@@ -44,6 +44,10 @@ pub const DEFAULT_VOLUME_GIB: u32 = 10;
 pub const VOLUME_GIB: std::ops::RangeInclusive<u32> = 1..=1024;
 /// Where volumes cannot be mounted: the guest's own mounts.
 const RESERVED_VOLUME_DIRS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/spawn"];
+const MAX_SERVICES: usize = 8;
+const MAX_SERVICE_NAME: usize = 63;
+const MAX_SERVICE_ARGS: usize = 256;
+const MAX_HEALTH_PATH: usize = 1024;
 const MAX_SECRET_NAME: usize = 63;
 const MAX_SECRET_VALUE: usize = 16 * 1024;
 const MAX_SECRET_HOSTS: usize = 64;
@@ -90,6 +94,69 @@ pub struct CreateSandbox {
     /// being lost.
     #[serde(default)]
     pub persistent: bool,
+    /// Programs kept running in the sandbox.
+    #[serde(default)]
+    pub services: Vec<Service>,
+}
+
+/// A program that Spawnbox keeps running in a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    pub name: String,
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u32>,
+    /// How its port is published. Defaults to `private`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::ports::Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ServiceHealth>,
+    #[serde(default)]
+    pub restart: Restart,
+}
+
+/// How a service is checked: `{"http": "/path"}` or `{"tcp": true}`, on
+/// its port.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHealth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tcp: bool,
+    #[serde(default = "default_interval_s")]
+    pub interval_s: u32,
+    #[serde(default = "default_failures")]
+    pub failures: u32,
+}
+
+fn default_interval_s() -> u32 {
+    10
+}
+
+fn default_failures() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Restart {
+    #[default]
+    Always,
+    OnFailure,
+}
+
+impl Service {
+    /// Its published port and access.
+    pub fn published(&self) -> Option<(u16, crate::ports::Access)> {
+        let port = u16::try_from(self.port?).ok()?;
+        Some((port, self.access.unwrap_or(crate::ports::Access::Private)))
+    }
 }
 
 /// One volume of `CreateSandbox`.
@@ -188,8 +255,94 @@ impl CreateSandbox {
             egress.check().map_err(ApiError::invalid)?;
         }
         check_volume_mounts(&self.volumes)?;
+        check_services(&self.services)?;
         Ok(timeout)
     }
+}
+
+fn check_services(services: &[Service]) -> Result<(), ApiError> {
+    if services.len() > MAX_SERVICES {
+        return Err(ApiError::invalid(format!(
+            "at most {MAX_SERVICES} services"
+        )));
+    }
+    for (i, service) in services.iter().enumerate() {
+        let name = &service.name;
+        if !is_service_name(name) {
+            return Err(ApiError::invalid(format!(
+                "service name {name:?} must be 1 to {MAX_SERVICE_NAME} of a-z, 0-9 and -, \
+                 not starting with -"
+            )));
+        }
+        let earlier = &services[..i];
+        if earlier.iter().any(|s| s.name == *name) {
+            return Err(ApiError::invalid(format!(
+                "service {name:?} is listed twice"
+            )));
+        }
+        let invalid = |what: &str| Err(ApiError::invalid(format!("service {name}: {what}")));
+        if service.command.is_empty() || service.command.len() > MAX_SERVICE_ARGS {
+            return invalid(&format!("command must have 1 to {MAX_SERVICE_ARGS} items"));
+        }
+        if service.command.iter().map(String::len).sum::<usize>() > MAX_CMD_BYTES
+            || service.command.iter().any(|a| a.contains('\0'))
+        {
+            return invalid(&format!(
+                "command must be at most {MAX_CMD_BYTES} bytes with no NUL"
+            ));
+        }
+        if let Some(cwd) = &service.cwd
+            && (!cwd.starts_with('/') || cwd.contains('\0'))
+        {
+            return invalid("cwd must be an absolute path");
+        }
+        check_env(&service.env)?;
+        if let Some(port) = service.port {
+            if !(1..=65_535).contains(&port) {
+                return invalid("port must be 1 to 65535");
+            }
+            if earlier.iter().any(|s| s.port == Some(port)) {
+                return invalid(&format!("port {port} is used by another service"));
+            }
+        } else if service.access.is_some() {
+            return invalid("access needs a port");
+        }
+        if let Some(health) = &service.health {
+            match (&health.http, health.tcp) {
+                (Some(path), false) => {
+                    let ok = path.starts_with('/')
+                        && path.len() <= MAX_HEALTH_PATH
+                        && path.bytes().all(|b| b.is_ascii_graphic());
+                    if !ok {
+                        return invalid(&format!(
+                            "health.http must be a path of at most {MAX_HEALTH_PATH} bytes, \
+                             starting with /"
+                        ));
+                    }
+                }
+                (None, true) => {}
+                _ => return invalid("health needs one of http or tcp"),
+            }
+            if service.port.is_none() {
+                return invalid("health needs a port");
+            }
+            if !(1..=3600).contains(&health.interval_s) {
+                return invalid("health.interval_s must be 1 to 3600");
+            }
+            if !(1..=100).contains(&health.failures) {
+                return invalid("health.failures must be 1 to 100");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn is_service_name(name: &str) -> bool {
+    (1..=MAX_SERVICE_NAME).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn check_volume_mounts(mounts: &[VolumeMount]) -> Result<(), ApiError> {
@@ -1229,6 +1382,66 @@ mod tests {
         let error = create(r#"{"persistent":true,"idle_pause_s":0}"#).unwrap_err();
         assert!(error.contains("idle_pause_s"), "{error}");
         assert!(create(r#"{"persistent":"yes"}"#).is_err());
+    }
+
+    #[test]
+    fn checks_services() {
+        let with = |services: &str| create(&format!(r#"{{"services":[{services}]}}"#));
+        let web = r#"{"name":"web","command":["srv","--port","8000"],"cwd":"/workspace",
+            "env":{"LOG_LEVEL":"info"},"port":8000,"access":"public",
+            "health":{"http":"/healthz"},"restart":"on-failure"}"#;
+        assert!(with(web).is_ok());
+        assert!(with(r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true}}"#).is_ok());
+        let ok =
+            |name: &str, port: u32| format!(r#"{{"name":"{name}","command":["x"],"port":{port}}}"#);
+        let nine: Vec<String> = (1..=9).map(|i| ok(&format!("s{i}"), i)).collect();
+        assert!(with(&nine[..8].join(",")).is_ok());
+        assert!(with(&nine.join(",")).is_err());
+        let long = "a".repeat(64);
+        for bad in [
+            r#"{"name":"","command":["x"]}"#.to_owned(),
+            r#"{"name":"-a","command":["x"]}"#.to_owned(),
+            r#"{"name":"Web","command":["x"]}"#.to_owned(),
+            r#"{"name":"a_b","command":["x"]}"#.to_owned(),
+            format!(r#"{{"name":"{long}","command":["x"]}}"#),
+            format!("{},{}", ok("a", 1), ok("a", 2)),
+            format!("{},{}", ok("a", 1), ok("b", 1)),
+            r#"{"name":"a","command":[]}"#.to_owned(),
+            r#"{"name":"a"}"#.to_owned(),
+            r#"{"name":"a","command":"x"}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"cwd":"rel"}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":0}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":65536}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"access":"public"}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"env":{"1X":"y"}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"health":{"tcp":true}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true,"http":"/"}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"http":"x"}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"http":"/a b"}}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true,"interval_s":0}}"#
+                .to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true,"interval_s":3601}}"#
+                .to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true,"failures":0}}"#
+                .to_owned(),
+            r#"{"name":"a","command":["x"],"port":1,"health":{"tcp":true,"failures":101}}"#
+                .to_owned(),
+            r#"{"name":"a","command":["x"],"restart":"never"}"#.to_owned(),
+            r#"{"name":"a","command":["x"],"user":"root"}"#.to_owned(),
+        ] {
+            assert!(with(&bad).is_err(), "{bad}");
+        }
+        let req: CreateSandbox =
+            serde_json::from_str(&format!(r#"{{"services":[{}]}}"#, ok("a", 80))).unwrap();
+        let service = &req.services[0];
+        assert_eq!(service.restart, Restart::Always);
+        assert_eq!(
+            service.published(),
+            Some((80, crate::ports::Access::Private))
+        );
+        let health: ServiceHealth = serde_json::from_str(r#"{"tcp":true}"#).unwrap();
+        assert_eq!((health.interval_s, health.failures), (10, 3));
     }
 
     #[test]

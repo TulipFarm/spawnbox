@@ -142,6 +142,15 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
         Ok(opened) => opened,
         Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.message),
     };
+    if let Some(name) = app.sandboxes.service_on_port(&id, port)
+        && !app.sandboxes.wait_healthy(&opened.channel, &name).await
+    {
+        let wait = crate::runtime::services::HEALTHY_WAIT.as_secs();
+        return plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("service {name:?} is not healthy after {wait} s; see its logs"),
+        );
+    }
     let proto = if https { "https" } else { "http" };
     forward(opened.channel, opened.busy, port, req, &host, proto)
         .await
