@@ -293,6 +293,7 @@ async fn create(api: &Api, out: &Out, args: CreateArgs) -> Result<i32> {
         ("tenant", args.tenant.map(Value::from)),
         ("timeout_s", args.timeout.map(Value::from)),
         ("idle_pause_s", args.idle_pause.map(Value::from)),
+        ("persistent", args.persistent.then_some(Value::from(true))),
         ("env", (!env.is_empty()).then(|| json!(env))),
         ("labels", (!labels.is_empty()).then(|| json!(labels))),
         (
