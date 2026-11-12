@@ -3115,22 +3115,41 @@ impl Sandboxes {
     /// first; its memory and files outside volumes are lost, as in any cold
     /// start. Returns whether it was running. A sandbox already cold here is
     /// not an error, so the primary can ask again after a lost reply.
+    ///
+    /// The work runs in its own task: the record is gone before the VM is,
+    /// so a caller that stops waiting must not stop it halfway.
     pub async fn evict(
         &self,
         id: &str,
         generation: i64,
         origin: &Origin,
     ) -> Result<bool, ApiError> {
+        let this = self.clone();
+        let (id, origin) = (id.to_owned(), origin.clone());
+        detached(async move { this.evict_now(&id, generation, &origin).await }).await
+    }
+
+    async fn evict_now(
+        &self,
+        id: &str,
+        generation: i64,
+        origin: &Origin,
+    ) -> Result<bool, ApiError> {
         let Some(lock) = self.record_lock(id) else {
-            return match self.db.get_sandbox(id)? {
-                Some(row)
-                    if row.persistent
-                        && row.state == state::COLD
-                        && row.generation == generation =>
-                {
-                    Ok(false)
+            return match leftover(self.db.get_sandbox(id)?.as_ref(), generation) {
+                Leftover::Cold => Ok(false),
+                Leftover::Gone => Err(self.not_running(id)),
+                // An earlier evict ended between dropping the record and
+                // making the row cold: finish it.
+                Leftover::Orphan { was_running } => {
+                    let tenant = self
+                        .db
+                        .get_sandbox(id)?
+                        .map(|r| r.tenant)
+                        .unwrap_or_default();
+                    self.finish_evict(id, generation, &tenant, origin).await?;
+                    Ok(was_running)
                 }
-                _ => Err(self.not_running(id)),
             };
         };
         let _changing = lock.lock().await;
@@ -3179,15 +3198,39 @@ impl Sandboxes {
             vm.stop().await;
             self.release(index);
         }
+        self.finish_evict(id, generation, &record.tenant, origin)
+            .await?;
+        Ok(was_running)
+    }
+
+    /// Kills what is left of `id` and makes it cold. If its cgroup cannot
+    /// be emptied, the row stays as it was, so the next evict tries again.
+    async fn finish_evict(
+        &self,
+        id: &str,
+        generation: i64,
+        tenant: &str,
+        origin: &Origin,
+    ) -> Result<(), ApiError> {
         remove_dir(&self.paused_dir(id));
-        if !self.node.kill(&ids::host_name(id)).await {
+        let mut gone = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            gone = self.node.kill(&ids::host_name(id)).await;
+            if gone {
+                break;
+            }
+        }
+        if !gone {
             return Err(ApiError::internal(format!(
-                "{id}: processes are left in its cgroup"
+                "{id}: processes are left in its cgroup; ask again to retry"
             )));
         }
         self.db.set_cold(id, generation)?;
-        self.cold_event(origin, &record.tenant, id, "drained");
-        Ok(was_running)
+        self.cold_event(origin, tenant, id, "drained");
+        Ok(())
     }
 
     /// Ends a move that failed: the sandbox stays here, and runs again if
@@ -3472,9 +3515,128 @@ fn round(ms: f64) -> f64 {
     (ms * 10.0).round() / 10.0
 }
 
+/// What a drain finds for a sandbox that has no record here.
+#[derive(Debug, PartialEq, Eq)]
+enum Leftover {
+    /// Already cold at that generation: an earlier evict finished.
+    Cold,
+    /// Still running or paused at that generation, so an earlier evict
+    /// stopped after dropping the record.
+    Orphan { was_running: bool },
+    /// Anything else: not this host's to evict.
+    Gone,
+}
+
+fn leftover(row: Option<&db::Sandbox>, generation: i64) -> Leftover {
+    match row {
+        Some(row) if row.persistent && row.generation == generation => match row.state.as_str() {
+            state::COLD => Leftover::Cold,
+            state::RUNNING | state::PAUSED => Leftover::Orphan {
+                was_running: row.state == state::RUNNING,
+            },
+            _ => Leftover::Gone,
+        },
+        _ => Leftover::Gone,
+    }
+}
+
+/// Runs `work` in its own task, so it ends even if the caller is dropped.
+async fn detached<T: Send + 'static>(
+    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::spawn(work)
+        .await
+        .map_err(|error| ApiError::internal(format!("task failed: {error}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(state: &str, generation: i64, persistent: bool) -> db::Sandbox {
+        db::Sandbox {
+            id: "sbx_a".into(),
+            tenant: "t".into(),
+            state: state.into(),
+            template: "base".into(),
+            build: None,
+            labels: Default::default(),
+            secrets: Vec::new(),
+            egress: spawn_egress::Policy {
+                mode: spawn_egress::Mode::Allowlist,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                max_egress_mbps: None,
+                max_ingress_mbps: None,
+            },
+            created_at: 1,
+            expires_at: 2,
+            idle_pause_s: 0,
+            paused_at: None,
+            node: None,
+            vcpus: 1,
+            memory_mib: 256,
+            volumes: Vec::new(),
+            persistent,
+            generation,
+            cold_starts: 0,
+            last_cold_start_at: None,
+        }
+    }
+
+    #[test]
+    fn an_evict_that_stopped_halfway_is_finished_by_the_next() {
+        // The record is gone but the row was not made cold: a cancelled
+        // evict, or one whose cgroup kill failed. Asking again finishes it.
+        assert_eq!(
+            leftover(Some(&row(state::RUNNING, 4, true)), 4),
+            Leftover::Orphan { was_running: true }
+        );
+        assert_eq!(
+            leftover(Some(&row(state::PAUSED, 4, true)), 4),
+            Leftover::Orphan { was_running: false }
+        );
+        assert_eq!(
+            leftover(Some(&row(state::COLD, 4, true)), 4),
+            Leftover::Cold
+        );
+        // Another generation, an ephemeral sandbox, a start in progress or
+        // no row at all are not this evict's to touch.
+        assert_eq!(
+            leftover(Some(&row(state::RUNNING, 5, true)), 4),
+            Leftover::Gone
+        );
+        assert_eq!(
+            leftover(Some(&row(state::RUNNING, 4, false)), 4),
+            Leftover::Gone
+        );
+        assert_eq!(
+            leftover(Some(&row(state::STARTING, 4, true)), 4),
+            Leftover::Gone
+        );
+        assert_eq!(leftover(None, 4), Leftover::Gone);
+    }
+
+    #[tokio::test]
+    async fn detached_work_ends_when_its_caller_is_dropped() {
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(detached(async move {
+            started_tx.send(()).unwrap();
+            gate.await.unwrap();
+            done_tx.send(()).unwrap();
+            Ok(())
+        }));
+        started.await.unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("the work ran to its end")
+            .unwrap();
+    }
 
     #[test]
     fn a_cold_start_boots_only_in_what_is_left_of_its_claim() {
