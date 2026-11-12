@@ -530,9 +530,7 @@ curl -s -H "$A" -d '{"template": "claude-code", "secrets": ["anthropic"]}' $B/sa
 For Codex, use the `openai` secret from
 [Use a secret safely](#use-a-secret-safely) (`OPENAI_API_KEY`).
 
-> **NOTE:** These templates are not yet tested in a real Firecracker VM.
-> The packages were checked in a `linux/amd64` container with Node.js
-> 26.13.1. The held-secret setup for Copilot CLI is not documented here,
+> **NOTE:** The held-secret setup for Copilot CLI is not documented here,
 > because the hosts that it sends its token to are not verified.
 
 ### Start a template from a container image
