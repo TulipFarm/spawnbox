@@ -70,8 +70,19 @@ fn strip_hop_by_hop(headers: &mut HeaderMap, upgrade: bool) {
 pub async fn send(
     tls: Arc<ClientConfig>,
     url: &str,
-    mut req: Request<Body>,
+    req: Request<Body>,
 ) -> Result<Response<Body>, Failure> {
+    connect(tls, url).await?.send(req).await
+}
+
+/// A connection to a host that no request was sent on yet.
+pub struct Connection {
+    sender: hyper::client::conn::http1::SendRequest<Body>,
+    url: String,
+}
+
+/// Connects to the host at `url`; `tls` checks who it is.
+pub async fn connect(tls: Arc<ClientConfig>, url: &str) -> Result<Connection, Failure> {
     let addr = authority(url).map_err(Failure::Unreachable)?;
     let unreachable = |e: anyhow::Error| Failure::Unreachable(e.context(format!("reach {url}")));
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
@@ -86,34 +97,45 @@ pub async fn send(
         .context("TLS handshake timed out")
         .and_then(|r| r.context("TLS handshake"))
         .map_err(unreachable)?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| unreachable(e.into()))?;
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
-    let upgrade = is_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
-    strip_hop_by_hop(req.headers_mut(), upgrade.is_some());
-    let mut resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Failure::Broken(anyhow::Error::from(e).context(format!("call {url}"))))?;
-    match upgrade {
-        Some(client) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
-            let upstream = hyper::upgrade::on(&mut resp);
-            tokio::spawn(async move {
-                if let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream) {
-                    let _ = tokio::io::copy_bidirectional(
-                        &mut TokioIo::new(client),
-                        &mut TokioIo::new(upstream),
-                    )
-                    .await;
-                }
-            });
+    Ok(Connection {
+        sender,
+        url: url.to_owned(),
+    })
+}
+
+impl Connection {
+    /// Sends `req`. WebSocket upgrades are joined both ways.
+    pub async fn send(self, mut req: Request<Body>) -> Result<Response<Body>, Failure> {
+        let Self { mut sender, url } = self;
+        let upgrade = is_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
+        strip_hop_by_hop(req.headers_mut(), upgrade.is_some());
+        let mut resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| Failure::Broken(anyhow::Error::from(e).context(format!("call {url}"))))?;
+        match upgrade {
+            Some(client) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
+                let upstream = hyper::upgrade::on(&mut resp);
+                tokio::spawn(async move {
+                    if let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream) {
+                        let _ = tokio::io::copy_bidirectional(
+                            &mut TokioIo::new(client),
+                            &mut TokioIo::new(upstream),
+                        )
+                        .await;
+                    }
+                });
+            }
+            _ => strip_hop_by_hop(resp.headers_mut(), false),
         }
-        _ => strip_hop_by_hop(resp.headers_mut(), false),
+        Ok(resp.map(Body::new))
     }
-    Ok(resp.map(Body::new))
 }
 
 /// POSTs `body` as JSON to `url` + `path` and reads a JSON reply. A reply
