@@ -365,13 +365,15 @@ pub(crate) mod tests {
         old.execute_batch(
             "PRAGMA secure_delete = OFF;
              ALTER TABLE sandboxes RENAME COLUMN saved_state TO saved;
-             DROP TABLE upkeep;",
+             DROP TABLE upkeep;
+             ALTER TABLE nodes DROP COLUMN fenced_at;
+             ALTER TABLE nodes DROP COLUMN fenced_by;",
         )
         .unwrap();
         let version: i64 = old
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        old.pragma_update(None, "user_version", version - 1)
+        old.pragma_update(None, "user_version", version - 2)
             .unwrap();
         let json = serde_json::json!({
             "env": { "TOKEN": "sandbox-secret-env" }, "ports": {}, "secrets": [],

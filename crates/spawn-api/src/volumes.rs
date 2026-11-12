@@ -175,10 +175,7 @@ impl Volumes {
             }
             if row.backend.is_some() {
                 if !file.exists() {
-                    return Err(ApiError::new(
-                        Code::Conflict,
-                        format!("volume {:?} is on another host", volume.name),
-                    ));
+                    return Err(volume_unavailable(&volume.name));
                 }
                 continue;
             }
@@ -243,4 +240,12 @@ impl Volumes {
 
 fn now_ms() -> i64 {
     crate::runtime::now_ms()
+}
+
+/// A volume whose only copy is on a host that is lost or unreachable.
+pub fn volume_unavailable(name: &str) -> ApiError {
+    ApiError::new(
+        Code::VolumeUnavailable,
+        format!("volume {name:?} is on a host that cannot be reached; try again when it returns"),
+    )
 }

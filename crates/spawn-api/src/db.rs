@@ -604,7 +604,7 @@ pub struct Sandbox {
 }
 
 /// What starting a persistent sandbox again needs, kept until it ends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StartRecord {
     pub sandbox: String,
     pub tenant: String,
@@ -1322,6 +1322,21 @@ impl Db {
              RETURNING id, tenant",
         )?;
         stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    /// Persistent sandboxes this host's database says run, start or are
+    /// paused here: after a failover, the old leader's. Returns their IDs,
+    /// tenants and generations.
+    pub fn unfinished_persistent(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant, generation FROM sandboxes
+             WHERE state IN ('starting', 'running', 'paused') AND persistent = 1
+               AND node IS NULL
+             ORDER BY seq",
+        )?;
+        stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect()
     }
 
@@ -2699,6 +2714,59 @@ impl Db {
         }
         tx.commit()?;
         Ok(gone)
+    }
+
+    /// Ends claims to start a sandbox on `node` that ran out, from what it
+    /// reports: `(id, generation, state)`. A copy at the claimed generation
+    /// that runs or is paused keeps running; otherwise the sandbox is cold
+    /// and this host's again. Returns those made cold.
+    pub fn settle_claims(
+        &self,
+        node: &str,
+        reported: &[(&str, i64, &str)],
+        now: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let expired: Vec<(String, String, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, tenant, generation FROM sandboxes
+                 WHERE node = ?1 AND persistent = 1 AND state = 'starting'
+                   AND claim_deadline < ?2",
+            )?;
+            stmt.query_map(params![node, now], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<_>>()?
+        };
+        let mut cooled = Vec::new();
+        for (id, tenant, generation) in expired {
+            let runs = reported.iter().find_map(|(rid, rgen, rstate)| {
+                (*rid == id
+                    && *rgen == generation
+                    && matches!(*rstate, state::RUNNING | state::PAUSED))
+                .then_some(*rstate)
+            });
+            if let Some(runs) = runs {
+                tx.execute(
+                    "UPDATE sandboxes
+                     SET state = ?3, claim = NULL, claim_deadline = NULL,
+                         cold_starts = cold_starts + 1, last_cold_start_at = ?4
+                     WHERE id = ?1 AND node = ?2 AND state = 'starting'",
+                    params![id, node, runs, now],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE sandboxes
+                     SET state = 'cold', node = NULL, claim = NULL, claim_deadline = NULL
+                     WHERE id = ?1 AND node = ?2 AND state = 'starting'",
+                    params![id, node],
+                )?;
+                cooled.push((id, tenant));
+            }
+        }
+        tx.commit()?;
+        Ok(cooled)
     }
 
     /// Records that `node`, down or removed, is known to run nothing: by
@@ -4645,6 +4713,41 @@ mod tests {
         let row = db.get_sandbox("sbx_q").unwrap().unwrap();
         assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
         assert!(db.unfenced_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unfinished_cold_starts_settle_from_the_report() {
+        let db = Db::memory().unwrap();
+        db.insert_join_token(b"t", 0, 100).unwrap();
+        db.join_node(b"t", &node("nod_a", 1)).unwrap();
+        for id in ["sbx_p", "sbx_q", "sbx_r"] {
+            db.insert_persistent(&persistent(id, state::COLD), &start_record(id, "b1"), None)
+                .unwrap()
+                .unwrap();
+            db.claim_cold(id, Some("nod_a"), "c", 100).unwrap();
+        }
+        let generation = db.get_sandbox("sbx_p").unwrap().unwrap().generation;
+        let report = [
+            ("sbx_p", generation, state::RUNNING),
+            ("sbx_q", generation - 1, state::RUNNING),
+        ];
+        // A claim still in time is left to its caller.
+        assert!(db.settle_claims("nod_a", &report, 100).unwrap().is_empty());
+        let cooled = db.settle_claims("nod_a", &report, 101).unwrap();
+        let ids: Vec<&str> = cooled.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["sbx_q", "sbx_r"]);
+        let p = db.get_sandbox("sbx_p").unwrap().unwrap();
+        assert_eq!(
+            (p.state.as_str(), p.node.as_deref()),
+            (state::RUNNING, Some("nod_a"))
+        );
+        assert_eq!(p.generation, generation);
+        for id in ["sbx_q", "sbx_r"] {
+            let row = db.get_sandbox(id).unwrap().unwrap();
+            assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+        }
+        // A settled claim can be made again.
+        assert!(db.claim_cold("sbx_q", None, "d", 200).unwrap().is_some());
     }
 
     #[test]

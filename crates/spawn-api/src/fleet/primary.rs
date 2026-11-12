@@ -30,8 +30,8 @@ use super::pki::{FleetCa, Identity, Peer};
 use super::retire::{self, Busy, Retirer};
 use super::volumes::Need;
 use super::{
-    Capacity, Config, ConfigRequest, DOWN_AFTER_MS, EgressCa, EventBatch, EventReply, Heartbeat,
-    HeartbeatReply, JoinReply, JoinRequest, KeyCopy, NODE_HEADER, ROUTE_HEADER, Routes,
+    Capacity, ColdStart, Config, ConfigRequest, DOWN_AFTER_MS, EgressCa, EventBatch, EventReply,
+    Heartbeat, HeartbeatReply, JoinReply, JoinRequest, KeyCopy, NODE_HEADER, ROUTE_HEADER, Routes,
     SUSPECT_AFTER_MS, SecretPush, SyncReply, TemplateCopy, UsageBatch, check_node_url, hex,
 };
 use crate::db::{
@@ -42,11 +42,14 @@ use crate::ids;
 use crate::model::{
     ApiError, BASE_TEMPLATE, Code, CreateSandbox, ForkSandbox, TemplateSpec, rfc3339_ms,
 };
-use crate::runtime::{MAX_FORK, now_ms};
+use crate::runtime::{COLD_START_CLAIM, MAX_FORK, now_ms};
 use crate::server::{App, AppState, parse};
 use crate::tenancy::{Tenant, scoped};
 use crate::traces::{self, Traced};
 
+/// How much longer than a cold start may take the primary waits for a
+/// worker's, and its claim lasts.
+const COLD_START_SLACK: std::time::Duration = std::time::Duration::from_secs(15);
 /// Most hosts a create is tried on.
 const PLACE_TRIES: usize = 3;
 /// Largest body on fleet calls: heartbeats list every sandbox.
@@ -358,11 +361,20 @@ async fn heartbeat(
     let node = worker(&app, &peer, &headers)?;
     let hb: Heartbeat = parse(&body)?;
     check_node_url(&hb.url).map_err(|e| ApiError::invalid(format!("url {e}")))?;
-    let reply = |app: &App| -> Result<Json<HeartbeatReply>, ApiError> {
-        let reported: Vec<&str> = hb
-            .sandboxes
+    let live_copies = || {
+        hb.sandboxes
             .iter()
             .filter(|s| !matches!(s.state.as_str(), state::DELETED | state::FAILED))
+    };
+    // Persistent copies are checked by generation; releasing one would
+    // delete its volumes.
+    let copies: Vec<(&str, i64)> = live_copies()
+        .filter(|s| s.persistent)
+        .map(|s| (s.id.as_str(), s.generation))
+        .collect();
+    let reply = |app: &App| -> Result<Json<HeartbeatReply>, ApiError> {
+        let reported: Vec<&str> = live_copies()
+            .filter(|s| !s.persistent)
             .map(|s| s.id.as_str())
             .filter(|id| !p.moves.is_moving(id))
             .collect();
@@ -370,6 +382,7 @@ async fn heartbeat(
             config_version: p.version(),
             events_after: app.db.remote_event_cursor(&node.id)?,
             release: app.db.misplaced(&node.id, &reported)?,
+            stale: app.db.stale_copies(&node.id, &copies)?,
         }))
     };
     // Calls may arrive out of order; an older report must not undo a newer.
@@ -377,8 +390,36 @@ async fn heartbeat(
         return reply(&app);
     }
     let now = now_ms();
+    let stale: HashSet<String> = app
+        .db
+        .stale_copies(&node.id, &copies)?
+        .into_iter()
+        .collect();
     for sandbox in &hb.sandboxes {
-        app.db.put_mirror(&node.id, sandbox, now)?;
+        if stale.contains(&sandbox.id) {
+            continue;
+        }
+        if app.db.put_mirror(&node.id, sandbox, now)?
+            && sandbox.persistent
+            && sandbox.state == state::COLD
+        {
+            cold_event(
+                &app,
+                &sandbox.tenant,
+                &sandbox.id,
+                "node_reported",
+                &node.id,
+            );
+        }
+    }
+    let states: Vec<(&str, i64, &str)> = hb
+        .sandboxes
+        .iter()
+        .filter(|s| s.persistent && !stale.contains(&s.id))
+        .map(|s| (s.id.as_str(), s.generation, s.state.as_str()))
+        .collect();
+    for (id, tenant) in app.db.settle_claims(&node.id, &states, now)? {
+        cold_event(&app, &tenant, &id, "start_unfinished", &node.id);
     }
     let mut keep: HashSet<String> = hb.sandboxes.iter().map(|s| s.id.clone()).collect();
     // A report from before a move must not count a moved sandbox as lost.
@@ -395,7 +436,19 @@ async fn heartbeat(
             json!({ "reason": "gone from node", "node": node.id }),
         );
     }
-    let report = json!({ "capacity": hb.capacity, "config_version": hb.config_version });
+    let keep: HashSet<String> = keep.difference(&stale).cloned().collect();
+    for (id, tenant) in app
+        .db
+        .cool_missing(&node.id, &keep, now - MIRROR_GRACE_MS)?
+    {
+        cold_event(&app, &tenant, &id, "gone_from_node", &node.id);
+    }
+    let report = json!({
+        "capacity": hb.capacity,
+        "config_version": hb.config_version,
+        "self_fence": hb.self_fence,
+        "fence_after_s": hb.fence_after_s,
+    });
     let seen = NodeRow {
         url: hb.url.clone(),
         boot: Some(hb.boot.clone()),
@@ -522,16 +575,100 @@ async fn usage(
     Ok(Json(json!({})))
 }
 
-/// Marks nodes suspect, then down, when their heartbeats stop.
-pub fn watch(app: AppState) -> tokio::task::JoinHandle<()> {
+/// Marks nodes suspect, then down, when their heartbeats stop, and makes
+/// cold the persistent sandboxes of lost nodes once their copies are
+/// known to be gone. `margin` is added to a worker's fence time.
+pub fn watch(app: AppState, margin: std::time::Duration) -> tokio::task::JoinHandle<()> {
+    let margin_ms = i64::try_from(margin.as_millis()).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(super::HEARTBEAT_EVERY).await;
             if let Err(error) = check_nodes(&app) {
                 eprintln!("fleet: check nodes: {error:#}");
             }
+            if let Err(error) = check_fenced(&app, margin_ms) {
+                eprintln!("fleet: check fenced nodes: {error:#}");
+            }
         }
     })
+}
+
+/// Records that a persistent sandbox is cold again.
+fn cold_event(app: &App, tenant: &str, id: &str, reason: &str, node: &str) {
+    eprintln!("{id} is cold: {reason} on {node}");
+    app.sandboxes.hub.record(
+        "sandbox.cold",
+        &Origin::system(),
+        Some(tenant),
+        Some(id),
+        json!({ "reason": reason, "node": node }),
+    );
+}
+
+/// What proves a lost node's copies are gone: an operator or the
+/// autoscaler said so, or the node fences itself and has not been heard
+/// from for its fence time and `margin_ms`. Being down proves nothing.
+pub fn fence_proof(
+    fenced_by: Option<&str>,
+    report: Option<&str>,
+    last_seen: i64,
+    margin_ms: i64,
+    now: i64,
+) -> Option<String> {
+    if let Some(by) = fenced_by {
+        return Some(by.to_owned());
+    }
+    let report: Value = serde_json::from_str(report?).ok()?;
+    let fence_after_s = report.get("fence_after_s")?.as_i64()?;
+    let fences = report.get("self_fence")?.as_bool()? && fence_after_s > 0;
+    (fences && now >= last_seen + fence_after_s * 1000 + margin_ms).then(|| "self_fence".into())
+}
+
+/// Makes cold the persistent sandboxes of a node whose copies are gone.
+pub fn cool_fenced(app: &App, node: &str, proof: &str, origin: &Origin) -> Result<usize> {
+    let cooled = app.db.cool_node(node)?;
+    for (id, tenant) in &cooled {
+        eprintln!("{id} is cold: {node} is fenced ({proof})");
+        crate::metrics::inc(
+            "spawnbox_fenced_cold_total",
+            vec![("reason", proof.to_owned())],
+        );
+        app.sandboxes.hub.record(
+            "sandbox.cold",
+            origin,
+            Some(tenant),
+            Some(id),
+            json!({ "reason": "fenced", "node": node, "proof": proof }),
+        );
+    }
+    Ok(cooled.len())
+}
+
+fn check_fenced(app: &App, margin_ms: i64) -> Result<()> {
+    let now = now_ms();
+    for (node, fenced_by) in app.db.unfenced_nodes()? {
+        let last_seen = node.last_seen.unwrap_or(node.created_at);
+        let Some(proof) = fence_proof(
+            fenced_by.as_deref(),
+            node.report.as_deref(),
+            last_seen,
+            margin_ms,
+            now,
+        ) else {
+            continue;
+        };
+        if fenced_by.is_none() {
+            app.sandboxes.hub.record(
+                "node.fenced",
+                &Origin::system(),
+                None,
+                None,
+                json!({ "node": node.id, "reason": proof }),
+            );
+        }
+        cool_fenced(app, &node.id, &proof, &Origin::system())?;
+    }
+    Ok(())
 }
 
 fn check_nodes(app: &App) -> Result<()> {
@@ -704,6 +841,210 @@ impl Created {
             cold_starts: 0,
             last_cold_start_at: None,
         })
+    }
+}
+
+/// Starts cold persistent sandbox `id` on a worker with room, under a
+/// claim for the next generation, or leaves it for the call to start it
+/// here: then its volumes are gathered here first. `here` keeps it on this
+/// host. Fails with `volume_unavailable` while a volume's only copy is on
+/// a host that is not ready.
+pub async fn wake_cold(app: &App, id: &str, here: bool) -> Result<(), ApiError> {
+    let p = primary(app)?;
+    let gate = app.sandboxes.waking_gate(id);
+    let _waking = gate.lock().await;
+    let Some(sandbox) = app.db.get_sandbox(id)? else {
+        return Ok(());
+    };
+    if !sandbox.persistent || sandbox.node.is_some() || sandbox.state != state::COLD {
+        return Ok(());
+    }
+    let Some(start) = app.db.get_start_record(id)? else {
+        return Ok(());
+    };
+    let Some(tenant) = app.db.get_tenant(&start.tenant)? else {
+        return Ok(());
+    };
+    let mut need = None;
+    let mut _volumes = None;
+    if !start.volumes.is_empty() {
+        _volumes = Some(p.volume_lock.write().await);
+        let now = Need::of(app, &start.volumes)?;
+        for row in &now.rows {
+            if let Some(home) = &row.node
+                && !app
+                    .db
+                    .get_node(home)?
+                    .is_some_and(|n| n.state == node_state::READY)
+            {
+                return Err(crate::volumes::volume_unavailable(&row.name));
+            }
+        }
+        need = Some(now);
+    }
+    let wanted = super::build_hash(&start.spec);
+    let worker = if here {
+        None
+    } else {
+        app.templates
+            .key(Some(&tenant.id), &start.template)
+            .ok()
+            .and_then(|key| {
+                let network = app.sandboxes.network_mode(&tenant, Some(&start.egress));
+                let same_build = |node: &NodeRow| {
+                    p.live()
+                        .get(&node.id)
+                        .and_then(|l| l.capacity.template(&key).cloned())
+                        .is_some_and(|t| t.spec_sha256 == wanted)
+                };
+                candidates(app, p, &tenant, &key, network, need.as_ref())
+                    .into_iter()
+                    .find(|c| c.node.as_ref().is_none_or(same_build))
+            })
+            .and_then(|c| c.node)
+    };
+    if let Some(node) = worker {
+        match start_on(app, p, &node, &tenant, sandbox, &start, need.as_ref()).await {
+            Ok(()) => return Ok(()),
+            // The call never reached it: start it here instead.
+            Err(Failure::Unreachable(error)) => {
+                eprintln!("cold start {id} on node {}: {error:#}", node.id);
+            }
+            Err(Failure::Broken(error)) => {
+                return Err(ApiError::new(
+                    Code::NodeUnreachable,
+                    format!("node {}: {error:#}", node.id),
+                ));
+            }
+        }
+    }
+    if let Some(need) = &need {
+        need.gather(app, p, None).await?;
+    }
+    Ok(())
+}
+
+/// Starts cold sandbox `sandbox` on `node` at the next generation. Its
+/// claim is given up only when the call surely did not start it there;
+/// otherwise the node's heartbeats settle it.
+async fn start_on(
+    app: &App,
+    p: &Primary,
+    node: &NodeRow,
+    tenant: &Tenant,
+    sandbox: db::Sandbox,
+    start: &db::StartRecord,
+    need: Option<&Need>,
+) -> Result<(), Failure> {
+    let fail = |e: ApiError| Failure::Unreachable(anyhow::anyhow!(e.message));
+    let id = sandbox.id.clone();
+    let _reservation = app
+        .sandboxes
+        .reserve(
+            &tenant.id,
+            &tenant.quotas,
+            u8::try_from(start.vcpus).unwrap_or(u8::MAX),
+            start.memory_mib,
+        )
+        .map_err(fail)?;
+    // Nothing started there before the claim.
+    let before = |f: Failure| Failure::Unreachable(f.error());
+    let tls = p.client(&node.id).map_err(fail)?;
+    if p.is_stale(&node.id) {
+        let _: SyncReply = forward::call(
+            Arc::clone(&tls),
+            &node.url,
+            "/fleet/v1/sync",
+            None,
+            &json!({}),
+        )
+        .await
+        .map_err(before)?;
+    }
+    if !start.secrets.is_empty() {
+        let keys: Vec<String> = app
+            .secrets
+            .specs(Some(&tenant.id), &start.secrets)
+            .map_err(fail)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let push = SecretPush {
+            secrets: app.secrets.export(&keys).map_err(fail)?,
+        };
+        let _: Value = forward::call(
+            Arc::clone(&tls),
+            &node.url,
+            "/fleet/v1/secrets",
+            None,
+            &push,
+        )
+        .await
+        .map_err(before)?;
+    }
+    if let Some(need) = need {
+        need.gather(app, p, Some(node)).await.map_err(fail)?;
+        super::volumes::push(app, p, node, &start.volumes)
+            .await
+            .map_err(fail)?;
+    }
+    let env = app
+        .secrets
+        .sbox()
+        .open_sandbox_env(&start.tenant, &id, &start.env)
+        .ok_or_else(|| fail(ApiError::internal("the start record's env cannot be read")))?;
+    let claim = ids::base32(&ids::random::<10>().map_err(|e| fail(ApiError::internal(e)))?);
+    let wait = COLD_START_CLAIM + COLD_START_SLACK;
+    let deadline = now_ms() + i64::try_from((wait + COLD_START_SLACK).as_millis()).unwrap_or(0);
+    let Some(generation) = app
+        .db
+        .claim_cold(&id, Some(&node.id), &claim, deadline)
+        .map_err(|e| fail(e.into()))?
+    else {
+        return Ok(());
+    };
+    let body = ColdStart {
+        sandbox,
+        start: db::StartRecord {
+            env: Vec::new(),
+            ..start.clone()
+        },
+        env,
+        generation,
+    };
+    let busy = p.busy.hold(&node.id);
+    let sent = tokio::time::timeout(
+        wait,
+        forward::call::<_, Value>(tls, &node.url, "/fleet/v1/cold-start", None, &body),
+    )
+    .await
+    .unwrap_or_else(|_| Err(Failure::Broken(anyhow::anyhow!("the start took too long"))));
+    drop(busy);
+    match sent {
+        Ok(_) => {
+            let now = now_ms();
+            if app
+                .db
+                .finish_cold_start(&id, Some(&node.id), generation, &claim, now)
+                .map_err(|e| fail(e.into()))?
+            {
+                eprintln!(
+                    "{id} started on node {} at generation {generation}",
+                    node.id
+                );
+            }
+            Ok(())
+        }
+        Err(Failure::Unreachable(error)) => {
+            if let Err(e) = app
+                .db
+                .abandon_claim(&id, Some(&node.id), generation, &claim)
+            {
+                eprintln!("record {id} as cold: {e}");
+            }
+            Err(Failure::Unreachable(error))
+        }
+        Err(broken) => Err(broken),
     }
 }
 
@@ -1009,10 +1350,13 @@ pub fn node_of(app: &App, id: &str) -> Option<String> {
 }
 
 /// The worker that runs `sandbox`, if it has not ended. Calls for an ended
-/// one are answered here, as its node may be gone.
+/// one are answered here, as its node may be gone, and so are calls for a
+/// persistent one that is cold or starting: this host places its start.
 pub fn remote_node(sandbox: db::Sandbox) -> Option<String> {
     let ended = matches!(sandbox.state.as_str(), state::DELETED | state::FAILED);
-    sandbox.node.filter(|_| !ended)
+    let waking =
+        sandbox.persistent && matches!(sandbox.state.as_str(), state::COLD | state::STARTING);
+    sandbox.node.filter(|_| !ended && !waking)
 }
 
 /// Sends a call for a worker's sandbox to that worker. `route` tells the
@@ -1384,9 +1728,9 @@ fn yes() -> bool {
     true
 }
 
-/// `POST /v1/nodes/{id}:drain`, `:undrain` and `:retire`. A draining node
-/// gets no new sandboxes. A retiring one also never takes them again: it
-/// is emptied until its machine can be stopped.
+/// `POST /v1/nodes/{id}:drain`, `:undrain`, `:retire` and `:fenced`. A
+/// draining node gets no new sandboxes. A retiring one also never takes
+/// them again: it is emptied until its machine can be stopped.
 pub async fn node_action(
     State(app): State<AppState>,
     axum::extract::Extension(origin): axum::extract::Extension<Origin>,
@@ -1401,6 +1745,7 @@ pub async fn node_action(
         "drain" => true,
         "undrain" => false,
         "retire" => return retire_node(&app, p, id, &body, &origin),
+        "fenced" => return fenced_node(&app, p, id, &body, &origin),
         _ => return Err(ApiError::new(Code::NotFound, "no such endpoint")),
     };
     let input: DrainInput = if body.is_empty() {
@@ -1453,6 +1798,50 @@ pub async fn node_action(
         StatusCode::OK
     };
     Ok((status, Json(view)))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FencedInput {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// An operator states that a down or removed node's host is powered off,
+/// so its persistent sandboxes can start elsewhere.
+fn fenced_node(
+    app: &App,
+    p: &Primary,
+    id: &str,
+    body: &Bytes,
+    origin: &Origin,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let input: FencedInput = if body.is_empty() {
+        FencedInput::default()
+    } else {
+        parse(body)?
+    };
+    let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
+    if node.kind == node_kind::EDGE {
+        return Err(ApiError::invalid("an edge runs no sandboxes"));
+    }
+    if !app.db.set_node_fenced(id, "operator", now_ms())? {
+        return Err(ApiError::new(
+            Code::Conflict,
+            "the node is not down or removed; only a lost host can be fenced",
+        ));
+    }
+    app.sandboxes.hub.record(
+        "node.fenced",
+        origin,
+        None,
+        None,
+        json!({ "node": id, "reason": "operator", "note": input.reason }),
+    );
+    let cooled = cool_fenced(app, id, "operator", origin).map_err(ApiError::internal)?;
+    let mut view = view_of(app, p, &node)?;
+    view["sandboxes_cold"] = json!(cooled);
+    Ok((StatusCode::OK, Json(view)))
 }
 
 fn retire_node(
@@ -1558,5 +1947,29 @@ impl ApiError {
         let mut resp = self.into_response();
         *resp.status_mut() = StatusCode::BAD_GATEWAY;
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_proof_makes_a_lost_node_fenced() {
+        let report = |on: bool| json!({ "self_fence": on, "fence_after_s": 60 }).to_string();
+        let on = report(true);
+        let off = report(false);
+        let at = |now| fence_proof(None, Some(&on), 1_000, 30_000, now);
+        // Being down proves nothing, until the node's own fence time and
+        // the margin have passed.
+        assert_eq!(at(1_000 + 89_999), None);
+        assert_eq!(at(1_000 + 90_000).as_deref(), Some("self_fence"));
+        assert_eq!(fence_proof(None, Some(&off), 0, 0, i64::MAX), None);
+        assert_eq!(fence_proof(None, None, 0, 0, i64::MAX), None);
+        assert_eq!(fence_proof(None, Some("{}"), 0, 0, i64::MAX), None);
+        assert_eq!(
+            fence_proof(Some("operator"), Some(&off), 0, 0, 0).as_deref(),
+            Some("operator")
+        );
     }
 }

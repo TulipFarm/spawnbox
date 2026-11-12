@@ -1194,6 +1194,8 @@ pub enum Code {
     QuotaExceeded,
     NoCapacity,
     NodeUnreachable,
+    /// A volume's only copy is on a host that cannot be reached.
+    VolumeUnavailable,
     Internal,
 }
 
@@ -1209,6 +1211,7 @@ impl Code {
             Self::QuotaExceeded => "quota_exceeded",
             Self::NoCapacity => "no_capacity",
             Self::NodeUnreachable => "node_unreachable",
+            Self::VolumeUnavailable => "volume_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -1221,7 +1224,7 @@ impl Code {
             Self::Forbidden => 403,
             Self::Conflict | Self::ProtectedEnv => 409,
             Self::QuotaExceeded => 429,
-            Self::NoCapacity | Self::NodeUnreachable => 503,
+            Self::NoCapacity | Self::NodeUnreachable | Self::VolumeUnavailable => 503,
             Self::Internal => 500,
         }
     }
@@ -1229,7 +1232,11 @@ impl Code {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::NoCapacity | Self::NodeUnreachable | Self::Internal | Self::QuotaExceeded
+            Self::NoCapacity
+                | Self::NodeUnreachable
+                | Self::VolumeUnavailable
+                | Self::Internal
+                | Self::QuotaExceeded
         )
     }
 }
