@@ -156,7 +156,8 @@ impl Slots {
 }
 
 /// A ready build that new sandboxes can start from. Once retired, its files
-/// are removed when the last create using it finishes. Running sandboxes
+/// are removed when the last create using it finishes, unless a start
+/// record names it. Running sandboxes
 /// keep their own links and copies, so they are not affected.
 pub struct ReadyBuild {
     pub id: String,
@@ -167,6 +168,8 @@ pub struct ReadyBuild {
     pub spec: TemplateSpec,
     dir: PathBuf,
     retired: AtomicBool,
+    /// Asked before its files are removed.
+    db: Db,
     /// Its key in the build store, if it can be kept there.
     store_key: Option<String>,
     /// False while its files are only in the build store. Held while they
@@ -189,7 +192,14 @@ pub enum Startable {
 }
 
 impl ReadyBuild {
-    fn new(build: &db::Build, files: Build, spec: TemplateSpec, dir: PathBuf, local: bool) -> Self {
+    fn new(
+        db: &Db,
+        build: &db::Build,
+        files: Build,
+        spec: TemplateSpec,
+        dir: PathBuf,
+        local: bool,
+    ) -> Self {
         Self {
             id: build.id.clone(),
             seq: build.seq,
@@ -198,6 +208,7 @@ impl ReadyBuild {
             spec,
             dir,
             retired: AtomicBool::new(false),
+            db: db.clone(),
             store_key: build.store_key.clone(),
             local: tokio::sync::Mutex::new(local),
             uploaded: AtomicBool::new(build.uploaded_at.is_some()),
@@ -224,8 +235,15 @@ impl crate::warm::Source for ReadyBuild {
 
 impl Drop for ReadyBuild {
     fn drop(&mut self) {
-        if self.retired.load(Ordering::SeqCst) {
-            remove_dir(&self.dir);
+        if !self.retired.load(Ordering::SeqCst) {
+            return;
+        }
+        // Its files stay while a start record names it, also when the
+        // server stops and lets go of the builds it kept.
+        match self.db.is_build_root(&self.id) {
+            Ok(false) => remove_dir(&self.dir),
+            Ok(true) => {}
+            Err(error) => eprintln!("build {}: keeping its files: {error}", self.id),
         }
     }
 }
@@ -1217,7 +1235,8 @@ impl Templates {
         let complete = files.files().iter().all(|p| p.is_file());
         let stored =
             self.store.is_some() && build.store_key.is_some() && build.uploaded_at.is_some();
-        (complete || stored).then(|| Arc::new(ReadyBuild::new(build, files, spec, dir, complete)))
+        (complete || stored)
+            .then(|| Arc::new(ReadyBuild::new(&self.db, build, files, spec, dir, complete)))
     }
 
     fn remove_unused_dirs(&self) -> Result<()> {
@@ -1651,7 +1670,7 @@ impl Templates {
         if build.root {
             self.db
                 .set_build_state(&build.id, build_state::READY, now, None)?;
-            let ready = Arc::new(ReadyBuild::new(build, files, spec, dir, local));
+            let ready = Arc::new(ReadyBuild::new(&self.db, build, files, spec, dir, local));
             ready.retired.store(true, Ordering::SeqCst);
             self.kept().insert(build.id.clone(), ready);
             eprintln!(
@@ -1673,7 +1692,7 @@ impl Templates {
         }
         self.db
             .set_build_state(&build.id, build_state::READY, now, None)?;
-        let ready = Arc::new(ReadyBuild::new(build, files, spec, dir, local));
+        let ready = Arc::new(ReadyBuild::new(&self.db, build, files, spec, dir, local));
         if let Some(old) = current.insert(build.template.clone(), ready) {
             self.db
                 .set_build_state(&old.id, build_state::REMOVED, now, None)?;
@@ -2263,5 +2282,166 @@ mod tests {
             ..spec
         };
         assert_ne!(rebuild_key("py", &setup, "f"), key);
+    }
+
+    /// Templates over `db` and builds in `dir`, with no VMs: builds are
+    /// published by hand.
+    async fn templates(db: Db, dir: &Path) -> Arc<Templates> {
+        let (cert, key) = spawn_egress::tls::generate_ca().unwrap();
+        let ca = Arc::new(spawn_egress::Ca::load(&cert, &key).unwrap());
+        let store = spawn_egress::SecretStore::default();
+        let sbox = crate::secretbox::SecretBox::new(&[7; 32]).unwrap();
+        let secrets = Secrets::load(db.clone(), sbox, store.clone()).unwrap();
+        let proxy = spawn_egress::Egress::start(
+            0,
+            0,
+            spawn_egress::Policy::allow_all(),
+            Arc::clone(&ca),
+            store,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        let node = Node {
+            host: spawn_node::firecracker::Host {
+                jailer: dir.join("jailer"),
+                firecracker: dir.join("firecracker"),
+                jails: dir.join("jails"),
+                logs: dir.join("logs"),
+                ksm: false,
+                pins: None,
+            },
+            runsc: None,
+            dns: std::net::Ipv4Addr::LOCALHOST,
+        };
+        Arc::new(Templates {
+            db,
+            node: Arc::new(node),
+            slots: Arc::new(Slots::new(1)),
+            network: Arc::new(Network {
+                proxy,
+                policy: spawn_egress::Policy::allow_all(),
+                ca_pem: cert,
+            }),
+            secrets: Arc::new(secrets),
+            inputs: Inputs {
+                kernel: dir.join("vmlinux"),
+                rootfs: dir.join("rootfs.ext4"),
+                runtime: dir.join("firecracker"),
+            },
+            dir: dir.join("builds"),
+            fingerprint: "f".into(),
+            defaults: Resources::default(),
+            builds: Semaphore::new(1),
+            current: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
+            closing: AtomicBool::new(false),
+            store: None,
+            cache_bytes: 0,
+            cpu: String::new(),
+            fresh: Mutex::new(HashMap::new()),
+            rebuilds: Mutex::new(HashMap::new()),
+            collects: true,
+        })
+    }
+
+    /// Saves `spec` as its template and publishes a build of it with a
+    /// file in its directory.
+    fn publish_build(templates: &Templates, spec: &TemplateSpec) -> String {
+        let json = serde_json::to_string(spec).unwrap();
+        templates
+            .db
+            .put_template(&spec.name, &json, now_ms())
+            .unwrap();
+        let build = templates.new_build(&spec.name, &json).unwrap();
+        let dir = templates.dir.join(&build.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vm.mem"), b"memory").unwrap();
+        let files = Build::at(&dir, Backend::Firecracker, limits(&spec.resources), false);
+        templates
+            .publish(&build, spec.clone(), files, dir, true)
+            .unwrap();
+        build.id
+    }
+
+    fn persistent_sandbox(templates: &Templates, id: &str, ready: &ReadyBuild) {
+        let sandbox = db::Sandbox {
+            id: id.into(),
+            tenant: "t1".into(),
+            state: db::state::STARTING.into(),
+            template: ready.spec.name.clone(),
+            build: Some(ready.id.clone()),
+            labels: Default::default(),
+            secrets: Vec::new(),
+            egress: spawn_egress::Policy::allow_all(),
+            created_at: now_ms(),
+            expires_at: i64::MAX,
+            idle_pause_s: 3600,
+            paused_at: None,
+            node: None,
+            vcpus: 1,
+            memory_mib: 256,
+            volumes: Vec::new(),
+            persistent: true,
+            generation: 1,
+            cold_starts: 0,
+            last_cold_start_at: None,
+        };
+        let start = db::StartRecord {
+            sandbox: id.into(),
+            tenant: "t1".into(),
+            template: ready.spec.name.clone(),
+            build: ready.id.clone(),
+            spec: serde_json::to_string(&ready.spec).unwrap(),
+            vcpus: 1,
+            memory_mib: 256,
+            egress: spawn_egress::Policy::allow_all(),
+            secrets: Vec::new(),
+            volumes: Vec::new(),
+            ports: "{}".into(),
+            idle_pause_s: 3600,
+            env: vec![1],
+            created_at: now_ms(),
+            updated_at: now_ms(),
+        };
+        templates
+            .db
+            .insert_persistent(&sandbox, &start, None)
+            .unwrap()
+            .unwrap();
+        assert!(templates.db.start_running(id, 1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn keeps_the_build_a_start_record_names_when_its_template_changes() {
+        let dir = std::env::temp_dir().join(format!("spawnbox-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let templates = templates(Db::memory().unwrap(), &dir).await;
+        let v1 = TemplateSpec {
+            name: "rb".into(),
+            setup: vec!["echo v1 > /etc/tver".into()],
+            ..TemplateSpec::base(Resources::default())
+        };
+        let first = publish_build(&templates, &v1);
+        let (_, ready) = templates.ready(None, "rb").unwrap();
+        persistent_sandbox(&templates, "sbx_a", &ready);
+        templates.hold(&ready);
+        drop(ready);
+
+        let v2 = TemplateSpec {
+            setup: vec!["echo v2 > /etc/tver".into()],
+            ..v1
+        };
+        let second = publish_build(&templates, &v2);
+        assert_eq!(templates.ready(None, "rb").unwrap().1.id, second);
+        assert!(templates.dir.join(&first).join("vm.mem").exists());
+        templates.prune_roots();
+        assert!(templates.dir.join(&first).join("vm.mem").exists());
+        assert_eq!(templates.root(&first).unwrap().id, first);
+        // As when the server stops: its kept builds are dropped.
+        let builds = templates.dir.clone();
+        drop(templates);
+        assert!(builds.join(&first).join("vm.mem").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

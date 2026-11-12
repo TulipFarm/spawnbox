@@ -1215,6 +1215,16 @@ impl Db {
         stmt.query_map((), |r| r.get(0))?.collect()
     }
 
+    /// True while a start record of a live sandbox names build `id`.
+    pub fn is_build_root(&self, id: &str) -> Result<bool> {
+        self.conn()
+            .prepare(
+                "SELECT 1 FROM start_records r JOIN sandboxes s ON s.id = r.sandbox
+                 WHERE r.build = ?1 AND s.state NOT IN ('deleted', 'failed') LIMIT 1",
+            )?
+            .exists([id])
+    }
+
     /// Claims a cold sandbox of this host to start it on `node`, or here
     /// if `None`: it becomes `starting` with the next generation, which is
     /// returned. `None` if it is not cold.
@@ -3638,6 +3648,8 @@ mod tests {
         db.set_state("b", 1, state::DELETED, 9).unwrap();
         assert_eq!(db.get_start_record("b").unwrap(), None);
         assert_eq!(db.build_roots().unwrap(), HashSet::from(["b1".to_owned()]));
+        assert!(db.is_build_root("b1").unwrap());
+        assert!(!db.is_build_root("b2").unwrap());
         db.insert_persistent(
             &persistent("c", state::RUNNING),
             &start_record("c", "b3"),

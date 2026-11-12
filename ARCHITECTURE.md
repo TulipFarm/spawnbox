@@ -161,7 +161,8 @@ flowchart LR
   disk or Firecracker version changes, because a snapshot only restores
   on the same versions.
 - A build that a persistent sandbox's start record names is kept until
-  that sandbox is deleted.
+  that sandbox is deleted, also when the server stops or the template gets
+  a new build.
 
 ### Build store
 
