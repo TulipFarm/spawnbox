@@ -1759,7 +1759,11 @@ systemctl list-timers spawnbox-backup.timer  # see when the next one runs
    sudo /opt/spawnbox/bin/spawn-api check-data --data-dir /var/lib/spawnbox
    ```
 
-   Add `--database-url` for Postgres. It only reads.
+   Add `--database-url` for Postgres. It changes nothing: it opens SQLite
+   read-only and Postgres in read-only transactions, and does not upgrade
+   the schema. It fails if the database's schema version is not the one
+   this `spawn-api` writes; check with the binary that wrote the data, or
+   start the matching server once to upgrade it.
 
 6. Start the server, and check it:
 

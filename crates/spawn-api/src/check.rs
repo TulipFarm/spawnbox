@@ -44,7 +44,7 @@ pub fn run(
     if database_url.is_none() && !db_file.exists() {
         bail!("no database at {}", db_file.display());
     }
-    let db = crate::leader::open(data, database_url, database_ca_file)?;
+    let db = crate::leader::open_read_only(data, database_url, database_ca_file)?;
     let report = check(&db, data, &sbox)?;
     print(&report);
     if !report.unreadable.is_empty() {
@@ -391,6 +391,32 @@ mod tests {
             Some(query) => format!("{base}/{name}?{query}"),
             None => format!("{base}/{name}"),
         }
+    }
+
+    #[test]
+    fn refuses_another_schema_version_and_leaves_it() {
+        let dir = crate::reseal::tests::scratch_dir("check-version");
+        std::fs::write(dir.join("secrets.key"), [7; 32]).unwrap();
+        let path = dir.join(crate::DB_FILE);
+        drop(Db::open(&path).unwrap());
+        run(&dir, None, None, None).unwrap();
+
+        let version = |set: Option<i64>| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            if let Some(v) = set {
+                conn.pragma_update(None, "user_version", v).unwrap();
+            }
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let current = version(None);
+        for other in [current - 1, current + 1] {
+            version(Some(other));
+            let error = run(&dir, None, None, None).unwrap_err();
+            assert!(format!("{error:#}").contains("schema version"), "{error:#}");
+            assert_eq!(version(None), other);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

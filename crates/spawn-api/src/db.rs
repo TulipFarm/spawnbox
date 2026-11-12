@@ -681,6 +681,18 @@ fn newer_than_binary(version: i64, known: usize) -> Result<()> {
     Ok(())
 }
 
+fn same_as_binary(version: i64, known: usize) -> Result<()> {
+    newer_than_binary(version, known)?;
+    if version != i64::try_from(known).unwrap_or(i64::MAX) {
+        return Err(Error::Connection(format!(
+            "the database has schema version {version}, but this spawnbox writes version \
+             {known}; start the matching spawn-api once to upgrade it, or check it with the \
+             binary that wrote it"
+        )));
+    }
+    Ok(())
+}
+
 /// One connection behind a lock. Queries are small, so they run directly
 /// on the async threads. One connection also keeps check-then-write steps
 /// whole, as only one primary writes at a time.
@@ -716,6 +728,41 @@ impl Db {
         tx.execute("DELETE FROM schema_version", ())?;
         tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [latest])?;
         tx.commit()?;
+        Ok(Self(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Opens an existing SQLite database read-only, without migrating it.
+    /// Fails unless its schema is the version this binary writes.
+    pub fn open_sqlite_read_only(path: &Path) -> Result<Self> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        same_as_binary(version, MIGRATIONS.len())?;
+        Ok(Self(Arc::new(Mutex::new(Conn::Sqlite(conn)))))
+    }
+
+    /// Connects in read-only transactions, without migrating or taking the
+    /// upgrade lock. Fails unless the schema is the version this binary
+    /// writes.
+    pub fn open_postgres_read_only(target: PgTarget) -> Result<Self> {
+        let mut conn = Conn::Postgres(sql::Pg::connect(target)?);
+        conn.execute_batch("SET default_transaction_read_only = on")?;
+        let tx = conn.transaction()?;
+        let has_version: bool = tx.query_row(
+            "SELECT to_regclass('schema_version') IS NOT NULL",
+            (),
+            |r| r.get(0),
+        )?;
+        let version: Option<i64> = if has_version {
+            tx.query_row("SELECT version FROM schema_version", (), |r| r.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        tx.commit()?;
+        same_as_binary(version.unwrap_or(0), PG_MIGRATIONS.len())?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 

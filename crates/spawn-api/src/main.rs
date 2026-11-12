@@ -91,7 +91,9 @@ enum Cli {
         database_ca_file: Option<PathBuf>,
     },
     /// Check a data directory and its database, as after a restore: count
-    /// what they hold and decrypt every sealed value. Changes nothing.
+    /// what they hold and decrypt every sealed value. Changes nothing: it
+    /// opens SQLite read-only and Postgres in read-only transactions, does
+    /// not migrate, and fails if the schema version is not this binary's.
     CheckData {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,

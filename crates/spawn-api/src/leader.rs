@@ -72,6 +72,17 @@ pub fn open(data: &Path, url: Option<&str>, ca_file: Option<&Path>) -> Result<Db
     }
 }
 
+/// The database as it is, read-only and without migrations, for checks
+/// that must not change it.
+pub fn open_read_only(data: &Path, url: Option<&str>, ca_file: Option<&Path>) -> Result<Db> {
+    match url {
+        Some(url) => {
+            Db::open_postgres_read_only(target(url, ca_file)?).context("open the Postgres database")
+        }
+        None => Db::open_sqlite_read_only(&data.join(crate::DB_FILE)).context("open database"),
+    }
+}
+
 /// This host's name in the lease, kept in the data directory.
 pub fn host_id(data: &Path) -> Result<String> {
     let path = data.join("host-id");
