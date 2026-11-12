@@ -1089,7 +1089,11 @@ SPAWNBOX_ARGS="... --primary https://10.0.0.1:7443 --self-fence --fence-after-s 
 ```
 
 On the primary, `--fence-margin-s` (default 30) is the time to add for
-clocks and slow hosts.
+clocks and slow hosts. The worker counts from when it sent its last
+heartbeat that got an answer, and the primary from when it got that
+heartbeat, so the worker always fences first. Keep the margin above 10
+seconds: a worker can take a few seconds to see the fence time and stop
+its VMs.
 
 **Generations.** Each cold start adds 1 to the `generation` of the
 sandbox. A host runs a sandbox only for the generation that the primary
@@ -1150,9 +1154,10 @@ When a standby becomes the leader:
 - Persistent sandboxes of the old leader become `cold` after
   `--fence-after-s` plus `--fence-margin-s`. Until then, requests for them
   give `409`.
-- If the leader cannot reach the database for 8 seconds, it stops its
-  persistent VMs, then exits, so that two primaries never serve at the
-  same time.
+- If the leader cannot reach the database for 6 seconds, or another
+  primary took its lease, it stops taking requests, kills all its VMs and
+  exits, before its lease ends. So two primaries never serve at the same
+  time.
 
 To use TLS with a certificate check, give the CA of the database in
 `--database-ca-file`. Without it, the connection uses TLS if the server

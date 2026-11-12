@@ -898,12 +898,22 @@ flowchart TB
   `stale_generation`). It never resumes.
 - **Self-fencing.** Heartbeats carry `self_fence` and `fence_after_s`.
   A worker with `--self-fence` that has had no answer from the primary
-  for `fence_after_s` writes `cgroup.kill` for each persistent VM's
+  for `fence_after_s`, counted from when it sent the last heartbeat that
+  got an answer, writes `cgroup.kill` for each persistent VM's
   cgroup, waits until `cgroup.procs` is empty, and marks the sandbox
   `cold` locally (`sandbox.fenced`, `self_fenced`). A copy whose cgroup is
   not empty stays as it is. The primary trusts time only for a node
   whose last report had `self_fence`, and only `fence_after_s` plus
-  `--fence-margin-s` after that report. It then records `node.fenced`.
+  `--fence-margin-s` after it received that report, which is after the
+  worker sent it. It then records `node.fenced`. A heartbeat waits at most
+  10 s, and less than half of `fence_after_s`; an answer to one sent
+  before the fence time does not lift the fence.
+- **Starts during a fence.** A fence sets its flag, then lists the
+  sandboxes. A cold start or resume checks the flag again once its VM
+  runs and its record is in that list, so either the fence kills it or
+  the start stops it. If a worker started a sandbox but the primary's
+  claim was lost meanwhile, the primary does not start it again until
+  that copy is dropped as stale.
 - **Other proofs.** The autoscaler marks a node fenced after its hook
   removed the machine. `POST /v1/nodes/{id}:fenced` (admin) does the same
   for a `down` or removed node. Removing a node does not; a heartbeat
@@ -922,8 +932,8 @@ flowchart TB
   ready, the cold start fails with `503 volume_unavailable`.
 - **Edges** resend a call to the primary only if the worker could not be
   connected to, so a call is never sent twice.
-- **Leader failover.** A leader that loses its lease kills its persistent
-  VMs before it exits. The new leader waits `fence_after_s` plus the
+- **Leader failover.** A leader that loses its lease stops taking calls
+  and kills its VMs before it exits. The new leader waits `fence_after_s` plus the
   margin, then makes the old leader's persistent rows `cold`
   (`sandbox.cold`, `failover`).
 
@@ -968,9 +978,13 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
   are marked deleted with a `sandbox.lost` event, because their memory is
   gone. Persistent sandboxes that were running or starting become `cold`
   with a `sandbox.cold` event instead. The next call starts them again.
-- **Lost lease.** A leader that loses its database lease kills the
-  cgroups of its persistent VMs and marks them `cold`, then shuts down
-  as on SIGTERM. It exits within 5 seconds even if that is not done.
+- **Lost lease.** A leader renews its lease (15 s) every second. If it
+  cannot for 6 s, it stops taking calls. Its lease thread writes
+  `cgroup.kill` for every VM, without the database or the server's
+  runtime, waits up to 1 s for them to end, and exits 2 s later; the
+  server marks the persistent ones `cold` meanwhile if it can. So it is
+  gone at most 14 s after its last renewal. If another primary took the
+  lease, it kills its VMs and exits at once.
 
 ## Security boundaries
 
