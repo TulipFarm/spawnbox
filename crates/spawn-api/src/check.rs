@@ -391,9 +391,39 @@ mod tests {
         assert_eq!(crate::secrets::egress_ca_pem(&data, &sbox).unwrap(), ca);
         drop(db);
 
-        // --force replaces what is there and keeps the old files.
+        // --force replaces what is there and keeps the old files. With
+        // Postgres, it refuses while a primary holds the lease, and drops
+        // tables that the backup does not have.
         std::fs::write(data.join("egress-ca.crt"), "changed").unwrap();
-        ok(run(&["--restore", "latest", "--force"], &passphrase));
+        let in_db = |sql: &str| {
+            let out = Command::new("psql")
+                .args(["-v", "ON_ERROR_STOP=1", "-tAc", sql, url.unwrap()])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{sql}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        if url.is_some() {
+            in_db(
+                "INSERT INTO leader (id, holder, term, expires_at)
+                 VALUES (1, 'host_other', 1, now() + interval '1 hour')
+                 ON CONFLICT (id) DO UPDATE SET holder = excluded.holder,
+                     expires_at = excluded.expires_at",
+            );
+            in_db("CREATE TABLE added_later (id INTEGER)");
+            let out = run(&["--restore", "latest", "--force"], &passphrase);
+            assert!(!out.status.success());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("held by host_other"), "{stderr}");
+            ok(run(
+                &["--restore", "latest", "--ignore-lease", "--force"],
+                &passphrase,
+            ));
+            assert_eq!(in_db("SELECT to_regclass('added_later') IS NULL"), "t");
+            assert_eq!(in_db("SELECT count(*) FROM leader"), "0");
+        } else {
+            ok(run(&["--restore", "latest", "--force"], &passphrase));
+        }
         assert_eq!(
             std::fs::read_to_string(data.join("egress-ca.crt.pre-restore")).unwrap(),
             "changed"

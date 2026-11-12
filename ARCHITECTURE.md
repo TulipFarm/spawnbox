@@ -1085,8 +1085,15 @@ persistent sandboxes of the old one.
 A restore decrypts the archive into a private work directory, checks the
 mode (SQLite or Postgres) and that nothing would be overwritten (or
 `--force`), then moves the files in, keeping replaced ones as
-`*.pre-restore`, and runs `pg_restore --single-transaction`. Last,
-`spawn-api check-data` opens the restored database with the restored key
+`*.pre-restore`. For Postgres it first refuses while the leader lease is
+held (`expires_at > now()`), as a running standby would take the lease
+and write during the restore; `--ignore-lease` skips that. It turns the
+dump into SQL with `pg_restore -f -` and runs it with `psql
+--single-transaction -v ON_ERROR_STOP=1`. With `--force` the same
+transaction first drops and makes again the current schema, so tables
+that a newer version added cannot outlive a restored, older
+`schema_version`. Last, `spawn-api check-data` opens the restored
+database, read-only and without migrations, with the restored key
 and decrypts every secret, sandbox env and start record, every CA key
 and every shared file. It reports counts, and fails when a value does not
 decrypt. It never creates a key or a database. The `check` module test

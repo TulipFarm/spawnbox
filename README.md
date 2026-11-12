@@ -1730,11 +1730,18 @@ systemctl list-timers spawnbox-backup.timer  # see when the next one runs
 2. Put the passphrase in `/etc/spawnbox/backup.passphrase` (mode `0600`).
    If the backups are in S3, set `SPAWNBOX_BACKUP_TARGET` in
    `/etc/spawnbox/backup.env`.
-3. Stop the server:
+3. Stop the server. With Postgres, stop every primary that shares the
+   database, standbys too, on every host. A standby that still runs takes
+   the lease and writes to the database while it is restored.
 
    ```sh
    sudo systemctl stop spawnbox
    ```
+
+   With Postgres, the script refuses to restore while a primary holds the
+   leader lease. The lease ends 15 seconds after its primary stops.
+   `--ignore-lease` skips this check; use it only when you know that no
+   primary runs, for example when the lease is left by a host that is gone.
 
 4. Restore the newest backup, or a file or URL:
 
@@ -1746,9 +1753,11 @@ systemctl list-timers spawnbox-backup.timer  # see when the next one runs
    The script decrypts and checks the whole backup before it changes
    anything. Without `--force`, it does not replace a SQLite database,
    a Postgres database that has tables, or files that are different. With
-   `--force`, it keeps the old files as `<file>.pre-restore` and replaces
-   the Postgres tables in one transaction. The Postgres database must
-   exist.
+   `--force`, it keeps the old files as `<file>.pre-restore`. In Postgres,
+   it drops the database user's current schema (usually `public`), with
+   every table in it, makes it again and restores into it, all in one
+   transaction: if a step fails, the database is as it was. The database
+   user must own the schema. The Postgres database must exist.
 
 5. The script then runs `spawn-api check-data`. It counts the tenants,
    keys, templates, secrets and sandboxes, and decrypts each secret, each

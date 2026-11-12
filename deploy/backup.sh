@@ -13,10 +13,15 @@
 # the backups cannot be read.
 #
 #   backup.sh                         make a backup and drop old ones
-#   backup.sh --restore FILE|URL|latest [--force]
-#                                     restore one; the server must be
-#                                     stopped. --force replaces existing
+#   backup.sh --restore FILE|URL|latest [--force] [--ignore-lease]
+#                                     restore one. Every server that uses the
+#                                     data must be stopped: with Postgres,
+#                                     every primary sharing the database,
+#                                     standbys too. --force replaces existing
 #                                     data, keeping old files as *.pre-restore
+#                                     and dropping the Postgres schema first.
+#                                     --ignore-lease restores even while the
+#                                     Postgres leader lease is held
 #   backup.sh --list                  list backups at the target
 #
 # Settings, read from /etc/spawnbox/backup.env (SPAWNBOX_BACKUP_CONFIG)
@@ -200,8 +205,27 @@ postgres_has_tables() {
   [[ "$n" != 0 ]]
 }
 
+# Fails while a primary holds the Postgres leader lease, unless told to
+# ignore it. A standby that is still running takes the lease within a
+# second of it expiring, so a lease that stays expired means none run.
+check_lease() {
+  local ignore="$1" has lease
+  has="$(psql --dbname="$database_url" -tAc "SELECT to_regclass('leader') IS NOT NULL")" ||
+    die "cannot connect to the database"
+  [[ "$has" == t ]] || return 0
+  lease="$(psql --dbname="$database_url" -tAc \
+    "SELECT holder || ' until ' || expires_at FROM leader WHERE id = 1 AND expires_at > now()")" ||
+    die "cannot read the leader lease"
+  [[ -n "$lease" ]] || return 0
+  if [[ "$ignore" == yes ]]; then
+    say "warning: the leader lease is held by $lease; restoring anyway (--ignore-lease)"
+    return 0
+  fi
+  die "the leader lease is held by $lease, so a primary still uses this database. Stop spawnbox on every primary that shares it, standbys too, wait for the lease to expire (15 seconds) and run this again. --ignore-lease skips this check."
+}
+
 restore() {
-  local source="$1" force="$2" archive file have_mode out
+  local source="$1" force="$2" ignore_lease="$3" archive file have_mode out
   if command -v systemctl >/dev/null && systemctl is-active --quiet spawnbox 2>/dev/null; then
     die "spawnbox is running; stop it first: systemctl stop spawnbox"
   fi
@@ -234,6 +258,7 @@ restore() {
   local replace=()
   if [[ "$mode" == postgres ]]; then
     need pg_restore psql
+    check_lease "$ignore_lease"
     if postgres_has_tables; then
       [[ "$force" == yes ]] || die "the database already has tables; restore into an empty database, or pass --force to replace them"
     fi
@@ -261,10 +286,25 @@ restore() {
     fi
   done
   if [[ "$mode" == postgres ]]; then
-    local clean=()
-    [[ "$force" == yes ]] && clean=(--clean --if-exists)
-    pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
-      "${clean[@]}" --dbname="$database_url" "$r/database.dump" || die "pg_restore failed"
+    # The SQL is written out in full first, so a failed pg_restore cannot
+    # leave psql to commit half of it. With --force, the schema is dropped
+    # and made again in the same transaction, so tables that a later
+    # version added do not survive next to an older schema_version.
+    local schema sql="$work/restore.sql"
+    : >"$sql"
+    if [[ "$force" == yes ]]; then
+      schema="$(psql --dbname="$database_url" -tAc "SELECT quote_ident(current_schema())")" ||
+        die "cannot connect to the database"
+      [[ -n "$schema" ]] || die "the database has no current schema"
+      printf 'DROP SCHEMA %s CASCADE;\nCREATE SCHEMA %s;\n' "$schema" "$schema" >"$sql"
+    fi
+    # The schema itself is made above, or already exists.
+    pg_restore -l "$r/database.dump" >"$work/restore.list" || die "cannot read the database dump"
+    sed -i '/ SCHEMA - /d' "$work/restore.list"
+    pg_restore --no-owner --no-privileges --exit-on-error -L "$work/restore.list" \
+      -f - "$r/database.dump" >>"$sql" || die "pg_restore failed"
+    psql --dbname="$database_url" --single-transaction -v ON_ERROR_STOP=1 -q -f "$sql" >/dev/null ||
+      die "the restore failed and was rolled back; the database is as it was"
   else
     install -m 600 "$r/spawnbox.db" "$data/spawnbox.db"
   fi
@@ -294,14 +334,17 @@ case "${1:-}" in
   --list) list ;;
   --restore)
     [[ -n "${2:-}" ]] || die "--restore needs a backup file, s3:// URL or latest"
-    force=no
-    case "${3:-}" in
-      "") ;;
-      --force) force=yes ;;
-      *) die "unknown option $3" ;;
-    esac
-    restore "$2" "$force"
+    from="$2" force=no ignore_lease=no
+    shift 2
+    for arg in "$@"; do
+      case "$arg" in
+        --force) force=yes ;;
+        --ignore-lease) ignore_lease=yes ;;
+        *) die "unknown option $arg" ;;
+      esac
+    done
+    restore "$from" "$force" "$ignore_lease"
     ;;
-  -h | --help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h | --help) sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown option $1 (see --help)" ;;
 esac
