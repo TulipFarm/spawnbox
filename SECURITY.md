@@ -40,6 +40,11 @@ go to those projects. Tell us too if Spawnbox makes the problem worse.
 
 ## Deploy safely
 
+- Serve previews on a registrable domain that you use only for previews.
+  An app in a sandbox can set cookies for its parent domains, so under
+  your own domain it could set cookies for your site. Previews of
+  different sandboxes can set cookies for each other unless the preview
+  domain is on the [Public Suffix List](https://publicsuffix.org/).
 - Protect a worker as you protect the primary. A worker holds every API
   key hash and the key that signs browser session tokens, so root on a
   worker can make session tokens for any sandbox of the fleet.

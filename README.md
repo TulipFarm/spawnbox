@@ -2261,6 +2261,13 @@ To show previews on the internet:
    `--preview-listen 0.0.0.0:8081 --preview-url https://{label}.preview.example.com`.
 3. Keep `--listen` on `127.0.0.1`, or use `--tls-cert` and `--tls-key`.
 
+Use a registrable domain only for previews, such as
+`*.example-preview.com`, not a name under the domain of your own site.
+An app in a sandbox can set cookies for its parent domains. Under your
+own domain, it could set cookies that your site reads. Previews of
+different sandboxes can also set cookies for each other. To stop that,
+add the preview domain to the [Public Suffix List](https://publicsuffix.org/).
+
 ## Troubleshooting
 
 Type these commands on the host.
