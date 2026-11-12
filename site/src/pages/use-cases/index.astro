@@ -1,0 +1,78 @@
+---
+import { Code } from "astro:components";
+import Logo from "../../components/Logo.astro";
+import Page from "../../layouts/Page.astro";
+import { useCases } from "../../data/use-cases";
+import "../../styles/use-cases.css";
+
+const pad = (x: number) => String(x).padStart(2, "0");
+const today = useCases.filter((u) => u.status === "today").length;
+const list = {
+  "@type": "ItemList",
+  name: "Spawnbox use cases",
+  numberOfItems: useCases.length,
+  itemListElement: useCases.map((u, i) => ({
+    "@type": "ListItem",
+    position: i + 1,
+    name: u.name,
+    url: new URL(`/use-cases/${u.slug}/`, Astro.site).href,
+  })),
+};
+---
+
+<Page
+  title="Use cases — Spawnbox"
+  description="What you can run in Spawnbox sandboxes: code from AI tool calls and workflow steps, MCP servers, coding agents, web apps, browser use and computer use."
+  current="use-cases"
+  og="use-cases"
+  ogAlt="Spawnbox use cases: code execution, MCP servers, coding agents, web apps, browser use and computer use."
+  crumbs={[["Use cases", "/use-cases/"]]}
+  schema={[list]}
+  pageType="CollectionPage"
+>
+  <section class="hero idx-hero">
+    <h1>
+      What you can run.
+      <span class="hl">Each one, step by step.</span>
+    </h1>
+    <p class="lede">
+      Each page follows one real request from your app, through Spawnbox, into a sandbox and back. {today} work today. The
+      other {useCases.length - today} run today on a plain sandbox, and their ready-made templates are coming.
+    </p>
+  </section>
+
+  <section class="idx" aria-labelledby="idx-h">
+    <h2 id="idx-h" class="visually-hidden">All use cases</h2>
+    <div class="idx-head" aria-hidden="true">
+      <span>SHEET</span><span>USE CASE</span><span>FIRST CALL</span><span>STATUS</span>
+    </div>
+    <ol class="idx-list">
+      {
+        useCases.map((u, n) => (
+          <li class={`idx-row ${u.status}`}>
+            <span class="idx-no">UC-{pad(n + 1)}</span>
+            <div class="idx-main">
+              <h3>
+                <a href={`/use-cases/${u.slug}/`}>{u.name}</a>
+              </h3>
+              <p>{u.summary}</p>
+              <ul class="idx-runs" aria-label={`Runs: ${u.runs.items.map(([, n]) => n).join(", ")}`}>
+                {u.runs.items
+                  .filter(([l]) => l)
+                  .map(([l, n]) => (
+                    <li title={n}>
+                      <Logo name={l!} size={16} decorative />
+                    </li>
+                  ))}
+              </ul>
+            </div>
+            <span class="idx-call">
+              <Code code={u.first} lang="http" theme="github-light" inline />
+            </span>
+            <span class={`status ${u.status}`}>{u.status === "today" ? "● Works today" : "◐ Template coming"}</span>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+</Page>

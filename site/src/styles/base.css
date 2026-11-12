@@ -135,7 +135,7 @@ a:focus-visible {
   font-weight: 600;
   letter-spacing: 0.2em;
 }
-nav {
+.topbar nav {
   display: flex;
   gap: 22px;
   align-items: center;
@@ -144,12 +144,12 @@ nav {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
-nav a:not(.btn-line) {
+.topbar nav a:not(.btn-line) {
   text-decoration: none;
   color: var(--muted);
   position: relative;
 }
-nav a:not(.btn-line)::after {
+.topbar nav a:not(.btn-line)::after {
   content: "";
   position: absolute;
   left: 0;
@@ -158,10 +158,10 @@ nav a:not(.btn-line)::after {
   border-bottom: 1.5px solid var(--blue);
   transition: right 0.25s;
 }
-nav a:not(.btn-line):hover {
+.topbar nav a:not(.btn-line):hover {
   color: var(--ink);
 }
-nav a:not(.btn-line):hover::after {
+.topbar nav a:not(.btn-line):hover::after {
   right: 0;
 }
 
@@ -325,6 +325,177 @@ tbody tr:hover td:not(.us) {
   font-weight: 600;
   letter-spacing: 0.2em;
   color: var(--blue);
+}
+
+h1 {
+  font-size: clamp(42px, 5.6vw, 70px);
+  line-height: 1.02;
+  margin: 0 0 22px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+.hl {
+  display: block;
+  color: var(--blue);
+}
+.lede {
+  color: var(--muted);
+  font-size: 19px;
+  max-width: 52ch;
+  margin: 0 0 28px;
+  text-wrap: pretty;
+}
+.cta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+section:not(.hero):not(.metrics) {
+  padding: 88px 0 16px;
+}
+.sec-head {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 18px;
+  align-items: baseline;
+  margin-bottom: 36px;
+}
+.sec-no {
+  font-family: var(--mono);
+  width: 46px;
+  height: 46px;
+  border: 1.5px solid var(--ink);
+  border-radius: 50%;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  place-items: center;
+  background: linear-gradient(transparent calc(50% - 0.75px), var(--ink) 0 calc(50% + 0.75px), transparent 0);
+  align-self: center;
+}
+.sec-no b {
+  font-size: 13px;
+  color: var(--blue);
+  align-self: end;
+  padding-bottom: 1px;
+}
+.sec-no small {
+  font-size: 9px;
+  color: var(--muted);
+  align-self: start;
+  padding-top: 2px;
+}
+h2 {
+  margin: 0;
+  font-size: clamp(28px, 3.4vw, 38px);
+  font-weight: 700;
+  line-height: 1.1;
+  text-wrap: balance;
+}
+.sec-sub {
+  grid-column: 2;
+  margin: 8px 0 0;
+  color: var(--muted);
+  max-width: 70ch;
+}
+
+/* Isometric drawings */
+.scene {
+  margin: 0;
+  border: 1px solid var(--line);
+  background: #fff;
+  padding: 14px;
+  min-width: 0;
+}
+.scene svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  overflow: visible;
+}
+.lbl {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  fill: var(--ink);
+  font-weight: 500;
+}
+.end {
+  text-anchor: end;
+}
+.mid {
+  text-anchor: middle;
+}
+.lbl.mut {
+  fill: var(--muted);
+}
+.leader {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 0.8;
+}
+.wire-path {
+  fill: none;
+  stroke: var(--blue-2);
+  stroke-width: 1.2;
+  stroke-dasharray: 3 4;
+  animation: march 1s linear infinite;
+}
+@keyframes march {
+  to {
+    stroke-dashoffset: -14;
+  }
+}
+.packet {
+  fill: var(--blue);
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+
+.topbar nav a[aria-current="page"] {
+  color: var(--ink);
+}
+.topbar nav a[aria-current="page"]::after {
+  right: 0;
+}
+
+@media (max-width: 1000px) {
+  .title-block {
+    grid-template-columns: 1fr 1fr;
+  }
+  .tb-name {
+    grid-column: 1 / -1;
+  }
+  .tb-cell {
+    border-top: 1px solid var(--line);
+  }
+  .tb-cell:nth-child(2n) {
+    border-left: 0;
+  }
+}
+@media (max-width: 640px) {
+  .sheet {
+    margin: 12px;
+    padding: 0 16px;
+    outline: 0;
+  }
+  .topbar nav a:not(.btn-line):not(.keep) {
+    display: none;
+  }
+  .sec-head {
+    grid-template-columns: 1fr;
+    row-gap: 8px;
+  }
+  .sec-no {
+    justify-self: start;
+  }
+  .sec-sub {
+    grid-column: 1;
+  }
+  .title-block {
+    margin: 64px -16px 0;
+  }
 }
 
 /* Shiki output: keep each box's own background and the brand mono font */
