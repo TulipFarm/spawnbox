@@ -749,6 +749,15 @@ flowchart LR
   Disk is charged by bytes actually stored: the upper disk while running,
   the snapshot while paused. Charges are split at UTC hour boundaries,
   kept in memory, and added to SQLite every 10 seconds and at shutdown.
+- **Metrics.** With `--metrics-listen`, each host serves Prometheus
+  metrics. Counters and histograms live in one registry in memory
+  (`metrics.rs`), so they start again from zero at each start; gauges
+  such as sandbox counts, load, leader term and data directory free space
+  are read at each scrape. Error responses count by code, and creates and
+  cold starts count by result (`ok` or the error code).
+  `deploy/prometheus/spawnbox-alerts.yml` has alert rules for them; a
+  test checks that each metric it uses exists and that each alert is
+  described in `deploy/prometheus/README.md`.
 
 ## More than one host
 
@@ -1023,10 +1032,17 @@ flowchart TB
 
 ```text
 /var/lib/spawnbox/              (--data-dir)
-  spawnbox.db                   SQLite: tenants, keys, sandboxes, templates,
-                                builds, secrets, events, usage
-  secrets.key                   encrypts secrets and the CA key. Back it up.
-  egress-ca.crt                 CA that sandboxes trust for secret injection
+  spawnbox.db                   SQLite: tenants, keys, sandboxes, start
+                                records, templates, builds, secrets,
+                                events, usage. With --database-url, all of
+                                this is in Postgres instead, plus the
+                                shared files below, encrypted.
+  secrets.key                   encrypts secrets, sandbox env, the CA keys
+                                and the shared files. Back it up.
+  session.key                   signs browser session tokens (shared)
+  egress-ca.crt, egress-ca.key  CA that sandboxes trust for secret
+                                injection (shared; the key is encrypted)
+  host-id                       this host's name in the leader lease
   builds/<build_id>/            rootfs.ext4, layer.ext4, upper.ext4,
                                 vm.mem, vm.state, vmlinux, build log.
                                 With --build-store, a copy of each build
@@ -1038,10 +1054,43 @@ flowchart TB
                                 checkpoint.img, pages.img, pages_meta.img)
   volumes/<volume_id>.ext4      one sparse disk per volume (mode 0700 dir)
   logs/                         Firecracker and runsc logs
-  fleet/                        primary: ca.crt, ca.key (encrypted) and
-                                its own certificate. Worker: fleet/worker/
-                                with its certificate, key and node ID.
+  fleet/                        primary: ca.crt, ca.key (encrypted,
+                                shared) and its own certificate in
+                                fleet/primary/. Worker: fleet/worker/ with
+                                its certificate, key and node ID.
+  .backup/, .backup.lock        work directory and lock of backup.sh
 ```
+
+The files marked shared must be the same on every primary. With
+Postgres, the leader stores them in the `shared_files` table, encrypted
+with `secrets.key`, and a primary writes them over its own when it takes
+the lease. `host-id` is not shared: a host with another `host-id` is
+another primary, and taking the lease from it is a failover.
+
+### Backups
+
+`deploy/backup.sh`, run daily by `spawnbox-backup.timer` on the primary,
+writes one gpg-encrypted (AES-256, passphrase) tar archive with the
+database (`sqlite3 .backup` or `pg_dump --format=custom`), `secrets.key`,
+`session.key`, the egress CA and the fleet CA, and a manifest. It keeps
+the newest `SPAWNBOX_BACKUP_KEEP` archives in a directory or an S3
+prefix. Builds, paused sandbox files, volumes and `host-id` are left out:
+templates are built again when their builds are missing (a build whose
+files cannot be opened at start becomes `outdated`), paused sandboxes
+whose files are missing become `cold` (persistent) or `failed`, and a
+restored primary takes the lease as a new host, so it fences the
+persistent sandboxes of the old one.
+
+A restore decrypts the archive into a private work directory, checks the
+mode (SQLite or Postgres) and that nothing would be overwritten (or
+`--force`), then moves the files in, keeping replaced ones as
+`*.pre-restore`, and runs `pg_restore --single-transaction`. Last,
+`spawn-api check-data` opens the restored database with the restored key
+and decrypts every secret, sandbox env and start record, every CA key
+and every shared file. It reports counts, and fails when a value does not
+decrypt. It never creates a key or a database. The `check` module test
+`backup_and_restore_round_trip` runs this whole path on SQLite and
+Postgres in CI.
 
 The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 `/etc/spawnbox/spawnbox.env` (server flags).
@@ -1054,7 +1103,11 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
   its firewall rules. Paused sandboxes stay on disk. Persistent sandboxes
   that did not pause become `cold`.
 - **Restart.** Ready builds and paused sandboxes are loaded again; nothing
-  is rebuilt.
+  is rebuilt. A ready build whose files cannot be opened, or that was made
+  with another kernel, base disk or runtime, becomes `outdated`, and its
+  template is built again (not a snapshot template). A paused sandbox
+  whose files are missing becomes `cold` with the reason
+  `paused_files_missing` if it is persistent, and `failed` if not.
 - **VM guard.** VM cgroups are under `/sys/fs/cgroup/spawnbox`, outside
   the server process and its service cgroup, so VMs outlive a server that
   is killed. Fencing relies on them dying with it. Before it starts any
@@ -1077,7 +1130,9 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
   rules, Firecracker processes and runsc containers are removed. Sandboxes that were running
   are marked deleted with a `sandbox.lost` event, because their memory is
   gone. Persistent sandboxes that were running or starting become `cold`
-  with a `sandbox.cold` event instead. The next call starts them again.
+  with a `sandbox.cold` event (reason `server_restarted`) instead. The
+  next call starts them again. `spawnbox_start_time_seconds` changes at
+  each start, so restarts and crash loops show in metrics.
 - **Lost lease.** A leader renews its lease (15 s) every second. If it
   cannot for 6 s, it stops taking calls. Its lease thread writes
   `cgroup.kill` for every VM, without the database or the server's
