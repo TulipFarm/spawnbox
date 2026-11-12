@@ -49,7 +49,8 @@ pub struct Host {
     pub pins: Option<Arc<CpuPins>>,
 }
 
-/// Gives each VM its own host CPUs, least used first. Under nested
+/// Gives each VM its own host CPUs, least used first. A vCPU that moves
+/// between host CPUs loses its caches and runs slower. Under nested
 /// virtualization (a cloud VM running Firecracker) a vCPU that moves
 /// between host CPUs can fail to enter the guest (`KVM_EXIT_FAIL_ENTRY`)
 /// once many VMs share each CPU, and Firecracker exits. A vCPU that stays
