@@ -155,6 +155,10 @@ pub struct Heartbeat {
     pub self_fence: bool,
     #[serde(default)]
     pub fence_after_s: u64,
+    /// The worker's software version. Empty from versions that did not
+    /// send it.
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -474,6 +478,20 @@ impl std::fmt::Display for Primaries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_heartbeat_from_an_older_worker_has_no_version() {
+        let hb: Heartbeat = serde_json::from_value(serde_json::json!({
+            "url": "https://10.0.0.2:7443",
+            "boot": "b",
+            "seq": 1,
+            "config_version": 1,
+            "capacity": serde_json::to_value(Capacity::default()).unwrap(),
+            "sandboxes": [],
+        }))
+        .unwrap();
+        assert_eq!(hb.version, "");
+    }
 
     #[test]
     fn primaries_move_on_when_unreachable() {

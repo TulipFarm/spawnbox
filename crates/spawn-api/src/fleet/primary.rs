@@ -89,6 +89,7 @@ pub struct Primary {
     /// Calls that may still put a sandbox on each node.
     pub busy: Busy,
     pub retirer: Retirer,
+    pub drain_passes: migrate::DrainPasses,
     failed_builds: FailedBuilds,
     /// Storage keys of the secrets pushed to each node since this primary
     /// started. A node's config sync gets values only for these and the
@@ -140,6 +141,7 @@ impl Primary {
             autoscaler: OnceLock::new(),
             busy: Busy::default(),
             retirer: Retirer::default(),
+            drain_passes: migrate::DrainPasses::default(),
             failed_builds: FailedBuilds::default(),
             pushed: Mutex::default(),
         })
@@ -498,6 +500,7 @@ async fn heartbeat(
         "config_version": hb.config_version,
         "self_fence": hb.self_fence,
         "fence_after_s": hb.fence_after_s,
+        "version": hb.version,
     });
     let seen = NodeRow {
         url: hb.url.clone(),
@@ -1719,7 +1722,26 @@ pub async fn new_token(
     ))
 }
 
-fn node_view(p: &Primary, node: &NodeRow, sandboxes: usize, retired: Option<&Retirement>) -> Value {
+/// What a node holds: sandboxes that are not cold, and volumes it is the
+/// home of.
+#[derive(Clone, Copy, Default)]
+struct Held {
+    sandboxes: usize,
+    volumes: usize,
+}
+
+fn held(app: &App) -> Result<HashMap<String, Held>, ApiError> {
+    let mut out: HashMap<String, Held> = HashMap::new();
+    for (node, n) in app.db.node_sandbox_counts()? {
+        out.entry(node).or_default().sandboxes = n;
+    }
+    for (node, n) in app.db.node_volume_counts()? {
+        out.entry(node).or_default().volumes = n;
+    }
+    Ok(out)
+}
+
+fn node_view(p: &Primary, node: &NodeRow, held: Held, retired: Option<&Retirement>) -> Value {
     let report: Value = node
         .report
         .as_deref()
@@ -1731,11 +1753,14 @@ fn node_view(p: &Primary, node: &NodeRow, sandboxes: usize, retired: Option<&Ret
         "url": node.url,
         "state": node.state,
         "draining": node.draining,
+        "drain_running": p.drain_passes.running(&node.id),
         "created_at": rfc3339_ms(node.created_at),
         "last_seen": node.last_seen.map(rfc3339_ms),
         "capacity": report.get("capacity"),
         "config_current": report.get("config_version").and_then(Value::as_u64) == Some(p.version()),
-        "sandboxes": sandboxes,
+        "version": report.get("version").and_then(Value::as_str),
+        "sandboxes": held.sandboxes,
+        "volumes": held.volumes,
         "retirement": retired.map(|r| retire::view(r, &p.retirer.waiting_for(&r.node))),
     })
 }
@@ -1746,7 +1771,7 @@ fn node_not_found() -> ApiError {
 
 pub async fn list_nodes(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
     let p = primary(&app)?;
-    let counts = app.db.node_sandbox_counts()?;
+    let counts = held(&app)?;
     let retired: HashMap<String, Retirement> = app
         .db
         .retirements(false)?
@@ -1758,7 +1783,7 @@ pub async fn list_nodes(State(app): State<AppState>) -> Result<Json<Value>, ApiE
         .list_nodes()?
         .iter()
         .map(|n| {
-            let count = counts.get(&n.id).copied().unwrap_or(0);
+            let count = counts.get(&n.id).copied().unwrap_or_default();
             node_view(p, n, count, retired.get(&n.id))
         })
         .collect();
@@ -1825,12 +1850,12 @@ pub(super) fn remove(app: &App, id: &str, origin: &Origin) -> Result<bool, ApiEr
 }
 
 fn view_of(app: &App, p: &Primary, node: &NodeRow) -> Result<Value, ApiError> {
-    let counts = app.db.node_sandbox_counts()?;
+    let counts = held(app)?;
     let retired = app.db.retirement(&node.id)?;
     Ok(node_view(
         p,
         node,
-        counts.get(&node.id).copied().unwrap_or(0),
+        counts.get(&node.id).copied().unwrap_or_default(),
         retired.as_ref(),
     ))
 }
@@ -1916,11 +1941,21 @@ pub async fn node_action(
         json!({ "node": id, "migrate": input.migrate }),
     );
     eprintln!("node {id}: {kind}");
-    if input.migrate {
+    // A second `:drain` while a pass runs starts nothing; the running pass
+    // takes what is there.
+    let pass = if !input.migrate {
+        None
+    } else if p.drain_passes.running(id) {
+        Some("already_running")
+    } else {
         tokio::spawn(migrate::drain(Arc::clone(&app), id.to_owned(), origin));
-    }
+        Some("started")
+    };
     let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
-    let view = view_of(&app, p, &node)?;
+    let mut view = view_of(&app, p, &node)?;
+    if let Some(pass) = pass {
+        view["drain_pass"] = json!(pass);
+    }
     let status = if input.migrate {
         StatusCode::ACCEPTED
     } else {
@@ -2004,11 +2039,11 @@ fn retire_node(
     )?
     .ok_or_else(node_not_found)?;
     let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
-    let counts = app.db.node_sandbox_counts()?;
+    let counts = held(app)?;
     let view = node_view(
         p,
         &node,
-        counts.get(id).copied().unwrap_or(0),
+        counts.get(id).copied().unwrap_or_default(),
         Some(&retired),
     );
     Ok((StatusCode::ACCEPTED, Json(view)))

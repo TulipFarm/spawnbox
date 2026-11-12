@@ -787,11 +787,13 @@ are gone. Its ID, env, secrets, network rules, volumes and published
 ports are the same.
 
 A tenant needs the `persistent_sandboxes` quota. It is `0` by default.
-Persistent sandboxes are created on the primary, and you cannot move
-them. In a fleet, a cold sandbox can start again on any worker that has
-its template build. Refer to [Fence lost hosts](#fence-lost-hosts). To
-run one on another host, let it become cold: it then starts on the host
-that takes the next call, from a build of that host.
+Persistent sandboxes are created on the primary. `:migrate` cannot copy
+them to another host with their memory (`409`). In a fleet, a cold
+sandbox can start again on any worker that has its template build.
+Refer to [Fence lost hosts](#fence-lost-hosts). To run one on another
+host, let it become cold: it then starts on the host that takes the next
+call, from a build of that host. A
+[drain](#drain-a-worker-and-move-its-sandboxes) does this for you.
 
 #### Upgrades and old builds
 
@@ -1153,7 +1155,8 @@ certificate in `/var/lib/spawnbox/fleet/worker/`.
   Requests for its sandboxes give `503 node_unreachable`. Try again
   later. When the worker comes back, its sandboxes operate again.
 - **A worker restarts.** Its running sandboxes are deleted, as on one
-  host. Its paused sandboxes stay. To keep the running sandboxes,
+  host. Its paused sandboxes stay, and running persistent sandboxes
+  pause first (`--shutdown-pause-s`). To keep the running sandboxes,
   [drain the worker](#drain-a-worker-and-move-its-sandboxes) before you
   restart it.
 - **Persistent sandboxes on a `down` worker** stay on that worker until
@@ -1304,7 +1307,7 @@ commands on the primary.
    `{"migrate":false}`.
 
 2. Wait until the worker has no sandboxes. `sandboxes` in this response
-   must be `0`:
+   must be `0`. To remove the worker, also wait until `volumes` is `0`:
 
    ```sh
    curl -s -H "$A" http://127.0.0.1:8080/v1/nodes/NODE_ID
@@ -1312,7 +1315,14 @@ commands on the primary.
 
    When the moves are complete, the event `node.drained` shows the number
    of sandboxes that moved and that did not move. The primary also moves
-   the [volumes](#volumes-on-more-than-one-host) of the worker.
+   the [volumes](#volumes-on-more-than-one-host) of the worker. One drain
+   call moves what it can once. If something did not move, call `:drain`
+   again. Only one move pass runs on a worker at a time: while one runs,
+   `GET /v1/nodes/NODE_ID` shows `"drain_running": true`, and another
+   `:drain` call starts nothing and answers `"drain_pass":
+   "already_running"`. A pass ends if the primary stops. A standby that
+   takes over keeps the worker drained but does not start a new pass, so
+   call `:drain` again.
 
 3. Do your work on the worker.
 4. Let the worker take new sandboxes again:
@@ -1320,6 +1330,47 @@ commands on the primary.
    ```sh
    curl -s -H "$A" -d '{}' http://127.0.0.1:8080/v1/nodes/NODE_ID:undrain
    ```
+
+With the CLI, `spawnbox nodes drain NODE_ID --wait` does steps 1 and 2.
+Until the worker holds no sandboxes and no volumes, it calls `:drain`
+again when no pass runs and a minute has passed since its last call, so
+it also restarts the drain after a standby takes over. It waits out
+errors, such as the API being away during that takeover, and exits with
+`1` after `--timeout` seconds (default 1800), or at once if someone
+undrains the worker. `spawnbox nodes ls` shows `SANDBOXES`, `VOLUMES` and the
+`VERSION` of each worker, and `spawnbox nodes undrain NODE_ID` does
+step 4.
+
+**Persistent sandboxes in a drain.** A persistent sandbox cannot move
+with its memory: its snapshot works only on the host that made it. So
+the drain stops it on the worker and makes it `cold`, as a
+[cold start](#keep-a-sandbox-until-you-delete-it) needs:
+
+1. The worker writes the data of its volumes to disk, stops the VM and
+   records `sandbox.cold` with the reason `drained`. Requests for the
+   sandbox wait during this time; a request that was already in the
+   sandbox fails, so try it again.
+2. The primary copies its volumes to another host with the same
+   backend.
+3. A sandbox that was running starts again at once on another host, at
+   the next generation. A sandbox that was paused stays `cold` and starts
+   on its next request.
+
+`node.drained` shows `persistent_cold` (stopped this way), `restarted`
+and `restart_failed`. One that could not start again stays `cold` and
+starts on its next request.
+
+Its ID, env, secrets, network rules, volumes and published ports stay
+the same. Its processes and its files outside volumes are gone, as in
+any cold start. The old copy on the worker can never run again: a
+copy with an older generation is deleted.
+
+If no other ready host has the backend of one of its volumes, the drain
+does not stop the sandbox. It keeps running on the worker, `node.drained`
+counts it in `failed`, and the log of the primary says which volume
+cannot leave.
+Add a host with that backend and call `:drain` again, or restart the
+worker in place: its paused persistent sandboxes stay.
 
 You can also move one sandbox. The primary selects the host with the most
 free memory. To select a host, add `"node"` with a node ID or `"primary"`:
@@ -1356,7 +1407,8 @@ primary.
 - The primary puts a sandbox that mounts a volume on the home of the
   volume.
 - If the home is full or draining, the primary copies the volume to a
-  different host. It does this only if no sandbox uses the volume.
+  different host. It does this only if no sandbox uses the volume, or
+  only `cold` sandboxes use it.
 - If the volumes of a sandbox are on different hosts, the primary copies
   them to one host first.
 - When a sandbox moves, its volumes move with it. A sandbox can move only
@@ -1368,7 +1420,8 @@ primary.
   cold sandbox starts. Try again when the host comes back.
 
 - When you drain a worker with `{"migrate":true}`, the primary also
-  copies the volumes of the worker to other hosts. The event
+  copies the volumes of the worker to other hosts, also those of
+  persistent sandboxes that the drain made `cold`. The event
   `node.drained` shows `volumes_moved` and `volumes_failed`.
 
 > **CAUTION:** Before you remove a worker, drain it. Make sure that
@@ -1449,6 +1502,72 @@ To remove an edge, use `DELETE /v1/nodes/NODE_ID`. After approximately
 
 To add the same host again, remove `/var/lib/spawnbox/fleet/worker/` on
 the worker. Then do [step 3](#step-3-add-a-worker) with a new token.
+
+### Upgrade a fleet without loss
+
+Upgrade one host at a time, so that the fleet keeps serving. Upgrade the
+primaries first: a primary accepts workers of the release before it, and
+only a primary of this release or later can stop persistent sandboxes
+for a drain. Back up the database first; refer to
+[step 4](#step-4-install-spawnbox).
+
+1. **Standby primaries.** On each standby, type the
+   [install command](#step-4-install-spawnbox) again. A standby serves
+   nothing, so this loses nothing.
+2. **The leader.** Type the install command on the leader. It restarts
+   the service in place:
+   - On `SIGTERM`, running persistent sandboxes pause
+     (`--shutdown-pause-s`, default 30). Ones that do not pause in time
+     become `cold`. Plain sandboxes that run on the leader are deleted,
+     as on one host; paused ones stay.
+   - The leader keeps its lease while it stops. If it starts again
+     within about 15 seconds, it is the leader again and its paused
+     persistent sandboxes resume with their memory on their next
+     request.
+   - If a standby takes over instead, the API moves to it within about
+     15 seconds, and the persistent sandboxes of the old leader become
+     `cold` after `--fence-after-s` plus `--fence-margin-s`. Refer to
+     [Keep the API up](#keep-the-api-up-when-the-primary-stops). Nothing
+     is lost, but their memory is.
+   - Sandboxes on workers continue to run during the restart. Calls to
+     them through the API wait for the new leader.
+3. **Each worker.** On the primary:
+
+   ```sh
+   spawnbox nodes drain NODE_ID --wait
+   ```
+
+   This moves its plain sandboxes with their memory, stops its persistent
+   sandboxes and starts them on other hosts, and copies its volumes. Read
+   [Drain a worker](#drain-a-worker-and-move-its-sandboxes) for what
+   occurs to each kind. Then, on the worker, type the install command
+   again, and wait until `spawnbox nodes ls` shows the worker `ready`
+   with the new `VERSION`. Then, on the primary:
+
+   ```sh
+   spawnbox nodes undrain NODE_ID
+   ```
+
+   Do the next worker when this one takes sandboxes again, so that the
+   fleet keeps the room.
+
+Instead of a drain, you can restart a worker in place, as for the leader:
+its persistent sandboxes pause and resume after the restart, but its
+running plain sandboxes are deleted. Use this when no other host has
+room, or for a worker of a release before the primary, which cannot stop
+persistent sandboxes for a drain (`node.drained` then counts them as
+`failed`, and the log of the primary says that the worker is too old).
+
+A sandbox started from a template build of an older release keeps that
+build. If its guest is too old for the new release, it starts again from
+a new build of its template; refer to
+[Upgrades and old builds](#upgrades-and-old-builds).
+
+With the [autoscaler](#add-and-remove-workers-automatically), new
+workers install the latest release when they start. Upgrade the
+primaries as above, then [retire](#retire-a-worker-safely) the old
+workers one at a time: the primary moves their sandboxes, and the hook
+starts new workers as the load needs.
 
 ### Retire a worker safely
 
@@ -2364,14 +2483,16 @@ These calls operate only on a primary. The key must have the scope
 | `GET /v1/nodes/autoscale` | Get the load, the workers in each state and the autoscaler requests. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `GET /v1/nodes/{id}` | Get one worker or edge |
 | `DELETE /v1/nodes/{id}` | Remove a worker or an edge. The sandboxes of a worker are marked deleted. |
-| `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes to other hosts. Gives `202` when it moves sandboxes. |
+| `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes and volumes to other hosts: persistent sandboxes become `cold` and start again on other hosts. Gives `202` when it moves sandboxes, with `drain_pass` set to `started`, or to `already_running` when a pass already runs, in which case it starts nothing. Call it again to retry what did not move. |
 | `POST /v1/nodes/{id}:undrain` | Put new sandboxes on the worker again. Gives `409` if the worker retires. |
 | `POST /v1/nodes/{id}:retire` | Retire the worker before you stop its machine. Optional body: `{"migrate":true,"reason":"..."}`. Gives `202`. Refer to [Retire a worker safely](#retire-a-worker-safely). |
 | `POST /v1/nodes/{id}:fenced` | Tell the primary that the host of a `down` or removed worker is off. Its persistent sandboxes become `cold`. Optional body: `{"reason":"..."}`. The response has `sandboxes_cold`. Gives `409` if the worker is not `down` or removed. Refer to [Fence lost hosts](#fence-lost-hosts). |
 | `POST /v1/sandboxes/{id}:migrate` | Move one sandbox to a different host. Optional body: `{"node":"nod_..."}` or `{"node":"primary"}`. |
 
 Each node has `id`, `kind` (`worker` or `edge`), `url`, `state` (`ready`, `suspect`, `down`),
-`draining`, `last_seen`, `sandboxes`, `config_current`, `retirement` and `capacity`
+`draining`, `last_seen`, `sandboxes` (sandboxes on it that are not `cold`), `volumes`
+(volumes whose home it is), `version` (its Spawnbox release, `null` before
+it reports one), `config_current`, `retirement` and `capacity`
 (free slots, free memory, reserved memory and its limit, whether memory is
 short, ready templates,
 warm VMs, CPU model and `fingerprint`). Sandboxes move only between hosts with the same
@@ -2604,6 +2725,82 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
   --firecracker $a/bin/firecracker --jailer $a/bin/jailer \
   --kernel $a/vmlinux --rootfs $a/rootfs.ext4
 ```
+
+### Soak and failover tests
+
+`scripts/soak.py` runs against an installed server or fleet for a long
+time and checks that nothing is lost, run twice or left behind. It uses
+only the Python standard library. It reaches the API with an org key, and
+each host with `ssh` as root, or as a user with `sudo` if you add
+`--sudo`. Name each host with `--host NAME=TARGET`. For `NAME`, use
+`primary`, `standby` or a worker's node ID from `spawnbox nodes ls`.
+
+```sh
+# 72 hours at about 30 live sandboxes, with a server killed every 6 hours.
+scripts/soak.py --api http://10.0.0.5:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5 --host nod_1=root@10.0.0.6 \
+  --ssh-opt=-i --ssh-opt="$HOME/.ssh/fleet" \
+  --density 30 --duration 72h --chaos-every 6h --summary soak.json
+
+# Kill a worker, cut a worker off from the primary, and kill the leader.
+scripts/soak.py --mode failover \
+  --api http://10.0.0.5:8080 --api http://10.0.0.7:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5 --host standby=root@10.0.0.7 \
+  --host nod_1=root@10.0.0.6 --primary-ip 10.0.0.5 \
+  --fence-after-s 60 --fence-margin-s 30 --summary failover.json
+
+# Show the plan and probe the API and hosts without changing anything.
+scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5
+```
+
+- The soak creates ephemeral and persistent sandboxes in the tenant
+  `soak` (`--tenant`). Each has a service and an env value, and each
+  persistent sandbox has a volume. It pauses, wakes, cold starts (it
+  kills the VM's `firecracker` process), kills services in the guest and
+  deletes sandboxes at random.
+- Every `--check-every` (default 5 minutes) it checks these points:
+  - Each persistent sandbox answers with its volume file, its env value
+    and, unless it was cold started, its disk file.
+  - No VM runs on two hosts, and each VM runs on the host that the API
+    names.
+  - No jail, network namespace or cgroup stays behind for a sandbox that
+    was deleted, is cold or moved.
+  - A killed service runs again.
+  - The memory and open files of `spawn-api` do not grow beyond
+    `--max-rss-growth-mib` and `--max-fd-growth`.
+- The failover mode puts persistent sandboxes on one host, then cuts the
+  host off. New persistent sandboxes start on the primary, so the script
+  moves each one to the worker by cold starts: it kills the VM and wakes
+  the sandbox until placement picks that worker, up to `--place-tries`
+  times (default 12). A cold start prefers the host that holds the
+  sandbox's volume, so a sandbox with a volume reaches a worker only when
+  the primary has no room. The worker scenarios use sandboxes without a
+  volume unless you set `--failover-volume-sandboxes`. The leader
+  scenario also uses sandboxes with a volume. It checks that no
+  sample of the host's processes taken after the API made a sandbox cold
+  still shows its VM. It wakes the sandboxes without a volume while the
+  host is still cut off, so a second copy starts elsewhere, and checks
+  that the two never run at once, also after the host returns. Then it
+  checks that each sandbox starts again with its data.
+- A sandbox whose host is restarting or cut off, or whose volume's host
+  is away, may answer 503 for a while. The script asks again for up to
+  `--verify-wait` (default 3 minutes) before it counts the sandbox as
+  lost. A wake or check that fails with another retryable error, such as
+  `503 no_capacity` on a full host, is asked again with backoff for up to
+  `--retry-wait` (default 90 seconds). The summary counts these retries
+  under `errors` as `retried_<code>`. An error that is not retryable
+  counts as lost at once.
+- The script writes the summary (`--summary`) and exits with 1 if a check
+  fails. It exits with 3 if it cannot set up what it tests, for example
+  if it cannot write its markers or cannot get a sandbox onto the host of
+  a scenario. These are not counted as lost sandboxes.
+- `python3 scripts/soak_test.py` tests the script's own logic against a
+  stubbed API, without a server. `scripts/soak.py --help` lists every option.
+
+> **CAUTION:** The failover mode kills servers and adds `iptables` rules
+> on the hosts. Use it only on a test fleet. Do not run the soak on a fleet
+> with real users.
 
 ### Repository layout
 

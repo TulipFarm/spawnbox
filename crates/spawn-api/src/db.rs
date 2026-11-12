@@ -1540,6 +1540,24 @@ impl Db {
         volume_users(&self.conn(), id, "")
     }
 
+    /// The sandboxes that may have volume `id` open now: its users that are
+    /// not cold. A cold sandbox mounts its volumes only when it starts, and
+    /// a start takes the fleet's volume lock, so its volumes can move.
+    pub fn volume_holders(&self, id: &str) -> Result<Vec<VolumeUser>> {
+        let conn = self.conn();
+        let cold: HashSet<String> = conn
+            .query_all(
+                "SELECT id FROM sandboxes WHERE volumes LIKE '%' || ?1 || '%' AND state = 'cold'",
+                [id],
+            )?
+            .iter()
+            .map(|row| row.get(0))
+            .collect::<Result<_>>()?;
+        let mut users = volume_users(&conn, id, "")?;
+        users.retain(|u| !cold.contains(&u.sandbox));
+        Ok(users)
+    }
+
     /// GiB of `tenant`'s volumes.
     pub fn volume_gib(&self, tenant: &str) -> Result<u64> {
         self.conn().query_row(
@@ -2795,6 +2813,34 @@ impl Db {
         )?;
         stmt.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect()
+    }
+
+    /// Makes cold persistent sandbox `id`, which `node` ran or had paused at
+    /// `generation` and has stopped for a drain. `false` if the row changed
+    /// since: then the node's reports decide.
+    pub fn cool_on_node(&self, id: &str, node: &str, generation: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes
+             SET state = 'cold', node = NULL, claim = NULL, claim_deadline = NULL,
+                 paused_at = NULL, saved_state = NULL
+             WHERE id = ?1 AND node = ?2 AND generation = ?3 AND persistent = 1
+               AND state IN ('running', 'paused')",
+            params![id, node, generation],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// How many live volumes each worker is the home of.
+    pub fn node_volume_counts(&self) -> Result<HashMap<String, usize>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT node, count(*) FROM volumes
+             WHERE node IS NOT NULL AND deleted_at IS NULL GROUP BY node",
+        )?;
+        stmt.query_map((), |r| {
+            Ok((r.get(0)?, usize::try_from(r.get::<_, i64>(1)?).unwrap_or(0)))
+        })?
+        .collect()
     }
 
     /// Makes cold the persistent sandboxes that `node`, which reports all
@@ -4875,6 +4921,62 @@ mod tests {
         let row = db.get_sandbox("sbx_q").unwrap().unwrap();
         assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
         assert!(db.unfenced_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_drain_makes_persistent_sandboxes_cold_and_frees_their_volumes() {
+        let db = Db::memory().unwrap();
+        db.insert_join_token(b"t", 0, 100).unwrap();
+        db.join_node(b"t", &node("nod_a", 1)).unwrap();
+        let mut home = volume("vol_1", "data");
+        home.node = Some("nod_a".into());
+        assert!(db.insert_volume(&home).unwrap());
+        for id in ["sbx_p", "sbx_q"] {
+            let mut row = persistent(id, state::COLD);
+            if id == "sbx_p" {
+                row.volumes = with_volume(id, false).volumes;
+            }
+            db.insert_persistent(&row, &start_record(id, "b1"), None)
+                .unwrap()
+                .unwrap();
+            db.claim_cold(id, Some("nod_a"), "c", 100).unwrap();
+            db.finish_cold_start(id, Some("nod_a"), 2, "c", 5).unwrap();
+        }
+        let mut paused = persistent("sbx_q", state::PAUSED);
+        paused.generation = 2;
+        assert!(db.put_mirror("nod_a", &paused, 6).unwrap());
+        assert_eq!(db.node_sandbox_counts().unwrap()["nod_a"], 2);
+        assert_eq!(db.node_volume_counts().unwrap()["nod_a"], 1);
+        assert_eq!(db.volume_holders("vol_1").unwrap().len(), 1);
+
+        // Only the copy the drain stopped: that node, that generation.
+        assert!(!db.cool_on_node("sbx_p", "nod_b", 2).unwrap());
+        assert!(!db.cool_on_node("sbx_p", "nod_a", 1).unwrap());
+        assert!(db.cool_on_node("sbx_p", "nod_a", 2).unwrap());
+        assert!(!db.cool_on_node("sbx_p", "nod_a", 2).unwrap());
+        assert!(db.cool_on_node("sbx_q", "nod_a", 2).unwrap());
+        for id in ["sbx_p", "sbx_q"] {
+            let row = db.get_sandbox(id).unwrap().unwrap();
+            assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+        }
+        assert!(!db.node_sandbox_counts().unwrap().contains_key("nod_a"));
+        // The volume can move while its sandbox is cold, but not be
+        // deleted or mounted by another.
+        assert!(db.volume_holders("vol_1").unwrap().is_empty());
+        assert_eq!(db.volume_users("vol_1").unwrap().len(), 1);
+        // The next start is a new generation on another host.
+        assert_eq!(
+            db.claim_cold("sbx_p", Some("nod_b"), "d", 100).unwrap(),
+            Some(3)
+        );
+        assert_eq!(db.volume_holders("vol_1").unwrap().len(), 1);
+        // A report from the drained node's old copy changes nothing.
+        let mut old = persistent("sbx_p", state::RUNNING);
+        old.generation = 2;
+        assert!(!db.put_mirror("nod_a", &old, 7).unwrap());
+        // Deleted sandboxes are never cooled.
+        db.set_state("sbx_q", 2, state::DELETED, 8).unwrap();
+        assert!(!db.cool_on_node("sbx_q", "nod_a", 2).unwrap());
     }
 
     #[test]

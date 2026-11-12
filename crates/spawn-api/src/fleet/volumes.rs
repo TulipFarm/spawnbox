@@ -79,9 +79,10 @@ async fn import(app: &App, body: Body) -> Result<db::Volume, ApiError> {
     read
 }
 
-/// Removes a volume's file from this host, unless a sandbox here uses it.
+/// Removes a volume's file from this host, unless a sandbox here that is
+/// not cold uses it.
 fn drop_here(app: &App, id: &str, deleted: bool) -> Result<(), ApiError> {
-    let users = app.db.volume_users(id)?;
+    let users = app.db.volume_holders(id)?;
     if !users.is_empty() {
         return Err(ApiError::new(
             Code::Conflict,
@@ -214,7 +215,7 @@ pub async fn copy(
     if from.as_ref().map(|n| &n.id) == to.map(|n| &n.id) {
         return Ok(());
     }
-    let users = app.db.volume_users(&volume.id)?;
+    let users = app.db.volume_holders(&volume.id)?;
     if !users.is_empty() {
         let ids: Vec<_> = users.iter().map(|u| u.sandbox.as_str()).collect();
         return Err(ApiError::new(
@@ -291,22 +292,9 @@ pub async fn copy(
     Ok(())
 }
 
-/// Copies the volumes no sandbox uses off a draining `node`, to the host
-/// with the same backend and the most free memory. Returns how many moved
-/// and how many did not.
-pub async fn evacuate(app: &App, p: &Primary, node: &str) -> (u32, u32) {
-    let _lock = p.volume_lock.write().await;
-    let volumes: Vec<db::Volume> = app
-        .db
-        .list_volumes(None)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| v.node.as_deref() == Some(node))
-        .collect();
-    let (mut moved, mut failed) = (0, 0);
-    if volumes.is_empty() {
-        return (moved, failed);
-    }
+/// Hosts that can take the volumes of a draining `node`: the primary and
+/// the ready workers that are not draining, most free memory first.
+fn targets(app: &App, p: &Primary, node: &str) -> Vec<(Option<NodeRow>, super::Capacity)> {
     let ready: std::collections::HashMap<String, NodeRow> = app
         .db
         .list_nodes()
@@ -323,10 +311,61 @@ pub async fn evacuate(app: &App, p: &Primary, node: &str) -> (u32, u32) {
         }
     }
     hosts.sort_by_key(|(_, c)| std::cmp::Reverse(c.memory_available_mib));
+    hosts
+}
+
+/// Why the volumes of `sandbox` cannot leave draining `node`, if they
+/// cannot: no other host has the backend of one that is there.
+pub fn stuck(app: &App, p: &Primary, node: &str, sandbox: &db::Sandbox) -> Option<String> {
+    let backends: Vec<String> = targets(app, p, node)
+        .into_iter()
+        .map(|(_, c)| c.backend)
+        .collect();
+    let volumes: Vec<db::Volume> = sandbox
+        .volumes
+        .iter()
+        .filter_map(|v| app.db.get_volume_by_id(&v.volume).ok().flatten())
+        .collect();
+    unmovable(&volumes, node, &backends)
+}
+
+/// The first of `volumes` homed on `node` that no host with one of
+/// `backends` can take.
+fn unmovable(volumes: &[db::Volume], node: &str, backends: &[String]) -> Option<String> {
+    let row = volumes.iter().find(|row| {
+        row.node.as_deref() == Some(node)
+            && !backends
+                .iter()
+                .any(|b| row.backend.as_deref() == Some(b.as_str()))
+    })?;
+    Some(format!(
+        "volume {:?} cannot leave: no other ready host has the {} backend",
+        row.name,
+        row.backend.as_deref().unwrap_or("same")
+    ))
+}
+
+/// Copies the volumes that no sandbox holds off a draining `node`, to the
+/// host with the same backend and the most free memory. Volumes of cold
+/// sandboxes move too. Returns how many moved and how many did not.
+pub async fn evacuate(app: &App, p: &Primary, node: &str) -> (u32, u32) {
+    let _lock = p.volume_lock.write().await;
+    let volumes: Vec<db::Volume> = app
+        .db
+        .list_volumes(None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.node.as_deref() == Some(node))
+        .collect();
+    let (mut moved, mut failed) = (0, 0);
+    if volumes.is_empty() {
+        return (moved, failed);
+    }
+    let hosts = targets(app, p, node);
     for volume in volumes {
         if !app
             .db
-            .volume_users(&volume.id)
+            .volume_holders(&volume.id)
             .unwrap_or_default()
             .is_empty()
         {
@@ -445,5 +484,39 @@ impl Need {
     /// side by side.
     pub fn is_simple(&self) -> bool {
         self.unplaced.is_empty() && self.homes.len() <= 1
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    fn volume(name: &str, node: Option<&str>, backend: &str) -> db::Volume {
+        db::Volume {
+            id: format!("vol_{name}"),
+            tenant: "t".into(),
+            name: name.into(),
+            size_gib: 1,
+            node: node.map(str::to_owned),
+            backend: Some(backend.into()),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_volume_stays_only_when_no_host_has_its_backend() {
+        let volumes = [
+            volume("elsewhere", Some("nod_b"), "gvisor"),
+            volume("here", Some("nod_a"), "firecracker"),
+        ];
+        let firecracker = ["firecracker".to_string()];
+        assert_eq!(unmovable(&volumes, "nod_a", &firecracker), None);
+        let gvisor = ["gvisor".to_string()];
+        let why = unmovable(&volumes, "nod_a", &gvisor).unwrap();
+        assert!(
+            why.contains("\"here\"") && why.contains("firecracker"),
+            "{why}"
+        );
+        assert_eq!(unmovable(&volumes, "nod_c", &[]), None);
     }
 }

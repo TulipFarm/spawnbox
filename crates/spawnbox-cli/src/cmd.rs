@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 
 use crate::api::{Api, ApiError, seg};
 use crate::{
-    Cli, Command, CreateArgs, EgressArgs, EventsArgs, ExecArgs, KeysCommand, PortsCommand,
-    SecretsCommand, ServicesArgs, ServicesCommand, TemplatesCommand, TenantsCommand,
+    Cli, Command, CreateArgs, EgressArgs, EventsArgs, ExecArgs, KeysCommand, NodesCommand,
+    PortsCommand, SecretsCommand, ServicesArgs, ServicesCommand, TemplatesCommand, TenantsCommand,
     VolumesCommand, config, files, pty,
 };
 
@@ -130,6 +130,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Secrets(command) => secrets(&api, &out, command).await,
         Command::Volumes(command) => volumes(&api, &out, command).await,
         Command::Tenants(command) => tenants(&api, &out, command).await,
+        Command::Nodes(command) => nodes(&api, &out, command).await,
         Command::Keys(command) => keys(&api, &out, command).await,
         Command::Events(args) => events(&api, &out, args).await,
         Command::Usage {
@@ -896,6 +897,116 @@ async fn volumes(api: &Api, out: &Out, command: VolumesCommand) -> Result<i32> {
     Ok(0)
 }
 
+/// How often `nodes drain --wait` looks at the node, and asks the primary
+/// for another pass over what is left.
+const DRAIN_POLL: Duration = Duration::from_secs(5);
+const DRAIN_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether `nodes drain --wait` should ask for another pass: things are
+/// left, no pass runs (it ended, or a new leader never started one), and
+/// the last ask was a while ago. A server too old to say whether a pass
+/// runs is asked every `DRAIN_RETRY`; it then runs passes side by side.
+fn ask_again(node: &Value, no_move: bool, since_asked: Duration) -> bool {
+    !no_move && !drained(node) && node["drain_running"] != json!(true) && since_asked >= DRAIN_RETRY
+}
+
+/// Whether a node view shows nothing left on the node.
+fn drained(node: &Value) -> bool {
+    node["sandboxes"].as_u64() == Some(0) && node["volumes"].as_u64().unwrap_or(0) == 0
+}
+
+async fn nodes(api: &Api, out: &Out, command: NodesCommand) -> Result<i32> {
+    match command {
+        NodesCommand::Ls => {
+            let list = api.get("/nodes").await?;
+            let items = list["nodes"].as_array().cloned().unwrap_or_default();
+            out.table(
+                &list,
+                &items,
+                &[
+                    ("ID", "id"),
+                    ("KIND", "kind"),
+                    ("STATE", "state"),
+                    ("DRAINING", "draining"),
+                    ("SANDBOXES", "sandboxes"),
+                    ("VOLUMES", "volumes"),
+                    ("VERSION", "version"),
+                    ("URL", "url"),
+                ],
+            );
+        }
+        NodesCommand::Get { id } => {
+            out.json(&api.get(&format!("/nodes/{}", seg(&id))).await?);
+        }
+        NodesCommand::Drain {
+            id,
+            no_move,
+            wait,
+            timeout,
+        } => {
+            let path = format!("/nodes/{}:drain", seg(&id));
+            let body = json!({ "migrate": !no_move });
+            let mut node = api.post(&path, &body).await?;
+            if wait {
+                let get = format!("/nodes/{}", seg(&id));
+                let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+                let mut asked = std::time::Instant::now();
+                let mut last_error = None;
+                while !drained(&node) {
+                    if node["draining"] == json!(false) {
+                        eprintln!("{id} is no longer draining; someone undrained it");
+                        return Ok(1);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "{id} still holds {} sandboxes and {} volumes; see `spawnbox events` \
+                             for node.drained",
+                            text(&node["sandboxes"]),
+                            text(&node["volumes"])
+                        );
+                        if let Some(error) = last_error {
+                            eprintln!("last error: {error:#}");
+                        }
+                        return Ok(1);
+                    }
+                    tokio::time::sleep(DRAIN_POLL).await;
+                    // Errors here, such as while a standby takes over, are
+                    // waited out until the deadline.
+                    let step = async {
+                        let mut next = api.get(&get).await?;
+                        if ask_again(&next, no_move, asked.elapsed()) {
+                            next = api.post(&path, &body).await?;
+                            asked = std::time::Instant::now();
+                        }
+                        anyhow::Ok(next)
+                    };
+                    match step.await {
+                        Ok(next) => node = next,
+                        Err(error) => {
+                            eprintln!("{id}: {error:#}; trying again");
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+            out.show(&node, || {
+                format!(
+                    "{id} draining: {} sandboxes, {} volumes left",
+                    text(&node["sandboxes"]),
+                    text(&node["volumes"])
+                )
+            });
+        }
+        NodesCommand::Undrain { id } => {
+            let node = api
+                .post(&format!("/nodes/{}:undrain", seg(&id)), &json!({}))
+                .await?;
+            out.show(&node, || format!("{id} takes sandboxes again"));
+        }
+    }
+    Ok(0)
+}
+
 /// From an environment variable, a hidden prompt, or all of stdin. Never
 /// from the command line, where `ps` and shell history would show it.
 fn secret_value(from_env: Option<&str>) -> Result<String> {
@@ -1147,6 +1258,30 @@ async fn usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_is_drained_when_it_holds_nothing() {
+        assert!(drained(&json!({ "sandboxes": 0, "volumes": 0 })));
+        // From a primary that does not count volumes.
+        assert!(drained(&json!({ "sandboxes": 0 })));
+        assert!(!drained(&json!({ "sandboxes": 1, "volumes": 0 })));
+        assert!(!drained(&json!({ "sandboxes": 0, "volumes": 2 })));
+        assert!(!drained(&json!({})));
+    }
+
+    #[test]
+    fn a_drain_is_asked_again_only_when_no_pass_runs() {
+        let left = json!({ "sandboxes": 2, "volumes": 0, "drain_running": false });
+        let running = json!({ "sandboxes": 2, "volumes": 0, "drain_running": true });
+        let old_server = json!({ "sandboxes": 2, "volumes": 0 });
+        let done = json!({ "sandboxes": 0, "volumes": 0, "drain_running": false });
+        assert!(ask_again(&left, false, DRAIN_RETRY));
+        assert!(!ask_again(&left, false, DRAIN_POLL));
+        assert!(!ask_again(&left, true, DRAIN_RETRY));
+        assert!(!ask_again(&running, false, DRAIN_RETRY * 10));
+        assert!(ask_again(&old_server, false, DRAIN_RETRY));
+        assert!(!ask_again(&done, false, DRAIN_RETRY));
+    }
 
     #[test]
     fn quotes_arguments_only_when_needed() {

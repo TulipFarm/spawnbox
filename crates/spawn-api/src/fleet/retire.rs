@@ -249,13 +249,20 @@ fn next_pass(
     tokio::spawn(async move {
         let result = migrate::drain(Arc::clone(&app), id.clone(), Origin::system()).await;
         if let Ok(p) = super::primary::primary(&app) {
-            lock(&p.retirer.passes).insert(
-                id,
-                Pass::Done {
-                    at: now_ms(),
-                    failed: result.failed + result.volumes_failed,
-                },
-            );
+            if result.skipped {
+                // A `:drain` pass had the node; look again on the next
+                // tick, not at once, which would only find it busy again.
+                lock(&p.retirer.passes).remove(&id);
+                return;
+            } else {
+                lock(&p.retirer.passes).insert(
+                    id,
+                    Pass::Done {
+                        at: now_ms(),
+                        failed: result.failed + result.volumes_failed,
+                    },
+                );
+            }
             p.retirer.wake();
         }
     });
