@@ -42,6 +42,8 @@ const NODE_FILE: &str = "id";
 const EVENTS_EVERY: Duration = Duration::from_secs(1);
 const USAGE_EVERY: Duration = Duration::from_secs(60);
 const EVENT_BATCH: usize = 500;
+/// Longest wait for the primary to answer a heartbeat.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Worker {
     pub node: String,
@@ -284,10 +286,13 @@ async fn heartbeat(app: &App, w: &Worker) -> Result<()> {
         self_fence: w.self_fence,
         fence_after_s: w.fence_after.as_secs(),
     };
-    let reply: HeartbeatReply = w
-        .call("/fleet/v1/heartbeat", &hb)
-        .await
-        .map_err(Failure::error)?;
+    let reply: HeartbeatReply = tokio::time::timeout(
+        heartbeat_timeout(w.fence_after),
+        w.call("/fleet/v1/heartbeat", &hb),
+    )
+    .await
+    .context("the primary did not answer in time")?
+    .map_err(Failure::error)?;
     {
         let mut reached = w.reached.lock().unwrap_or_else(|e| e.into_inner());
         *reached = (*reached).max(sent);
@@ -298,7 +303,10 @@ async fn heartbeat(app: &App, w: &Worker) -> Result<()> {
             eprintln!("fleet: drop stale copy of {id}: {}", error.message);
         }
     }
-    app.sandboxes.set_fenced(false);
+    // An answer to a call sent before the fence time does not undo it.
+    if sent.elapsed() < w.fence_after {
+        app.sandboxes.set_fenced(false);
+    }
     w.events_after.store(reply.events_after, Ordering::SeqCst);
     for id in &reply.release {
         eprintln!("fleet: {id} runs on another host now; removing it here");
@@ -341,6 +349,11 @@ async fn send_usage(app: &App, w: &Worker) -> Result<()> {
     Ok(())
 }
 
+/// Well under the fence time, so a slow answer cannot hold off a fence.
+fn heartbeat_timeout(fence_after: Duration) -> Duration {
+    HEARTBEAT_TIMEOUT.min(fence_after / 2)
+}
+
 /// Starts the loops that report to the primary.
 pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> {
     let beat = {
@@ -366,18 +379,16 @@ pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> 
     let fence = {
         let (app, w) = (Arc::clone(&app), Arc::clone(&w));
         tokio::spawn(async move {
-            let mut fenced = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let lost = w.self_fence && w.unreached_for() >= w.fence_after;
-                if lost && !fenced {
+                if lost && !app.sandboxes.is_fenced() {
                     eprintln!(
                         "fleet: no answer from the primary for {}s; stopping persistent sandboxes",
                         w.fence_after.as_secs()
                     );
                     app.sandboxes.fence_all("self_fenced").await;
                 }
-                fenced = lost;
             }
         })
     };
@@ -559,4 +570,19 @@ async fn take_secrets(State(app): State<AppState>, body: Bytes) -> Result<Json<V
     let push: SecretPush = parse(&body)?;
     app.secrets.import(&push.secrets, None)?;
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heartbeat_gives_up_well_before_the_fence_time() {
+        for fence_after_s in [1, 4, 20, 60, 3600] {
+            let fence_after = Duration::from_secs(fence_after_s);
+            let timeout = heartbeat_timeout(fence_after);
+            assert!(timeout <= fence_after / 2, "{fence_after_s}");
+            assert!(timeout <= HEARTBEAT_TIMEOUT, "{fence_after_s}");
+        }
+    }
 }
