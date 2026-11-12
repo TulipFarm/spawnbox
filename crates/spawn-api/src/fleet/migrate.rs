@@ -845,7 +845,7 @@ fn unreachable_or_broken(node: &NodeRow, failure: Failure) -> ApiError {
             Code::NodeUnreachable,
             format!("node {} cannot be reached: {e:#}", node.id),
         ),
-        Failure::Broken(e) => ApiError::internal(format!("node {}: {e:#}", node.id)),
+        failure => ApiError::internal(format!("node {}: {:#}", node.id, failure.error())),
     }
 }
 

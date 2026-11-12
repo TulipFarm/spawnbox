@@ -362,7 +362,10 @@ pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> 
             let mut quiet = Quiet(None);
             loop {
                 quiet.see("heartbeat", heartbeat(&app, &w).await);
-                tokio::time::sleep(HEARTBEAT_EVERY).await;
+                tokio::select! {
+                    () = tokio::time::sleep(HEARTBEAT_EVERY) => {}
+                    () = app.sandboxes.report_now.notified() => {}
+                }
             }
         })
     };
@@ -508,6 +511,7 @@ async fn cold_start_here(
     State(app): State<AppState>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let begun = Instant::now();
     let ColdStart {
         mut sandbox,
         mut start,
@@ -519,14 +523,13 @@ async fn cold_start_here(
         return Err(ApiError::invalid("not a persistent sandbox"));
     }
     // Template builds are made on each host: use the one made from the
-    // same spec here.
+    // same spec here. Without one, the start builds the spec again.
     let wanted = super::build_hash(&start.spec);
     let build = app
         .templates
         .ready_builds()
         .into_iter()
         .map(|(_, build, _)| build)
-        .chain([start.build.clone()])
         .find(|build| {
             app.db
                 .get_build(build)
@@ -534,12 +537,7 @@ async fn cold_start_here(
                 .flatten()
                 .is_some_and(|b| super::build_hash(&b.spec) == wanted)
         })
-        .ok_or_else(|| {
-            ApiError::new(
-                crate::model::Code::NoCapacity,
-                format!("no build of template {:?} here", start.template),
-            )
-        })?;
+        .unwrap_or_else(|| start.build.clone());
     // An older copy here must not run beside the new one.
     app.sandboxes.drop_stale(&id).await?;
     start.build.clone_from(&build);
@@ -555,7 +553,7 @@ async fn cold_start_here(
     sandbox.generation = generation - 1;
     app.db.replace_persistent(&sandbox, &start)?;
     app.sandboxes
-        .start_cold_gated(&id, &crate::events::Origin::system())
+        .start_cold_gated(&id, &crate::events::Origin::system(), Some(begun))
         .await?;
     let running = app.db.get_sandbox(&id)?.map(|s| s.generation);
     if running != Some(generation) {

@@ -727,7 +727,42 @@ ports are the same.
 A tenant needs the `persistent_sandboxes` quota. It is `0` by default.
 Persistent sandboxes are created on the primary, and you cannot move
 them. In a fleet, a cold sandbox can start again on any worker that has
-its template build. Refer to [Fence lost hosts](#fence-lost-hosts).
+its template build. Refer to [Fence lost hosts](#fence-lost-hosts). To
+run one on another host, let it become cold: it then starts on the host
+that takes the next call, from a build of that host.
+
+#### Upgrades and old builds
+
+The guest in a sandbox is part of its template build. A host accepts
+guests up to two minor versions older or newer than its own. A
+persistent sandbox can live longer than that, and the host that starts
+it can lack its build, for example after a leader failover. So:
+
+- A paused persistent sandbox whose guest the host no longer accepts is
+  not resumed. It becomes `cold` with the reason `guest_too_old`, and the
+  call starts it again from its start record.
+- A cold start uses the recorded build if this host has it, or can get it
+  from the build store, and accepts its guest. If not, it uses a ready
+  build of this host made from the same template spec, or builds that
+  spec again with the current guest, as a template rebuild does. The
+  sandbox then starts from that build from now on, and the event
+  `sandbox.rebuilt` shows `from_build`, `to_build` and the `reason`:
+  `missing` (no host file and not in the store), `outdated` (made with
+  another kernel, base disk or runtime) or `guest_too_old`.
+- Cold starts on one host that need the same spec wait for one build.
+  On the primary, the call waits up to 60 seconds for it. When the
+  sandbox starts on a worker, the call does not wait. In both cases, the
+  call gives `503 rebuilding` while the build goes on; try again.
+- If the spec cannot be built, the call gives `409 build_failed` with the
+  error, and the sandbox stays `cold`. The same error is given for the
+  next 5 minutes, then the next call builds again. If a worker cannot
+  build the spec, the primary starts the sandbox itself, and does not ask
+  that worker to build the spec again for 5 minutes. A sandbox from a
+  snapshot template cannot be built again on another host or version.
+- When a paused sandbox on a worker becomes `cold` this way, the worker
+  tells the primary at once, and the primary starts the sandbox again for
+  the same call. If that takes too long, the call gives
+  `503 sandbox_cold`; try again.
 
 ### Fork a sandbox or save it as a template
 
@@ -907,6 +942,7 @@ Prometheus adds the `instance` label.
 | `spawnbox_self_fences_total` (counter) | `reason` (`self_fenced`, `lease_lost`) | Times this host stopped its persistent sandboxes because it lost the primary or its lease |
 | `spawnbox_fenced_cold_total` (counter) | `reason` | Primary only: persistent sandboxes of a lost host that became `cold`, by proof (`operator`, `autoscaler`, `self_fence`, `failover`) |
 | `spawnbox_stale_copies_total` (counter) | None | Copies of persistent sandboxes from an older generation that a host deleted |
+| `spawnbox_sandbox_rebuilds_total` (counter) | `reason` (`missing`, `outdated`, `guest_too_old`) | Cold starts of persistent sandboxes that used a new build of their template spec, because the recorded build could not be used |
 | `spawnbox_fleet_retirements` (gauge) | `state` | Primary only: workers that retire, in each state (`draining`, `blocked`, `ready_to_terminate`) |
 
 ## Use more than one host
@@ -1167,7 +1203,9 @@ When a standby becomes the leader:
 - Volumes whose file was on the old leader are lost.
 - Persistent sandboxes of the old leader become `cold` after
   `--fence-after-s` plus `--fence-margin-s`. Until then, requests for them
-  give `409`.
+  give `409`. The next request starts them on the new leader, or on a
+  worker. If that host lacks their build, it builds their template spec
+  again first. Refer to [Upgrades and old builds](#upgrades-and-old-builds).
 - If the leader cannot reach the database for 6 seconds, or another
   primary took its lease, it stops taking requests, kills all its VMs and
   exits, before its lease ends. So two primaries never serve at the same
@@ -1935,7 +1973,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   - `sandbox.created` (with `forked_from` for a copy), `.paused`,
     `.resumed`, `.forked`, `.snapshotted`, `.expired`, `.killed`, `.lost`,
     `.cold` (with `reason`), `.cold_started` (with `generation`, `build`
-    and `duration_ms`), `.fenced` (with `reason` and `generation`: a host
+    and `duration_ms`), `.rebuilt` (with `from_build`, `to_build` and
+    `reason`), `.fenced` (with `reason` and `generation`: a host
     stopped its copy)
   - `node.fenced` (with `node` and `reason`, primary only)
   - `exec.started`, `exec.finished` (with the last 64 KiB of output)
@@ -2153,6 +2192,9 @@ Type these commands on the host.
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |
 | A request for a persistent sandbox gives `503 node_unreachable` for a long time | Its worker is `down`, and no proof says that its VM is stopped | Bring the worker back, or stop its machine and call `POST /v1/nodes/{id}:fenced`. Refer to [Fence lost hosts](#fence-lost-hosts). |
 | A request for a cold sandbox gives `503 volume_unavailable` | The only copy of its volume is on a host that is `down` | Bring the host back. |
+| A request for a cold sandbox gives `503 rebuilding` | This host is building the sandbox's template spec again, because it cannot use the recorded build | Try again in a minute. Refer to [Upgrades and old builds](#upgrades-and-old-builds). |
+| A request gives `503 sandbox_cold` | The sandbox's worker found it `cold`, and the primary did not learn it in time to start it again | Try again. Refer to [Upgrades and old builds](#upgrades-and-old-builds). |
+| A request for a cold sandbox gives `409 build_failed` | The sandbox's template spec cannot be built on this host now, for example a setup command fails | Read the error. Fix what the setup needs, such as network access, then try again after 5 minutes. |
 | A worker stops with `the join token is unknown, used or expired` | The token was used or is older than one hour | Make a new token on the primary. |
 | A worker log shows `not a node of this fleet` | The worker was removed | Remove `/var/lib/spawnbox/fleet/worker/` and add the worker again with a new token. |
 

@@ -101,6 +101,11 @@ const METRICS: &[(&str, &str, &str)] = &[
         "Copies of persistent sandboxes destroyed on this host because a newer generation runs elsewhere.",
     ),
     (
+        "spawnbox_sandbox_rebuilds_total",
+        "counter",
+        "Cold starts of persistent sandboxes whose recorded build could not be used here, so their template spec was built again or an equal build was taken, by reason.",
+    ),
+    (
         "spawnbox_fleet_retirements",
         "gauge",
         "Workers being retired, by state: draining, blocked or ready_to_terminate.",

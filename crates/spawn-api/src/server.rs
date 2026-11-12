@@ -825,6 +825,7 @@ async fn run(
         build_store,
         args.build_cache_gib.saturating_mul(1 << 30),
         wait_for_base,
+        !matches!(role, Role::Worker(_)),
     )
     .await
     .context("load templates")?;
@@ -1332,7 +1333,29 @@ async fn auth(State(app): State<AppState>, mut req: Request, next: Next) -> Resp
         Err(error) => return error.into_response(),
     };
     if let Some((node, id)) = remote {
-        return primary::forward_api(&app, &node, &id, req).await;
+        let (first, again) = match replayable(&id, req).await {
+            Ok(split) => split,
+            Err(error) => return error.into_response(),
+        };
+        let reply = primary::forward_api(&app, &node, &id, first).await;
+        let Some(mut again) = again else {
+            return reply;
+        };
+        // The worker turned the paused sandbox cold but cannot start it:
+        // once its report arrives, start it again and send the call there.
+        let (reply, cold) = cold_reply(reply).await;
+        if !cold || !primary::reported_cold(&app, &id).await {
+            return reply;
+        }
+        if let Err(error) = primary::wake_cold(&app, &id, false).await {
+            return error.into_response();
+        }
+        if let Some(node) = primary::node_of(&app, &id) {
+            return primary::forward_api(&app, &node, &id, again).await;
+        }
+        again.extensions_mut().insert(caller);
+        again.extensions_mut().insert(origin);
+        return next.run(again).await;
     }
     if matches!(app.role, Role::Primary(_))
         && let Some(id) = tenancy::sandbox_in_path(req.uri().path())
@@ -1350,6 +1373,47 @@ async fn auth(State(app): State<AppState>, mut req: Request, next: Next) -> Resp
     req.extensions_mut().insert(caller);
     req.extensions_mut().insert(origin);
     next.run(req).await
+}
+
+/// Largest request body kept to send a call to a worker a second time.
+const REPLAY_BODY: usize = 1 << 20;
+
+/// Splits a call that wakes sandbox `id` into two copies, so it can be sent
+/// again; other calls, upgrades and large or streamed bodies get no copy.
+async fn replayable(id: &str, req: Request) -> Result<(Request, Option<Request>), ApiError> {
+    let headers = req.headers();
+    let length = match headers.get(header::CONTENT_LENGTH) {
+        Some(value) => value.to_str().ok().and_then(|v| v.parse::<usize>().ok()),
+        None if headers.contains_key(header::TRANSFER_ENCODING) => None,
+        None => Some(0),
+    };
+    if !wakes(req.method(), req.uri().path(), id)
+        || headers.contains_key(header::UPGRADE)
+        || length.is_none_or(|n| n > REPLAY_BODY)
+    {
+        return Ok((req, None));
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, REPLAY_BODY)
+        .await
+        .map_err(|e| ApiError::invalid(format!("read request body: {e}")))?;
+    let again = Request::from_parts(parts.clone(), Body::from(bytes.clone()));
+    Ok((Request::from_parts(parts, Body::from(bytes)), Some(again)))
+}
+
+/// Whether a worker's reply says the sandbox is cold there; the reply is
+/// returned whole either way.
+async fn cold_reply(reply: Response) -> (Response, bool) {
+    if reply.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return (reply, false);
+    }
+    let (parts, body) = reply.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 64 << 10).await else {
+        let error = ApiError::new(Code::NodeUnreachable, "read the worker's reply");
+        return (error.into_response(), false);
+    };
+    let cold = crate::fleet::forward::refusal(&bytes).is_some_and(|e| e.code == Code::Cold);
+    (Response::from_parts(parts, Body::from(bytes)), cold)
 }
 
 /// Whether a call for sandbox `id` needs its VM, so starts it if cold.
@@ -2804,6 +2868,53 @@ fn totals_json(totals: &Totals) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_small_waking_calls_are_kept_to_send_again() {
+        let id = "sbx_0123456789abcdef";
+        let call = |method: &str, tail: &str, headers: &[(&str, &str)], body: &'static str| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(format!("/v1/sandboxes/{id}{tail}"));
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            builder.body(Body::from(body)).unwrap()
+        };
+        let exec = call("POST", "/exec", &[("content-length", "7")], "{\"a\":1}");
+        let (first, again) = replayable(id, exec).await.unwrap();
+        let again = again.expect("a copy");
+        assert_eq!(again.uri(), first.uri());
+        let read = |r: Request| async { axum::body::to_bytes(r.into_body(), 64).await.unwrap() };
+        assert_eq!(read(first).await, read(again).await);
+        for (method, tail, headers) in [
+            ("GET", "", &[][..]),
+            ("POST", "/exec", &[("transfer-encoding", "chunked")][..]),
+            ("POST", "/exec", &[("content-length", "2000000")][..]),
+            ("GET", "/pty", &[("upgrade", "websocket")][..]),
+        ] {
+            let (_, again) = replayable(id, call(method, tail, headers, ""))
+                .await
+                .unwrap();
+            assert!(again.is_none(), "{method} {tail} {headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_reply_is_found_and_kept_whole() {
+        let reply = |error: ApiError| error.into_response();
+        let (kept, cold) = cold_reply(reply(ApiError::new(Code::Cold, "on a worker"))).await;
+        assert!(cold);
+        assert_eq!(kept.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(kept.into_body(), 64 << 10)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("sandbox_cold"));
+        for other in [Code::Rebuilding, Code::Conflict] {
+            let (_, cold) = cold_reply(reply(ApiError::new(other, "x"))).await;
+            assert!(!cold, "{other:?}");
+        }
+    }
 
     #[test]
     fn only_calls_that_need_the_vm_wake_a_cold_sandbox() {

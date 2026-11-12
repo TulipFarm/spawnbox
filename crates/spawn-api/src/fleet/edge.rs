@@ -208,7 +208,8 @@ impl Edge {
                     format!("{name} cannot be reached; try again later"),
                 ))
             }
-            Err(Failure::Broken(e)) => {
+            Err(failure) => {
+                let e = failure.error();
                 let mut resp =
                     ApiError::new(Code::Internal, format!("{name}: {e:#}")).into_response();
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
@@ -236,7 +237,7 @@ impl Edge {
                 self.primary.unreachable(&url);
                 return Err(e);
             }
-            Err(Failure::Broken(e)) => return Err(e),
+            Err(failure) => return Err(failure.error()),
         };
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), MAX_ROUTES).await?;

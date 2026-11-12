@@ -246,6 +246,8 @@ pub struct Node {
 
 pub struct TemplateInfo {
     pub agent_version: String,
+    /// The guest's protocol version, `major.minor`.
+    pub guest_version: String,
     pub boot_to_agent_ms: f64,
     pub snapshot_create_ms: f64,
     pub upper_disk_used_kib: Option<u64>,
@@ -480,7 +482,7 @@ impl Node {
             }
         };
         let result = async {
-            let agent_version = guest::hello(&channel).await?;
+            let (agent_version, guest_version) = guest::hello(&channel).await?;
             if let Some(ca) = &recipe.ca {
                 note(log, "== snapshot: trusting the egress CA");
                 let cmd = trust_ca(ca)?;
@@ -500,12 +502,12 @@ impl Node {
             guest::exec(&channel, "true").await?;
             note(log, "== snapshot: saving");
             let snapshot_create_ms = save_template(&vm, build).await?;
-            anyhow::Ok((agent_version, snapshot_create_ms))
+            anyhow::Ok((agent_version, guest_version, snapshot_create_ms))
         }
         .await;
         drop(channel);
         vm.stop().await;
-        let (agent_version, snapshot_create_ms) = result?;
+        let (agent_version, guest_version, snapshot_create_ms) = result?;
         if recipe.record_pages && build.backend == Backend::Firecracker {
             note(log, "== snapshot: recording the memory a start uses");
             if let Err(error) = self.record_hot(build, slot, recipe.net).await {
@@ -523,6 +525,7 @@ impl Node {
         };
         Ok(TemplateInfo {
             agent_version,
+            guest_version: spawn_proto::version_string(&guest_version),
             boot_to_agent_ms,
             snapshot_create_ms,
             upper_disk_used_kib,

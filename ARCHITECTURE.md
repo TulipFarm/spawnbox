@@ -161,7 +161,8 @@ flowchart LR
   disk or Firecracker version changes, because a snapshot only restores
   on the same versions.
 - A build that a persistent sandbox's start record names is kept until
-  that sandbox is deleted.
+  that sandbox is deleted, also when the server stops or the template gets
+  a new build.
 
 ### Build store
 
@@ -192,8 +193,10 @@ flowchart LR
   recently used first. A build in use by a create or a warm pool, or used
   in the last 10 minutes, is kept. The next create fetches it again. If a
   fetch fails, the template is built again.
-- **Clean-up.** Once a day each host rewrites the manifests it uses, then
-  deletes manifests and unreferenced blobs that are older than 7 days.
+- **Clean-up.** Once a day each host rewrites the manifests it uses.
+  Primaries then delete manifests and unreferenced blobs that are older
+  than 7 days, except builds that a start record names. Workers do not
+  delete: they do not know every start record.
 
 ## Creating a sandbox
 
@@ -354,7 +357,9 @@ lost. A cold sandbox has no VM.
   show them. The snapshot gives `409 protected_env`. Forks keep the flag.
 - **Build roots.** A build in a start record is a root. The host keeps
   it, and the build store does not collect it, even after a newer build of
-  the template is ready.
+  the template is ready. A root build (`builds.root`) is one made only for
+  cold starts; it is never a template's current build, and it is removed
+  10 minutes after no start record names it.
 - **Cold start.** A call that wakes a cold sandbox moves its row from
   `cold` to `starting` in one conditional update. That update adds 1 to
   `generation` and writes a claim with a 120 s deadline. Calls on this
@@ -372,6 +377,54 @@ lost. A cold sandbox has no VM.
 - **Placement.** Creates place persistent sandboxes on the primary.
   Moving or draining one gives `409 conflict`. In a fleet, a cold start
   can run on any worker; see [Lost hosts and fencing](#lost-hosts-and-fencing).
+  So a persistent sandbox changes host, including to a host with another
+  fingerprint, only by becoming cold and starting there, never by a
+  snapshot copy.
+
+### Old builds and upgrades
+
+A build records the protocol version of its guest (`builds.guest`, read
+when the build's snapshot is taken; unknown for builds fetched from the
+store or made by earlier releases). A host accepts a guest of the same
+major version and at most two minor versions apart.
+
+- **Resume.** Before a paused persistent sandbox resumes, the host reads
+  the guest of its start record's build. If the host does not accept it,
+  or the restored guest's handshake says so, the snapshot is dropped and
+  the row becomes `cold` (`sandbox.cold`, `guest_too_old`). `open` and
+  `:resume` then cold-start it.
+- **Choosing the build.** A cold start uses the start record's build if
+  its guest is accepted and its files are here or in the build store.
+  Otherwise, under a per-host lock keyed by SHA-256 of the template, the
+  spec without `min_warm` and registry secrets, and the fingerprint, it
+  takes the newest ready build with that template, spec and fingerprint
+  whose guest is accepted and whose files are reachable. With none, it
+  queues a root build of the recorded spec and runs it like a template
+  build: if the build store has a build with the same key, it is fetched
+  instead, and a new build is uploaded. Concurrent cold
+  starts wait on the same lock, so they share one build.
+- **Adopting it.** The start record's `build` (and the row's) moves to
+  the new build in one update, conditional on the old build. The host
+  holds the new build, and the old one is released when no record names
+  it. The event `sandbox.rebuilt` has `from_build`, `to_build` and
+  `reason` (`missing`, `outdated` or `guest_too_old`), and
+  `spawnbox_sandbox_rebuilds_total{reason}` counts it.
+- **Waiting.** On the primary, the call waits up to 60 s, before it
+  claims the row. After that it gives `503 rebuilding` (retryable) and the
+  build continues; the next call takes it. A worker's cold-start route
+  does not wait at all: it gives `rebuilding` at once, so the primary's
+  claim covers only the boot. The primary passes that `503` on.
+- **Start budget.** A cold start's boot gets the claim's 120 s less the
+  time the start already spent, measured from when the call arrived. With
+  less than 10 s left it gives `503 no_capacity` before it claims the
+  row, so a start never runs past the claim that the primary holds. A failed build gives `409 build_failed`, the row
+  stays `cold`, and the failure is returned for 5 minutes before another
+  build is tried. Snapshot templates cannot be built again, so they fail
+  at once.
+- **Shared database.** Primaries on one Postgres see each other's build
+  rows. A row whose files are neither on this host nor in the store is
+  not usable, so a new leader builds the spec again or takes its own
+  build of the same spec.
 
 ## Services
 
@@ -925,9 +978,22 @@ flowchart TB
   as the start record, or on itself. It syncs config, pushes secrets and
   volumes, and sends the start record with the plain env over mutual TLS.
   The worker seals the env under its own key and starts the build. If the
-  worker was not reached, the primary starts it locally. If the call
-  broke, the claim stays: the next heartbeat after its deadline makes the
-  row `running` if the worker reports that generation, or `cold`.
+  worker was not reached, the primary starts it locally. If the worker
+  answered with an API error from before its own claim (`rebuilding`,
+  `build_failed` or `no_capacity`), nothing started there, so the
+  primary drops its claim at once. It passes `rebuilding` on; after
+  `build_failed` or `no_capacity` it starts the sandbox locally, and skips
+  that worker for that spec hash for 5 minutes after `build_failed`. If
+  the call broke, or the worker gave another error, the claim stays: the
+  next heartbeat after its deadline makes the row `running` if the
+  worker reports that generation, or `cold`.
+- **Paused on a worker.** A worker cannot cold-start. When a paused
+  persistent sandbox there becomes `cold` (for example `guest_too_old`),
+  the worker sends a heartbeat at once and answers `503 sandbox_cold`.
+  On that answer, the primary waits up to two heartbeats for the row to
+  show `cold` with no node, cold-starts it as above and forwards the call
+  once more. Only waking calls with a body of at most 1 MiB, not
+  upgrades, are kept to send again; others get the `503`.
 - **Volumes.** If a volume of the sandbox is on a node that is not
   ready, the cold start fails with `503 volume_unavailable`.
 - **Edges** resend a call to the primary only if the worker could not be
@@ -935,7 +1001,9 @@ flowchart TB
 - **Leader failover.** A leader that loses its lease stops taking calls
   and kills its VMs before it exits. The new leader waits `fence_after_s` plus the
   margin, then makes the old leader's persistent rows `cold`
-  (`sandbox.cold`, `failover`).
+  (`sandbox.cold`, `failover`). Their next cold start builds the
+  recorded spec again if the new host lacks their build; see
+  [Old builds and upgrades](#old-builds-and-upgrades).
 
 ## State on disk
 
