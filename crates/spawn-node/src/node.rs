@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt, chown};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1056,8 +1056,7 @@ async fn snapshot_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
         for name in [ROOTFS, LAYER] {
             let src = root.join(name);
             if src.exists() {
-                std::fs::hard_link(&src, dir.join(name))
-                    .with_context(|| format!("link {name} to {}", dir.display()))?;
+                link_from_jail(&src, &dir.join(name))?;
             }
         }
         // While paused, so the disk matches the memory.
@@ -1065,6 +1064,7 @@ async fn snapshot_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
         sh(
             "cp",
             &[
+                "--no-dereference",
                 "--sparse=always",
                 "--reflink=auto",
                 &src.to_string_lossy(),
@@ -1072,8 +1072,7 @@ async fn snapshot_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
             ],
         )
         .await?;
-        chown(&dest, Some(0), Some(0))?;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+        own(&dest)?;
         anyhow::Ok(files)
     }
     .await;
@@ -1205,7 +1204,7 @@ async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
             keep(&root.join("paused.state"), &dir.join("vm.state"))?;
             if diff {
                 keep(&root.join("paused.mem"), &dir.join(crate::diff::DIFF))?;
-                std::fs::hard_link(root.join("vm.mem"), dir.join(crate::diff::BASE))
+                link_from_jail(&root.join("vm.mem"), &dir.join(crate::diff::BASE))
                     .context("keep the memory the VM was loaded from")?;
             } else {
                 keep(&root.join("paused.mem"), &dir.join("vm.mem"))?;
@@ -1213,8 +1212,7 @@ async fn pause_vm(vm: &firecracker::Vm, dir: &Path) -> Result<f64> {
             for name in [ROOTFS, LAYER] {
                 let src = root.join(name);
                 if src.exists() {
-                    std::fs::hard_link(&src, dir.join(name))
-                        .with_context(|| format!("link {name} to {}", dir.display()))?;
+                    link_from_jail(&src, &dir.join(name))?;
                 }
             }
             // Last: once the disk has moved, the pause is done.
@@ -1383,8 +1381,43 @@ fn note(log: Log<'_>, line: &str) {
 fn keep(src: &Path, dest: &Path) -> Result<()> {
     std::fs::rename(src, dest)
         .with_context(|| format!("move {} to {}", src.display(), dest.display()))?;
-    chown(dest, Some(0), Some(0))?;
-    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o644))?;
+    own(dest)
+}
+
+/// Makes `path`, just taken from a jail into a directory only root can
+/// change, owned by root and readable by every VM. The jailed VMM may have
+/// left a symlink, a hard link or a FIFO there instead of its file: these
+/// are removed and refused, never followed.
+fn own(path: &Path) -> Result<()> {
+    let owned = (|| {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            bail!("not a regular file with one link");
+        }
+        fchown(&file, Some(0), Some(0))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        anyhow::Ok(())
+    })();
+    if owned.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    owned.with_context(|| format!("take {} from the jail", path.display()))
+}
+
+/// Hard-links `src`, a file in a jail, to `dest`. Fails, leaving no `dest`,
+/// if `src` is not a regular file: `link` does not follow a symlink, so a
+/// planted one would arrive as a symlink.
+fn link_from_jail(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::hard_link(src, dest)
+        .with_context(|| format!("link {} to {}", src.display(), dest.display()))?;
+    if !std::fs::symlink_metadata(dest)?.is_file() {
+        let _ = std::fs::remove_file(dest);
+        bail!("{} is not a regular file", src.display());
+    }
     Ok(())
 }
 
@@ -1487,4 +1520,65 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spawn-jail-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("jail")).unwrap();
+        std::fs::create_dir_all(dir.join("kept")).unwrap();
+        dir
+    }
+
+    fn secret(dir: &Path) -> PathBuf {
+        let path = dir.join("secret");
+        std::fs::write(&path, "x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn keep_refuses_links_planted_in_a_jail() {
+        let dir = scratch("keep");
+        let secret = secret(&dir);
+        let dest = dir.join("kept/vm.state");
+
+        symlink(&secret, dir.join("jail/paused.state")).unwrap();
+        assert!(keep(&dir.join("jail/paused.state"), &dest).is_err());
+        assert_eq!(mode(&secret), 0o600);
+        assert!(std::fs::symlink_metadata(&dest).is_err());
+
+        std::fs::hard_link(&secret, dir.join("jail/paused.mem")).unwrap();
+        assert!(keep(&dir.join("jail/paused.mem"), &dest).is_err());
+        assert_eq!(mode(&secret), 0o600);
+
+        // Only root may give a file to root.
+        if std::fs::metadata(&secret).unwrap().uid() == 0 {
+            std::fs::write(dir.join("jail/ok"), "y").unwrap();
+            keep(&dir.join("jail/ok"), &dest).unwrap();
+            assert_eq!(mode(&dest), 0o644);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn links_from_a_jail_must_be_regular_files() {
+        let dir = scratch("link");
+        let secret = secret(&dir);
+        let dest = dir.join("kept/rootfs.ext4");
+        symlink(&secret, dir.join("jail/rootfs.ext4")).unwrap();
+        assert!(link_from_jail(&dir.join("jail/rootfs.ext4"), &dest).is_err());
+        assert!(std::fs::symlink_metadata(&dest).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

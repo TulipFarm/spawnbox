@@ -1083,6 +1083,7 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 | --- | --- |
 | Sandbox to host | KVM hardware virtualization, Firecracker's minimal device model, jailer chroot, unprivileged uid, cgroups, seccomp. On gVisor hosts: the gVisor user-space kernel with its seccomp filter, cgroups, and a network namespace that `runsc` owns. |
 | Guest agent to host | The host takes gRPC messages of at most 4 MiB from a guest agent, and keeps at most 10 MiB of output from a command that it runs there itself |
+| Jailed VMM to host files | After a pause or snapshot, root takes the files out of the jail without following links: a symlink, hard link or other file that is not a regular one is removed and the pause fails |
 | Sandbox to sandbox | Separate VMs, jails and network namespaces; same addresses inside, but no route between them |
 | Sandbox to your network | Host firewall drops private, link-local, loopback and host addresses; all TCP goes through the proxy |
 | Sandbox to secrets | Only placeholders inside; real values are added outside the VM and only for allowed hosts |
