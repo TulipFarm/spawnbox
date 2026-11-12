@@ -173,12 +173,12 @@ groups:
           description: "Workers are late with reports. No new sandboxes go to them."
 
       - alert: SpawnboxLeaderChanged
-        expr: max(spawnbox_leader_term{job="spawnbox"}) > max(spawnbox_leader_term{job="spawnbox"} offset 15m)
+        expr: count(count by (holder) (max_over_time(spawnbox_leader_term{job="spawnbox"}[15m]))) > 1
         labels:
           severity: warning
         annotations:
           summary: "Another primary took the leader lease"
-          description: "The leader term grew in the last 15 minutes: a standby took over."
+          description: "More than one host held the leader lease in the last 15 minutes: a standby took over. A primary that restarts and takes the lease again does not count."
 
       - alert: SpawnboxTwoLeaders
         expr: count(spawnbox_leader_term{job="spawnbox"}) > 1

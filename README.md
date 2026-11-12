@@ -1009,7 +1009,7 @@ Prometheus adds the `instance` label.
 | `spawnbox_creates_total` (counter) | `result` (`ok` or an error code) | Create calls, by result |
 | `spawnbox_cold_starts_total` (counter) | `result` (`ok` or an error code) | Cold starts of persistent sandboxes on this host, by result |
 | `spawnbox_cold_start_seconds` (histogram) | None | Time of each cold start that worked |
-| `spawnbox_leader_term` (gauge) | None | The term of the database lease this server holds as the primary. Only the leader shows it. It goes up at each failover. |
+| `spawnbox_leader_term` (gauge) | `holder` (this host's ID) | The term of the database lease this server holds as the primary. Only the leader shows it. It goes up each time a primary takes the lease: at a failover, and when the same primary restarts. A new `holder` means another host took over. |
 | `spawnbox_data_dir_available_bytes`, `spawnbox_data_dir_size_bytes` (gauges) | None | Free space and size of the file system of `--data-dir` |
 | `spawnbox_start_time_seconds` (gauge) | None | When this server process started, in seconds since the Unix epoch. It changes at each restart. |
 

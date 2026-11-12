@@ -215,8 +215,10 @@ and the load of the worker.
 
 ### SpawnboxLeaderChanged (warning)
 
-**Meaning.** `spawnbox_leader_term` went up in the last 15 minutes: a
-standby took over as the primary.
+**Meaning.** `spawnbox_leader_term` had more than one `holder` (host ID)
+in the last 15 minutes: a standby took over as the primary. A primary that
+restarts and takes the lease again gets a new term but keeps its holder,
+so it does not fire this alert.
 **Likely cause.** The old primary crashed, lost the database or was
 stopped.
 **First response.** Find out why the old primary stopped. Workers fence

@@ -1120,8 +1120,12 @@ async fn metrics_text(
         }
         Err(error) => eprintln!("metrics: data directory size: {error}"),
     }
-    if let Some(term) = crate::leader::term() {
-        samples.push(("spawnbox_leader_term", vec![], term as f64));
+    if let Some((term, holder)) = crate::leader::term() {
+        samples.push((
+            "spawnbox_leader_term",
+            vec![("holder", holder.to_owned())],
+            term as f64,
+        ));
     }
     match app.db.count_local_sandboxes() {
         Ok(counts) => {

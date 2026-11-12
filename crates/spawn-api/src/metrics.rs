@@ -130,7 +130,7 @@ const METRICS: &[(&str, &str, &str)] = &[
     (
         "spawnbox_leader_term",
         "gauge",
-        "With --database-url: the term of the leader lease this primary holds. It grows each time a primary takes the lease.",
+        "With --database-url: the term of the leader lease this primary holds, labelled with its host ID. It grows each time a primary takes the lease, also when the same host takes it again.",
     ),
     (
         "spawnbox_data_dir_available_bytes",

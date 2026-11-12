@@ -42,9 +42,15 @@ const _: () = assert!(EXIT_BY.as_secs() < LEASE_S as u64);
 /// The term of the lease this process holds; 0 until it leads.
 static TERM: AtomicI64 = AtomicI64::new(0);
 
-/// The term of the lease this process holds, if it leads.
-pub fn term() -> Option<i64> {
-    Some(TERM.load(Ordering::Relaxed)).filter(|t| *t > 0)
+/// This host's name in the lease, once it has led.
+static HOLDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The term of the lease this process holds, and its holder name, if it
+/// leads. The same holder takes a new term each time it takes the lease
+/// again, such as after a restart.
+pub fn term() -> Option<(i64, &'static str)> {
+    let term = TERM.load(Ordering::Relaxed);
+    (term > 0).then(|| (term, HOLDER.get().map_or("", String::as_str)))
 }
 
 /// Files under the data directory that every primary must have the same:
@@ -166,6 +172,7 @@ async fn hold(
         tokio::time::sleep(RENEW_EVERY).await;
     };
     let term = lease.0;
+    let _ = HOLDER.set(holder.to_owned());
     TERM.store(term, Ordering::Relaxed);
     eprintln!("leading the database as {holder}, term {term}");
     if led.send(lease.1).is_err() {
