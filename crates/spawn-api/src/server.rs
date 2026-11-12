@@ -2074,8 +2074,12 @@ async fn update_secret(
     } else {
         "secret.updated"
     };
-    let view = app.secrets.update(ns.as_deref(), &name, input, now_ms())?;
-    app.admin_event(kind, &origin, ns.as_deref(), secret_attrs(&view));
+    let (view, previous_hosts) = app.secrets.update(ns.as_deref(), &name, input, now_ms())?;
+    let mut attrs = secret_attrs(&view);
+    if previous_hosts != view.spec.allowed_hosts {
+        attrs["previous_allowed_hosts"] = json!(previous_hosts);
+    }
+    app.admin_event(kind, &origin, ns.as_deref(), attrs);
     Ok(Json(view))
 }
 

@@ -1958,6 +1958,14 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   header of the secret. The default header is `Authorization: Bearer`.
   `git_https` uses Basic authentication.
 - After a `PATCH`, the next request uses the new value.
+- A `PATCH` that adds to `allowed_hosts` or changes `header` or `format`
+  must also send `value`. Without it, the response is
+  `400 value_required`, so a key that can change a secret cannot send its
+  stored value to a new host. A `PATCH` that only removes hosts does not
+  need `value`.
+- The `secret.updated` and `secret.rotated` events show `allowed_hosts`.
+  When the hosts change, they also show `previous_allowed_hosts`. They
+  never show the value.
 - Sandboxes trust the CA of the proxy. `SSL_CERT_FILE`,
   `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` point
   to the system certificate bundle.

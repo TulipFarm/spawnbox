@@ -108,13 +108,14 @@ impl Secrets {
         view(self.row(&key)?)
     }
 
+    /// The new secret, and the hosts it went to before.
     pub fn update(
         &self,
         ns: Option<&str>,
         name: &str,
         input: SecretInput,
         now: i64,
-    ) -> Result<SecretView, ApiError> {
+    ) -> Result<(SecretView, Vec<String>), ApiError> {
         let _writing = self.writing();
         let key = self.own(ns, name)?;
         let row = self.row(&key)?;
@@ -144,7 +145,13 @@ impl Secrets {
         }
         self.store.set(spec.to_secret(&key, value, row.version + 1));
         eprintln!("secret {key:?} updated (version {})", row.version + 1);
-        view(self.row(&key)?)
+        if spec.allowed_hosts != current.allowed_hosts {
+            eprintln!(
+                "secret {key:?} allowed_hosts changed from {:?} to {:?}",
+                current.allowed_hosts, spec.allowed_hosts
+            );
+        }
+        Ok((view(self.row(&key)?)?, current.allowed_hosts))
     }
 
     pub fn get(&self, ns: Option<&str>, name: &str) -> Result<SecretView, ApiError> {
@@ -402,7 +409,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, Code::Conflict);
 
-        let view = secrets
+        let (view, _) = secrets
             .update(None, "gh", input(r#"{"value":"tok2"}"#), 3)
             .unwrap();
         assert_eq!(view.version, 2);
@@ -412,7 +419,7 @@ mod tests {
             .update(
                 None,
                 "gh",
-                input(r#"{"allowed_hosts":["api.github.com"]}"#),
+                input(r#"{"value":"tok2","allowed_hosts":["api.github.com"]}"#),
                 4,
             )
             .unwrap();

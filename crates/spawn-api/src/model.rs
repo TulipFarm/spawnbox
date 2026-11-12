@@ -841,8 +841,23 @@ impl SecretInput {
             spec.username = self.username;
         }
         spec.check()?;
-        if let Some(value) = &self.value {
-            check_secret_value(value)?;
+        match &self.value {
+            Some(value) => check_secret_value(value)?,
+            // Otherwise a caller could send the stored value somewhere new.
+            // Removing hosts is safe.
+            None if !spec
+                .allowed_hosts
+                .iter()
+                .all(|h| current.allowed_hosts.contains(h))
+                || spec.header != current.header
+                || spec.format != current.format =>
+            {
+                return Err(ApiError::new(
+                    Code::ValueRequired,
+                    "send value to change allowed_hosts, header or format",
+                ));
+            }
+            None => {}
         }
         Ok((spec, self.value))
     }
@@ -1202,11 +1217,13 @@ pub enum Code {
     Rebuilding,
     /// A worker stopped the sandbox; the primary starts it again.
     Cold,
+    /// A change to where a secret's value goes must send the value.
+    ValueRequired,
     Internal,
 }
 
 impl Code {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::InvalidRequest,
         Self::Unauthorized,
         Self::NotFound,
@@ -1220,6 +1237,7 @@ impl Code {
         Self::BuildFailed,
         Self::Rebuilding,
         Self::Cold,
+        Self::ValueRequired,
         Self::Internal,
     ];
 
@@ -1243,13 +1261,14 @@ impl Code {
             Self::BuildFailed => "build_failed",
             Self::Rebuilding => "rebuilding",
             Self::Cold => "sandbox_cold",
+            Self::ValueRequired => "value_required",
             Self::Internal => "internal",
         }
     }
 
     pub fn http_status(self) -> u16 {
         match self {
-            Self::InvalidRequest => 400,
+            Self::InvalidRequest | Self::ValueRequired => 400,
             Self::Unauthorized => 401,
             Self::NotFound => 404,
             Self::Forbidden => 403,
@@ -1752,7 +1771,42 @@ b"}}"#),
             (vec!["b.com".to_owned()], None, Some("v2".to_owned()))
         );
         assert_eq!(update("{}").unwrap(), (spec.clone(), None));
+        assert_eq!(
+            update(r#"{"env":"U"}"#).unwrap().0.env.as_deref(),
+            Some("U")
+        );
+        assert!(update(r#"{"allowed_hosts":["A.com"]}"#).is_ok());
         assert!(update(r#"{"name":"other"}"#).is_err());
         assert!(update(r#"{"type":"git_https"}"#).is_err());
+    }
+
+    #[test]
+    fn redirecting_a_secret_needs_its_value() {
+        let (spec, _) = secret(
+            r#"{"name":"gh","type":"http_header","value":"v","allowed_hosts":["a.com","b.com"]}"#,
+        )
+        .unwrap();
+        let narrowed = serde_json::from_str::<SecretInput>(r#"{"allowed_hosts":["b.com"]}"#)
+            .unwrap()
+            .update(&spec)
+            .unwrap();
+        assert_eq!(narrowed.0.allowed_hosts, ["b.com"]);
+        for json in [
+            r#"{"allowed_hosts":["evil.com"]}"#,
+            r#"{"allowed_hosts":["a.com","evil.com"]}"#,
+            r#"{"header":"X-Token"}"#,
+            r#"{"format":"token {value}"}"#,
+        ] {
+            let err = serde_json::from_str::<SecretInput>(json)
+                .unwrap()
+                .update(&spec)
+                .unwrap_err();
+            assert_eq!(err.code, Code::ValueRequired, "{json}");
+            let with_value = json.replacen('{', r#"{"value":"v2","#, 1);
+            serde_json::from_str::<SecretInput>(&with_value)
+                .unwrap()
+                .update(&spec)
+                .unwrap();
+        }
     }
 }
