@@ -2798,6 +2798,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "libc",
  "nix",
  "object_store",
  "opentelemetry",

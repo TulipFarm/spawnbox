@@ -473,6 +473,25 @@ pub async fn serve(args: Args) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("run as root: it creates jails, cgroups, network namespaces and firewall rules");
     }
+    // Before any VM starts: other hosts may start this host's persistent
+    // sandboxes once the fence time passed, so its VMs must not outlive it.
+    let fences = args.self_fence || args.fleet_listen.is_some() || args.database_url.is_some();
+    let guard = match crate::guard::Guard::start(
+        &spawn_node::firecracker::cgroups(),
+        Some(&spawn_node::firecracker::guard_cgroup()),
+        fences,
+    ) {
+        Ok(guard) => Some(guard),
+        Err(error) if fences => {
+            return Err(
+                error.context("--self-fence, --fleet-listen and --database-url need the VM guard")
+            );
+        }
+        Err(error) => {
+            eprintln!("warning: {error:#}; if this server dies, its VMs keep running");
+            None
+        }
+    };
     let data = crate::open_data_dir(&args.data_dir)?;
     let db = crate::leader::open(
         &data,
@@ -605,6 +624,10 @@ pub async fn serve(args: Args) -> Result<()> {
     }
     let _ = net::remove_stale_namespaces().await;
     host.remove_all().await;
+    // Every VM is stopped; the guard need not kill them.
+    if let Some(guard) = &guard {
+        guard.disarm();
+    }
     host_net.teardown().await;
     result
 }

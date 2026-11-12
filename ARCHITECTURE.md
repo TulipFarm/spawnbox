@@ -973,6 +973,24 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
   that did not pause become `cold`.
 - **Restart.** Ready builds and paused sandboxes are loaded again; nothing
   is rebuilt.
+- **VM guard.** VM cgroups are under `/sys/fs/cgroup/spawnbox`, outside
+  the server process and its service cgroup, so VMs outlive a server that
+  is killed. Fencing relies on them dying with it. Before it starts any
+  VM, `serve` starts `spawn-api guard` (from `/proc/self/exe`) in its own
+  process group, with `SIGINT`, `SIGTERM` and `SIGHUP` ignored. The guard
+  moves itself into `/sys/fs/cgroup/spawnbox-guard`, so a service manager
+  that kills the server's cgroup does not kill it, then reads its stdin:
+  a pipe whose write end only the server holds, close-on-exec, so
+  Firecracker, the jailer and other children never hold it. When the
+  server dies in any way, the kernel closes that end. On end of file the
+  guard writes `cgroup.kill` for every VM cgroup (or, without
+  `cgroup.kill`, kills each process in `cgroup.procs`) and waits up to
+  5 s for them to empty. A clean stop has already stopped every VM; it
+  then writes a disarm byte and the guard exits without killing. If the
+  guard cannot start, a server with `--self-fence`, `--fleet-listen` or
+  `--database-url` refuses to start; others warn. If the guard exits while
+  such a server runs, the server kills its VMs and exits, because it is
+  no longer guarded.
 - **Crash.** On the next start, leftover jails, namespaces, firewall
   rules, Firecracker processes and runsc containers are removed. Sandboxes that were running
   are marked deleted with a `sandbox.lost` event, because their memory is

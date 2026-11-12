@@ -1095,6 +1095,20 @@ heartbeat, so the worker always fences first. Keep the margin above 10
 seconds: a worker can take a few seconds to see the fence time and stop
 its VMs.
 
+**When the server process dies.** VMs run in their own cgroups, outside
+the `spawn-api` process and its systemd service, so they would keep
+running after a crash. The time proofs above need them stopped. So
+`spawn-api serve` starts a small guard process, `spawn-api guard`, before
+any VM. When the server process ends in any way, also with `kill -9`, the
+out-of-memory killer or a crash, the guard kills all the VMs of the host
+within about a second. A normal stop with `SIGTERM` stops the VMs first
+and then tells the guard to exit. The guard is in its own cgroup,
+`/sys/fs/cgroup/spawnbox-guard`, and ignores `SIGINT` and `SIGTERM`, so
+stopping the service does not stop it too early. If the guard cannot
+start, a server with `--self-fence`, `--fleet-listen` or `--database-url`
+does not start. If the guard stops while such a server runs, the server
+kills its VMs and exits.
+
 **Generations.** Each cold start adds 1 to the `generation` of the
 sandbox. A host runs a sandbox only for the generation that the primary
 gave it. When a worker comes back with an older copy, the primary tells

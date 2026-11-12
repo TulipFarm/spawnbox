@@ -220,11 +220,22 @@ pub async fn kill_cgroup(dir: &Path, tries: u32) -> bool {
     false
 }
 
+/// The cgroup that holds every VM's and gVisor container's cgroup.
+pub fn cgroups() -> PathBuf {
+    Path::new(CGROUP_ROOT).join(CGROUP_PARENT)
+}
+
+/// The cgroup of the process that kills the VMs if the server dies. Not
+/// under [`cgroups`], and not in the server's own cgroup.
+pub fn guard_cgroup() -> PathBuf {
+    Path::new(CGROUP_ROOT).join(format!("{CGROUP_PARENT}-guard"))
+}
+
 /// Kills every VM and gVisor process of this server at once, without an
 /// async runtime, and waits up to `wait` until they are gone. False if
 /// some are left.
 pub fn kill_all_now(wait: Duration) -> bool {
-    kill_children(&Path::new(CGROUP_ROOT).join(CGROUP_PARENT), wait)
+    kill_children(&cgroups(), wait)
 }
 
 fn kill_children(parent: &Path, wait: Duration) -> bool {
