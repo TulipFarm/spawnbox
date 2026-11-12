@@ -1,20 +1,47 @@
 #!/usr/bin/env bash
-# Builds a minimal Debian 13 ext4 root disk with spawn-guest as PID 1.
+# Builds a minimal Debian 13 ext4 root disk with Node.js, Python and spawn-guest as PID 1.
 # Needs Linux, sudo, debootstrap, and e2fsprogs.
 set -euo pipefail
 
 SUITE="trixie"
 MIRROR="https://deb.debian.org/debian"
-PACKAGES="bash,ca-certificates,coreutils,curl,git,iproute2,openssh-client,procps,sudo"
+PACKAGES="bash,ca-certificates,coreutils,curl,git,iproute2,libatomic1,openssh-client,procps,sudo"
+
+# Node.js and Python go in /usr/local. Python comes from python-build-standalone, as python.org has no Linux builds.
+NODE_VERSION="26.13.1"
+NODE_SHA256="5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864"
+PYTHON_VERSION="3.15.2"
+PYTHON_BUILD="20261110"
+PYTHON_SHA256="ad23d1b73fac26440b0306ae06911031344c49a90ec19716c8362e7fa40cae43"
 
 guest_bin="${1:?usage: build.sh <spawn-guest-binary> <out.ext4>}"
 out="${2:?usage: build.sh <spawn-guest-binary> <out.ext4>}"
 
 root="$(mktemp -d)"
-trap 'sudo rm -rf "$root"' EXIT
+downloads="$(mktemp -d)"
+trap 'sudo rm -rf "$root" "$downloads"' EXIT
+
+# fetch <url> <sha256> <file>
+fetch() {
+  curl -fsSL --retry 3 -o "$downloads/$3" "$1"
+  echo "$2  $downloads/$3" | sha256sum -c --quiet
+}
 
 sudo debootstrap --variant=minbase --include="$PACKAGES" "$SUITE" "$root" "$MIRROR"
 sudo install -D -m 0755 "$guest_bin" "$root/usr/local/bin/spawn-guest"
+
+fetch "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" "$NODE_SHA256" node.tar.xz
+sudo tar -xJf "$downloads/node.tar.xz" -C "$root/usr/local" --strip-components=1 --no-same-owner \
+  --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'
+
+fetch "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD}/cpython-${PYTHON_VERSION}+${PYTHON_BUILD}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" \
+  "$PYTHON_SHA256" python.tar.gz
+sudo tar -xzf "$downloads/python.tar.gz" -C "$root/usr/local" --strip-components=1 --no-same-owner
+for link in python:python3 pip:pip3; do
+  [[ -e "$root/usr/local/bin/${link%%:*}" ]] || sudo ln -s "${link#*:}" "$root/usr/local/bin/${link%%:*}"
+done
+sudo chroot "$root" node --version
+sudo chroot "$root" python3 --version
 echo "spawnbox" | sudo tee "$root/etc/hostname" >/dev/null
 
 # Commands run as `user` (uid 1000), who may use sudo without a password.

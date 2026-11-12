@@ -125,7 +125,7 @@ These functions operate now:
 | Terminals | Open an interactive shell through a WebSocket. |
 | Browser sessions | Give a browser a short token for one sandbox. The token opens its terminal and its private preview URLs, without an API key. |
 | Git | Clone `https://` repositories. Use a secret for private repositories. |
-| Templates | Make your own sandbox image with `setup` and `warmup` commands. Start from the Debian base, a container image such as `node:22`, or an image-based `devcontainer.json`. |
+| Templates | Make your own sandbox image with `setup` and `warmup` commands. Start from the Debian base, which has Node.js 26 and Python 3.15, a container image such as `node:22`, or an image-based `devcontainer.json`. |
 | Warm pools | Keep VMs ready with paused vCPUs, so that a create takes approximately 8 ms. The pool size follows the number of creates. |
 | More than one host | Add worker hosts to one primary host. Clients use only the primary. The primary puts each sandbox on the host that has the most free space. Drain a worker to move its sandboxes to other hosts. Add an edge that sends commands, terminals, files and previews directly to the correct host. |
 | Build store | Keep template builds in an S3-compatible object store. Get a build from the store instead of building it again. Build each template on one host only: the other hosts wait and get it from the store. Set a limit for the disk that builds use. On a Firecracker host, start a sandbox before all of its memory is on the host. |
@@ -455,7 +455,7 @@ start as fast as sandboxes from the `base` template.
    ```sh
    curl -s -H "$A" $B/templates -d '{
      "name": "py",
-     "setup": ["apt-get update && apt-get install -y python3-pip nodejs"],
+     "setup": ["apt-get update && apt-get install -y build-essential", "pip install requests"],
      "env": {"PYTHONUNBUFFERED": "1"},
      "resources": {"vcpus": 2, "memory_mib": 2048, "disk_gib": 20}
    }'
@@ -473,8 +473,9 @@ start as fast as sandboxes from the `base` template.
    curl -s -H "$A" -d '{"template": "py"}' $B/sandboxes
    ```
 
-> **NOTE:** The base disk has no apt package lists. Run `apt-get update`
-> before you install packages.
+> **NOTE:** The base disk is Debian 13 with Node.js 26.13.1 (with npm) and
+> Python 3.15.2 (with pip) in `/usr/local`. It has no apt package lists.
+> Run `apt-get update` before you install packages.
 
 ### Start a template from a container image
 
@@ -2290,7 +2291,7 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `crates/spawn-proto` | The gRPC contract between the host and the guest |
 | `crates/spawn-bench` | The boot and restore benchmark |
 | `crates/spawnbox-cli` | The `spawnbox` CLI |
-| `guest/` | The guest kernel settings and the Debian base image |
+| `guest/` | The guest kernel settings and the Debian base image, with Node.js and Python |
 | `install.sh` | The one-line installer: downloads a release (or the code) and runs `deploy/install.sh` |
 | `deploy/install.sh` | The installer for one server, from a release bundle or the code |
 | `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |
