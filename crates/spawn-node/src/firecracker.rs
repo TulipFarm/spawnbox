@@ -220,6 +220,42 @@ pub async fn kill_cgroup(dir: &Path, tries: u32) -> bool {
     false
 }
 
+/// Kills every VM and gVisor process of this server at once, without an
+/// async runtime, and waits up to `wait` until they are gone. False if
+/// some are left.
+pub fn kill_all_now(wait: Duration) -> bool {
+    kill_children(&Path::new(CGROUP_ROOT).join(CGROUP_PARENT), wait)
+}
+
+fn kill_children(parent: &Path, wait: Duration) -> bool {
+    let children = || -> Vec<PathBuf> {
+        std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    };
+    for dir in children() {
+        let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = children().iter().any(|dir| {
+            std::fs::read_to_string(dir.join("cgroup.procs"))
+                .is_ok_and(|procs| !procs.trim().is_empty())
+        });
+        if !left {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A jail directory being filled before Firecracker starts.
 pub struct Jail {
     id: String,
@@ -600,6 +636,25 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_child_cgroup_is_killed() {
+        let parent = std::env::temp_dir().join(format!("spawnbox-cgroups-{}", std::process::id()));
+        assert!(kill_children(&parent, Duration::ZERO));
+        for id in ["a", "b"] {
+            std::fs::create_dir_all(parent.join(id)).unwrap();
+            std::fs::write(parent.join(id).join("cgroup.procs"), "").unwrap();
+        }
+        std::fs::write(parent.join("b").join("cgroup.procs"), "7\n").unwrap();
+        assert!(!kill_children(&parent, Duration::from_millis(50)));
+        for id in ["a", "b"] {
+            let kill = std::fs::read_to_string(parent.join(id).join("cgroup.kill")).unwrap();
+            assert_eq!(kill, "1");
+        }
+        std::fs::write(parent.join("b").join("cgroup.procs"), "").unwrap();
+        assert!(kill_children(&parent, Duration::ZERO));
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
 
     #[tokio::test]
     async fn a_cgroup_is_killed_once_it_is_empty() {

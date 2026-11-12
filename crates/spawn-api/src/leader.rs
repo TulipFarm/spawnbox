@@ -19,12 +19,24 @@ const LEASE_S: i64 = 15;
 const RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Longest wait for one database call.
 const CALL: Duration = Duration::from_secs(2);
-/// A leader stops when it has not renewed for this long: well before its
-/// lease runs out, even if the last call takes all of `CALL`.
-const GIVE_UP: Duration = Duration::from_secs(8);
-/// After losing the lease, how long the server has to stop its sandboxes
-/// before the process exits anyway: before the lease runs out.
-const EXIT_AFTER: Duration = Duration::from_secs(5);
+/// A leader stops when it has not renewed for this long.
+const GIVE_UP: Duration = Duration::from_secs(6);
+/// Longest wait for the processes of killed VMs to end.
+const KILL_WAIT: Duration = Duration::from_secs(1);
+/// After it gives up, how long the server has to record its sandboxes as
+/// stopped before the process exits.
+const EXIT_AFTER: Duration = Duration::from_secs(2);
+/// The latest a leader that cannot renew exits, counted from when its
+/// lease was last extended: the renewal may have taken all of `CALL`, the
+/// next check comes up to `RENEW_EVERY` and `CALL` late, and then it kills
+/// its VMs and exits. Less than the lease, so two never serve at once.
+const EXIT_BY: Duration = CALL
+    .saturating_add(GIVE_UP)
+    .saturating_add(RENEW_EVERY)
+    .saturating_add(CALL)
+    .saturating_add(KILL_WAIT)
+    .saturating_add(EXIT_AFTER);
+const _: () = assert!(EXIT_BY.as_secs() < LEASE_S as u64);
 
 /// Files under the data directory that every primary must have the same:
 /// the egress and fleet CAs and the browser session key.
@@ -69,7 +81,7 @@ pub fn host_id(data: &Path) -> Result<String> {
 pub struct Leading {
     /// Who held the lease before, if anyone did.
     pub previous: Option<String>,
-    /// Fires when the lease is lost. The process exits `EXIT_AFTER` later.
+    /// Fires when the lease is lost. The process exits soon after.
     pub lost: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -91,12 +103,21 @@ pub async fn lead(target: PgTarget, holder: String) -> Result<Leading> {
     Ok(Leading { previous, lost })
 }
 
-/// Tells the server to stop, then exits if it has not.
-async fn give_up(lost: tokio::sync::oneshot::Sender<()>) -> ! {
+/// Tells the server to stop and kills every VM here at once: the server
+/// may be stuck on the database. Exits `linger` later at most.
+async fn give_up(lost: tokio::sync::oneshot::Sender<()>, linger: Duration) -> ! {
     let _ = lost.send(());
-    tokio::time::sleep(EXIT_AFTER).await;
+    kill_vms();
+    tokio::time::sleep(linger).await;
     eprintln!("exiting without the leader lease");
     std::process::exit(1);
+}
+
+fn kill_vms() {
+    #[cfg(target_os = "linux")]
+    if !spawn_node::firecracker::kill_all_now(KILL_WAIT) {
+        eprintln!("warning: processes of some sandboxes are still running");
+    }
 }
 
 async fn hold(
@@ -135,7 +156,7 @@ async fn hold(
             Ok(Ok(true)) => renewed = Instant::now(),
             Ok(Ok(false)) => {
                 eprintln!("another primary took the leader lease; stopping");
-                give_up(lost).await;
+                give_up(lost, Duration::ZERO).await;
             }
             Ok(Err(_)) | Err(_) => client = None,
         }
@@ -144,7 +165,7 @@ async fn hold(
                 "cannot renew the leader lease for {} s; stopping so a standby can lead",
                 GIVE_UP.as_secs()
             );
-            give_up(lost).await;
+            give_up(lost, EXIT_AFTER).await;
         }
     }
 }

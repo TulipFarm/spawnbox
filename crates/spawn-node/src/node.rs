@@ -1391,10 +1391,12 @@ impl Node {
     /// Kills every process of sandbox `id`, whatever runs it. True once
     /// none is left.
     pub async fn kill(&self, id: &str) -> bool {
+        // First, as removing a container can take a while.
+        let gone = self.host.kill_cgroup(id).await;
         if let Some(runsc) = &self.runsc {
             runsc.remove(id).await;
         }
-        self.host.kill_cgroup(id).await
+        gone
     }
 
     pub async fn remove_failed(&self, id: &str, index: u32) {
