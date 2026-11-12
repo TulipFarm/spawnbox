@@ -14,14 +14,17 @@ Modes:
             checks the invariants below. At the end it wakes every
             persistent sandbox, checks its data and deletes what it made.
   failover  Runs the scenarios in --scenarios once, each against
-            persistent sandboxes with volumes:
+            persistent sandboxes on one host, most with a volume and some
+            without. Those without are woken while the host is still cut
+            off, so they start again elsewhere before it returns:
               worker     kill -9 a worker's server, then start it again
               partition  cut a worker off from the primary with iptables,
                          then heal it
               leader     kill -9 the leader (needs a standby host)
 
 Invariants:
-  lost       every persistent sandbox answers, with its volume marker
+  lost       every persistent sandbox answers (within --verify-wait while
+             its host restarts or its volume's host is away), with its volume marker
              intact, and its disk marker intact unless it was cold started
              since the marker was written; its env value is still there
   duplicate  a sandbox's VM never runs on two hosts at once, nor twice on
@@ -35,8 +38,9 @@ Invariants:
   growth     spawn-api's resident memory and open files on each host grow
              by less than --max-rss-growth-mib and --max-fd-growth from
              their values after --warmup
-  fencing    (failover) a cut-off worker stops its VMs before the primary
-             makes them cold, and a stale copy never runs again
+  fencing    (failover) no sample taken on a cut-off host after the API
+             made a sandbox cold shows its VM, during the cut, the 15 s
+             after, and after the host returns
   api        no request fails with 500 internal
 
 Hosts are reached with ssh as a user that can run ps, ip, nft, iptables and
@@ -69,6 +73,9 @@ import time
 import urllib.parse
 
 LIVE = ("starting", "running", "paused")
+# 503 codes that mean "not yet": the sandbox's host is restarting or cut
+# off, a wake is under way, or a volume's host is away.
+NOT_YET = ("node_unreachable", "sandbox_cold", "rebuilding", "volume_unavailable")
 VM_NAME = re.compile(r"sbx-[a-z0-9]{8,}")
 SOAK_NAME = re.compile(r"^soak-")
 
@@ -119,6 +126,8 @@ def parse_args(argv):
     p.add_argument("--node-port", type=int, default=7444)
     p.add_argument("--fence-after-s", type=int, default=60)
     p.add_argument("--fence-margin-s", type=int, default=30)
+    p.add_argument("--verify-wait", type=duration, default=duration("3m"),
+                   help="time a restarting host or an away volume may take before a sandbox counts as lost")
     p.add_argument("--summary", default="soak-summary.json")
     p.add_argument("--keep", action="store_true", help="do not delete the soak's sandboxes and volumes at the end")
     p.add_argument("--dry-run", action="store_true", help="print the plan and run read-only probes only")
@@ -382,7 +391,7 @@ class Soak:
             if not cursor:
                 return seen
 
-    def create(self, persistent):
+    def create(self, persistent, volume=True):
         self.seq += 1
         token = f"{int(time.time())}-{self.seq}-{self.rng.getrandbits(32):08x}"
         spec = {
@@ -392,14 +401,17 @@ class Soak:
         }
         if self.args.template:
             spec["template"] = self.args.template
-        volume = None
-        if persistent:
+        if not persistent or not volume:
+            volume = None
+        if volume:
             volume = f"soak-{self.seq}-{self.rng.getrandbits(16):04x}"
             status, out = self.call("POST", "/v1/volumes", {"name": volume, "size_gib": self.args.volume_gib, "tenant": self.args.tenant})
             if status not in (200, 201):
                 self.count("create_persistent", f"volume_{code(out) or status}")
                 return None
-            spec.update(persistent=True, volumes=[{"volume": volume, "path": "/data"}])
+            spec["volumes"] = [{"volume": volume, "path": "/data"}]
+        if persistent:
+            spec["persistent"] = True
         else:
             spec["timeout_s"] = 3600
         status, out = self.call("POST", "/v1/sandboxes", spec)
@@ -413,7 +425,8 @@ class Soak:
         rec = {"persistent": persistent, "token": token, "volume": volume, "disk_gen": None, "generation": out.get("generation", 1)}
         self.mine[sid] = rec
         if persistent:
-            stdout, exit_code, raw = self.exec(sid, f"echo {token} > /data/soak-marker && echo {token} > /root/soak-marker && sync && echo ok")
+            data = f"echo {token} > /data/soak-marker && " if volume else ""
+            stdout, exit_code, raw = self.exec(sid, f"{data}echo {token} > /root/soak-marker && sync && echo ok")
             if exit_code != 0 or (stdout or "").strip() != "ok":
                 self.violate("lost", f"{sid}: cannot write markers: {json.dumps(raw)[:300]}")
             else:
@@ -426,20 +439,23 @@ class Soak:
         s = self.get(sid)
         return s.get("generation") if s else None
 
-    def verify(self, sid, why):
-        """The sandbox answers and still has its data."""
+    def verify(self, sid, why, wait=None):
+        """The sandbox answers and still has its data. Answers that only mean
+        "not yet", such as a host that is restarting or a volume whose host
+        is away, are asked again for up to `wait` seconds; a persistent
+        sandbox that still does not answer then is lost."""
         rec = self.mine[sid]
-        stdout, exit_code, raw = self.exec(
-            sid, 'printf "%s|%s|%s" "$(cat /data/soak-marker 2>/dev/null)" "$(cat /root/soak-marker 2>/dev/null)" "$SOAK_TOKEN"'
-        )
+        deadline = time.time() + (self.args.verify_wait if wait is None else wait)
+        while True:
+            stdout, exit_code, raw = self.exec(
+                sid, 'printf "%s|%s|%s" "$(cat /data/soak-marker 2>/dev/null)" "$(cat /root/soak-marker 2>/dev/null)" "$SOAK_TOKEN"'
+            )
+            if stdout is not None or exit_code != 503 or code(raw) not in NOT_YET or time.time() >= deadline:
+                break
+            self.count("verify_wait", code(raw))
+            time.sleep(5)
         if stdout is None:
             if rec["persistent"]:
-                c = code(raw)
-                # A volume whose host is away cannot be mounted until it
-                # returns; that is a wait, not a loss.
-                if c == "volume_unavailable":
-                    self.count("verify", c)
-                    return False
                 self.violate("lost", f"{sid} ({why}) does not answer: {exit_code} {json.dumps(raw)[:300]}")
             return False
         vol, disk, env = (stdout.split("|") + ["", "", ""])[:3]
@@ -447,7 +463,7 @@ class Soak:
         if env != rec["token"]:
             self.violate("lost", f"{sid} ({why}): env SOAK_TOKEN is {env!r}")
         if rec["persistent"]:
-            if vol != rec["token"]:
+            if rec["volume"] and vol != rec["token"]:
                 self.violate("lost", f"{sid} ({why}): volume marker is {vol!r}, wanted {rec['token']!r}")
             if rec["disk_gen"] == gen and disk != rec["token"]:
                 self.violate("lost", f"{sid} ({why}): disk marker is {disk!r} at the same generation {gen}")
@@ -559,10 +575,8 @@ class Soak:
         time.sleep(3)
         self.hosts.run(host, self.args.server_start_cmd)
         self.baselines = {k: v for k, v in self.baselines.items() if k[0] != host}
-        for _ in range(120):
-            if self.api.healthy():
-                break
-            time.sleep(2)
+        if not self.wait_ready(host):
+            self.violate("api", f"{host} is not ready {self.args.verify_wait}s after a restart")
         # Ephemeral sandboxes on that host are gone by design.
         listing = self.listing() or {}
         for sid, rec in list(self.mine.items()):
@@ -725,41 +739,51 @@ class Soak:
 
     # --- failover --------------------------------------------------------
 
-    def watch_copies(self, ids, seconds, stop=None):
-        """Polls every host's processes and the API; returns per id when its
-        VM was last seen on each host, and when the API first said cold."""
+    def watch_copies(self, ids, seconds, cut_host, cold_at=None, until_cold=False, grace=15):
+        """Polls every host's processes and the API for `seconds`, or, with
+        `until_cold`, until every sandbox is cold and then `grace` more
+        seconds. Flags a sandbox running on two hosts, and any VM seen on
+        `cut_host` in a sample taken after the API said it was cold.
+        Returns per id when its VM was last seen on each host, and when the
+        API first said cold."""
         names = {host_name(s): s for s in ids}
-        last_seen, cold_at = {}, {}
+        last_seen = {}
+        cold_at = {} if cold_at is None else cold_at
         end = time.time() + seconds
         while time.time() < end:
-            t = time.time()
             where = {}
             for host in self.hosts.names():
+                t = time.time()
                 s = self.hosts.sample(host)
                 if s is None:
                     continue
                 for name in s["vms"]:
-                    if name in names:
-                        where.setdefault(name, []).append(host)
-                        last_seen[(names[name], host)] = t
-            for name, hosts in where.items():
+                    if name not in names:
+                        continue
+                    sid = names[name]
+                    where.setdefault(sid, []).append(host)
+                    last_seen[(sid, host)] = t
+                    if host == cut_host and sid in cold_at and t > cold_at[sid]:
+                        self.violate("fencing", f"{sid} still runs on {host} {round(t - cold_at[sid], 1)}s after it went cold")
+            for sid, hosts in where.items():
                 if len(hosts) > 1:
-                    self.violate("duplicate", f"{names[name]} runs on {hosts} during failover")
+                    self.violate("duplicate", f"{sid} runs on {hosts} at once")
             for sid in ids:
                 if sid not in cold_at:
                     v = self.get(sid)
                     if v and v.get("state") == "cold":
-                        cold_at[sid] = t
-            if stop and stop(last_seen, cold_at):
-                break
+                        cold_at[sid] = time.time()
+            if until_cold and len(cold_at) == len(ids):
+                end = min(end, time.time() + grace)
+                until_cold = False
             time.sleep(2)
         return last_seen, cold_at
 
-    def place(self, n, want_host):
+    def place(self, n, want_host, volume=True):
         """Creates persistent sandboxes until `n` run on `want_host`."""
         ids = []
         for _ in range(n * 6):
-            sid = self.create(True)
+            sid = self.create(True, volume)
             if not sid:
                 continue
             view = self.get(sid)
@@ -773,28 +797,42 @@ class Soak:
 
     def scenario(self, name, host, ids, cut, heal):
         """Runs one failover: `cut` breaks the host, then checks the design's
-        fencing order, cold starts elsewhere and the data, then `heal`."""
+        fencing order, cold starts elsewhere and the data, then `heal`.
+        Sandboxes without a volume are woken while the host is still cut, so
+        a second copy starts elsewhere before the old one could return."""
         result = {"scenario": name, "host": host, "sandboxes": ids}
         gens = {s: self.mine[s]["generation"] for s in ids}
+        bare = [s for s in ids if not self.mine[s]["volume"]]
         t0 = time.time()
         cut()
         fence = self.args.fence_after_s + self.args.fence_margin_s
-        last_seen, cold_at = self.watch_copies(ids, fence + 90, stop=lambda _, c: len(c) == len(ids))
+        last_seen, cold_at = self.watch_copies(ids, fence + 90, host, until_cold=True)
         gone = {s: round(last_seen.get((s, host), t0) - t0, 1) for s in ids}
         cold = {s: round(cold_at[s] - t0, 1) if s in cold_at else None for s in ids}
         result.update(vm_gone_s=gone, cold_s=cold)
-        self.log(f"{name}: VMs gone after {gone}, cold after {cold}")
+        self.log(f"{name}: VMs last seen on {host} after {gone}, cold after {cold}")
         for s in ids:
             if cold[s] is None:
                 self.violate("fencing", f"{name}: {s} never became cold")
-            elif cold[s] + 2 < gone[s]:
-                self.violate("fencing", f"{name}: {s} was cold at {cold[s]}s while its VM still ran on {host} until {gone[s]}s")
-        heal()
-        for s in ids:
-            if self.verify(s, name) and (self.mine[s]["generation"] or 0) <= (gens[s] or 0):
+
+        def moved(s, when):
+            if self.verify(s, f"{name} {when}") and (self.mine[s]["generation"] or 0) <= (gens[s] or 0):
                 self.violate("duplicate", f"{name}: {s} restarted at generation {self.mine[s]['generation']}")
+
+        for s in bare:
+            moved(s, "while cut")
+        if bare:
+            self.watch_copies(ids, 20, host, cold_at)
+        heal()
+        if not self.wait_ready(host):
+            self.violate("lost", f"{name}: {host} is not ready again, so its volumes cannot be checked")
         # A returning host must not start its stale copies again.
-        self.watch_copies(ids, 30)
+        self.watch_copies(ids, 30, host, cold_at)
+        for s in ids:
+            if s in bare:
+                self.verify(s, f"{name} after heal")
+            else:
+                moved(s, "after heal")
         result["violations"] = len(self.summary["violations"])
         self.summary["scenarios"].append(result)
 
@@ -814,7 +852,7 @@ class Soak:
                 self.violate("api", "cannot tell which primary is the leader")
                 continue
             self.log(f"== {name} on {host}")
-            ids = self.place(n, host)
+            ids = self.place(n, host) + self.place(max(1, n // 2), host, volume=False)
             if not ids:
                 self.log(f"{name}: no sandbox landed on {host}; skipped")
                 continue
@@ -857,16 +895,18 @@ class Soak:
         return "primary"
 
     def wait_ready(self, host):
-        for _ in range(90):
+        deadline = time.time() + self.args.verify_wait
+        while time.time() < deadline:
             if host in ("primary", "standby"):
                 if self.api.healthy():
-                    return
+                    return True
             else:
                 status, out = self.call("GET", f"/v1/nodes/{host}")
                 if status == 200 and out.get("state") == "ready":
-                    return
+                    return True
             time.sleep(2)
         self.log(f"{host} is not ready again")
+        return False
 
     # --- dry run ---------------------------------------------------------
 
