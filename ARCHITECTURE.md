@@ -375,7 +375,8 @@ lost. A cold sandbox has no VM.
   generation they started with. An update from an older generation does
   nothing.
 - **Placement.** Creates place persistent sandboxes on the primary.
-  Moving or draining one gives `409 conflict`. In a fleet, a cold start
+  Moving one gives `409 conflict`; a drain makes it cold instead (see
+  [More than one host](#more-than-one-host)). In a fleet, a cold start
   can run on any worker; see [Lost hosts and fencing](#lost-hosts-and-fencing).
   So a persistent sandbox changes host, including to a host with another
   fingerprint, only by becoming cold and starting there, never by a
@@ -865,7 +866,8 @@ little.
 
 **Drain and migration.** `POST /v1/nodes/{id}:drain` sets `draining` on
 the node row; placement skips it. With `{"migrate":true}` a background
-task moves its sandboxes, running ones first, and records `node.drained`.
+task moves its sandboxes, persistent ones first (they are made cold, not
+copied; see below), then running ones, and records `node.drained`.
 `POST /v1/sandboxes/{id}:migrate` moves one. The primary drives every
 move; workers never call each other:
 
@@ -911,6 +913,21 @@ sequenceDiagram
   reports a sandbox that now lives elsewhere, the heartbeat reply tells
   it to `release` the stale copy. A failed import aborts the source; if
   the target adopted it anyway, the next heartbeat releases it there.
+- **Persistent sandboxes** are never copied: a snapshot may not work on
+  another host, and two copies must never run. A drain pass takes them
+  first. If a volume homed on the worker has no ready, undrained host of
+  its backend, the sandbox stays and counts as failed. Otherwise, under
+  the move guard (calls wait), the primary sends
+  `/fleet/v1/evict {id, generation}`. The worker checks the generation,
+  flushes volumes, stops the VM, empties its cgroup, drops the snapshot
+  and makes its row cold (`sandbox.cold`, `drained`). Only after that
+  answer does the primary run `cool_on_node`, which changes the row only
+  if that node still holds that generation. A lost answer leaves the row
+  to the worker's reports, and a second evict of a cold row succeeds. A
+  worker from before this call answers `404`; the drain reports it as
+  too old. Then volumes move (a volume whose users are all cold can
+  move), and the sandboxes that were running cold-start elsewhere at the
+  next generation, so any old copy is stale and is destroyed.
 
 **Autoscaling.** With `--autoscale-hook`, a task on the primary
 (`fleet/autoscale.rs`) checks every 10 s. Load is the larger of used
@@ -944,8 +961,9 @@ flowchart TB
   the source to drop its file.
 - **Moves** take the write lock and need the sandbox to be the only user
   of its volumes. After the move, each volume's home is the target.
-- **Drain** moves the sandboxes, then copies the volumes no sandbox uses
-  to the host with the same backend and the most free memory.
+- **Drain** moves the sandboxes, then copies the volumes no sandbox
+  holds (users that are all `cold` hold nothing) to the host with the
+  same backend and the most free memory.
 - **Delete** marks the row deleted on the primary and tells the home to
   remove the file.
 
