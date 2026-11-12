@@ -421,6 +421,24 @@ pub async fn release_here(
     Ok(Json(json!({})))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Evict {
+    id: String,
+    generation: i64,
+}
+
+/// Stops a persistent sandbox here and makes it cold, for a drain.
+pub async fn evict_here(State(app): State<AppState>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    let evict: Evict = parse(&body)?;
+    let origin = Origin::system();
+    let was_running = app
+        .sandboxes
+        .evict(&evict.id, evict.generation, &origin)
+        .await?;
+    Ok(Json(json!({ "was_running": was_running })))
+}
+
 pub async fn abort_here(State(app): State<AppState>, body: Bytes) -> Result<Json<Value>, ApiError> {
     let one: One = parse(&body)?;
     app.sandboxes.abort_move(&one.id).await?;
@@ -856,41 +874,139 @@ pub struct Drained {
     pub volumes_failed: u32,
 }
 
-/// Moves every sandbox off `node`, running ones first, until it is
-/// undrained.
+fn still_draining(app: &App, node: &str) -> bool {
+    app.db
+        .get_node(node)
+        .ok()
+        .flatten()
+        .is_some_and(|n| n.draining && n.state != node_state::REMOVED)
+}
+
+/// The order a drain takes sandboxes in: persistent ones first, as they
+/// are stopped rather than copied, then running ones before paused ones.
+fn drain_order(sandboxes: &mut [db::Sandbox]) {
+    sandboxes.sort_by_key(|s| (!s.persistent, s.state != state::RUNNING));
+}
+
+/// Why an evict call failed, in words for the operator.
+fn evict_failure(node: &NodeRow, failure: Failure) -> ApiError {
+    match failure {
+        // A worker from before evictions sends the call on to its API,
+        // which has no such route.
+        Failure::Refused { status, error }
+            if status == StatusCode::NOT_FOUND && error.message == "no such endpoint"
+                || status == StatusCode::UNAUTHORIZED =>
+        {
+            ApiError::new(
+                Code::Conflict,
+                format!(
+                    "node {} is too old to stop persistent sandboxes for a drain; \
+                     upgrade it in place, or upgrade the primary first",
+                    node.id
+                ),
+            )
+        }
+        Failure::Refused { error, .. } => {
+            ApiError::new(error.code, format!("node {}: {}", node.id, error.message))
+        }
+        other => unreachable_or_broken(node, other),
+    }
+}
+
+/// Stops persistent sandbox `sandbox` on draining `node` and makes it cold,
+/// so it can start on another host with its volumes. Returns whether it
+/// was running. A sandbox whose volumes have nowhere to go stays.
+async fn evict(
+    app: &App,
+    p: &super::primary::Primary,
+    node: &NodeRow,
+    sandbox: &db::Sandbox,
+) -> Result<bool, ApiError> {
+    if let Some(why) = super::volumes::stuck(app, p, &node.id, sandbox) {
+        return Err(ApiError::new(Code::NoCapacity, why));
+    }
+    let _moving = p.moves.start(&sandbox.id)?;
+    let _busy = p.busy.hold(&node.id);
+    let tls = p.client(&node.id)?;
+    let body = json!({ "id": sandbox.id, "generation": sandbox.generation });
+    let reply: Value = forward::call(tls, &node.url, "/fleet/v1/evict", None, &body)
+        .await
+        .map_err(|f| evict_failure(node, f))?;
+    // The node stopped it. If the row changed since, the node's reports
+    // settle it.
+    app.db
+        .cool_on_node(&sandbox.id, &node.id, sandbox.generation)?;
+    Ok(reply
+        .get("was_running")
+        .and_then(Value::as_bool)
+        .unwrap_or(true))
+}
+
+/// Starts a sandbox a drain made cold on another host.
+async fn restart(app: &App, id: &str, origin: &Origin) -> Result<(), ApiError> {
+    super::primary::wake_cold(app, id, false).await?;
+    let cold_here = super::primary::node_of(app, id).is_none()
+        && app
+            .db
+            .get_sandbox(id)?
+            .is_some_and(|s| s.state == state::COLD && s.node.is_none());
+    if cold_here {
+        app.sandboxes.resume(id, origin).await?;
+    }
+    Ok(())
+}
+
+/// Moves every sandbox off `node` until it is undrained. Persistent
+/// sandboxes cannot be copied between hosts, so they are stopped there and
+/// started again elsewhere from their disk and volumes: those that ran
+/// start now, paused ones on their next call. Plain sandboxes move with
+/// their memory. Then the volumes left there move.
 pub async fn drain(app: AppState, node: String, origin: Origin) -> Drained {
     let mut sandboxes = app.db.node_sandboxes(&node).unwrap_or_default();
-    sandboxes.sort_by_key(|s| s.state != state::RUNNING);
-    let (mut moved, mut failed) = (0u32, 0u32);
+    drain_order(&mut sandboxes);
+    let (mut moved, mut failed, mut cold) = (0u32, 0u32, 0u32);
+    let mut to_start = Vec::new();
+    let row = app.db.get_node(&node).ok().flatten();
     for sandbox in sandboxes {
-        let draining = app
-            .db
-            .get_node(&node)
-            .ok()
-            .flatten()
-            .is_some_and(|n| n.draining && n.state != node_state::REMOVED);
-        if !draining {
+        if !still_draining(&app, &node) {
             eprintln!("node {node} is no longer draining; stopped moving sandboxes");
             break;
         }
-        match migrate(&app, &sandbox.id, MigrateInput::default(), &origin).await {
-            Ok(_) => moved += 1,
+        let result = if sandbox.persistent {
+            match (super::primary::primary(&app), &row) {
+                (Ok(p), Some(row)) => evict(&app, p, row, &sandbox).await.map(|ran| {
+                    cold += 1;
+                    if ran {
+                        to_start.push(sandbox.id.clone());
+                    }
+                }),
+                _ => Err(ApiError::internal("not a primary")),
+            }
+        } else {
+            migrate(&app, &sandbox.id, MigrateInput::default(), &origin)
+                .await
+                .map(|_| moved += 1)
+        };
+        if let Err(error) = result {
+            eprintln!("drain {node}: {}: {}", sandbox.id, error.message);
+            failed += 1;
+        }
+    }
+    let (volumes_moved, volumes_failed) = match super::primary::primary(&app) {
+        Ok(p) if still_draining(&app, &node) => super::volumes::evacuate(&app, p, &node).await,
+        _ => (0, 0),
+    };
+    let (mut restarted, mut restart_failed) = (0u32, 0u32);
+    for id in to_start {
+        match restart(&app, &id, &origin).await {
+            Ok(()) => restarted += 1,
             Err(error) => {
-                eprintln!("drain {node}: {}: {}", sandbox.id, error.message);
-                failed += 1;
+                // It stays cold and starts on its next call.
+                eprintln!("drain {node}: start {id}: {}", error.message);
+                restart_failed += 1;
             }
         }
     }
-    let draining = app
-        .db
-        .get_node(&node)
-        .ok()
-        .flatten()
-        .is_some_and(|n| n.draining && n.state != node_state::REMOVED);
-    let (volumes_moved, volumes_failed) = match super::primary::primary(&app) {
-        Ok(p) if draining => super::volumes::evacuate(&app, p, &node).await,
-        _ => (0, 0),
-    };
     app.sandboxes.hub.record(
         "node.drained",
         &origin,
@@ -900,6 +1016,9 @@ pub async fn drain(app: AppState, node: String, origin: Origin) -> Drained {
             "node": node,
             "moved": moved,
             "failed": failed,
+            "persistent_cold": cold,
+            "restarted": restarted,
+            "restart_failed": restart_failed,
             "volumes_moved": volumes_moved,
             "volumes_failed": volumes_failed,
             "complete": failed == 0 && volumes_failed == 0,
@@ -965,6 +1084,64 @@ mod tests {
             .unwrap()
             .set_len(64 << 20)
             .unwrap();
+    }
+
+    #[test]
+    fn a_drain_stops_persistent_sandboxes_first() {
+        let mut sandboxes: Vec<db::Sandbox> = [
+            ("a", state::PAUSED, false),
+            ("b", state::RUNNING, false),
+            ("c", state::PAUSED, true),
+            ("d", state::RUNNING, true),
+        ]
+        .into_iter()
+        .map(|(id, state, persistent)| db::Sandbox {
+            id: id.into(),
+            state: state.into(),
+            persistent,
+            ..header().sandbox
+        })
+        .collect();
+        drain_order(&mut sandboxes);
+        let ids: Vec<&str> = sandboxes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn an_old_worker_is_told_apart_from_a_refusal() {
+        let node = NodeRow {
+            id: "nod_a".into(),
+            url: "https://10.0.0.2:7443".into(),
+            state: node_state::READY.into(),
+            boot: None,
+            seq: 0,
+            report: None,
+            last_seen: None,
+            created_at: 0,
+            removed_at: None,
+            draining: true,
+            kind: db::node_kind::WORKER.into(),
+        };
+        let old = evict_failure(
+            &node,
+            Failure::Refused {
+                status: StatusCode::NOT_FOUND,
+                error: ApiError::new(Code::NotFound, "no such endpoint"),
+            },
+        );
+        assert_eq!(old.code, Code::Conflict);
+        assert!(old.message.contains("too old"), "{}", old.message);
+        let gone = evict_failure(
+            &node,
+            Failure::Refused {
+                status: StatusCode::NOT_FOUND,
+                error: ApiError::new(Code::NotFound, "sandbox not found"),
+            },
+        );
+        assert_eq!(gone.code, Code::NotFound);
+        assert!(!gone.message.contains("too old"));
+        let down = evict_failure(&node, Failure::Unreachable(anyhow::anyhow!("refused")));
+        assert_eq!(down.code, Code::NodeUnreachable);
     }
 
     #[test]

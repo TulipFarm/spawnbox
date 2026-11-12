@@ -285,6 +285,7 @@ async fn heartbeat(app: &App, w: &Worker) -> Result<()> {
         sandboxes: app.db.local_report(now - REPORT_ENDED_MS)?,
         self_fence: w.self_fence,
         fence_after_s: w.fence_after.as_secs(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     let reply: HeartbeatReply = tokio::time::timeout(
         heartbeat_timeout(w.fence_after),
@@ -443,6 +444,7 @@ pub fn router(app: AppState) -> Router {
         .route("/fleet/v1/migrate/import", post(migrate::import_here))
         .route("/fleet/v1/migrate/release", post(migrate::release_here))
         .route("/fleet/v1/migrate/abort", post(migrate::abort_here))
+        .route("/fleet/v1/evict", post(migrate::evict_here))
         .route("/fleet/v1/volumes/put", post(super::volumes::put_here))
         .route(
             "/fleet/v1/volumes/export",

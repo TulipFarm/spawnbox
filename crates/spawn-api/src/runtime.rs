@@ -3110,6 +3110,86 @@ impl Sandboxes {
         Ok(())
     }
 
+    /// Stops persistent sandbox `id` of `generation` here and makes it cold,
+    /// so another host can start it: a drain. Its volumes are flushed
+    /// first; its memory and files outside volumes are lost, as in any cold
+    /// start. Returns whether it was running. A sandbox already cold here is
+    /// not an error, so the primary can ask again after a lost reply.
+    pub async fn evict(
+        &self,
+        id: &str,
+        generation: i64,
+        origin: &Origin,
+    ) -> Result<bool, ApiError> {
+        let Some(lock) = self.record_lock(id) else {
+            return match self.db.get_sandbox(id)? {
+                Some(row)
+                    if row.persistent
+                        && row.state == state::COLD
+                        && row.generation == generation =>
+                {
+                    Ok(false)
+                }
+                _ => Err(self.not_running(id)),
+            };
+        };
+        let _changing = lock.lock().await;
+        let mut record = {
+            let mut inner = self.inner();
+            let Some(record) = inner.records.get(id) else {
+                return Err(self.not_running(id));
+            };
+            if !record.persistent {
+                return Err(ApiError::new(Code::Conflict, "sandbox is not persistent"));
+            }
+            if record.generation != generation {
+                return Err(ApiError::new(
+                    Code::Conflict,
+                    format!(
+                        "this host runs generation {}, not {generation}",
+                        record.generation
+                    ),
+                ));
+            }
+            if record.is_moving() {
+                return Err(ApiError::new(
+                    Code::Conflict,
+                    "sandbox is moving to another host",
+                ));
+            }
+            inner
+                .records
+                .remove(id)
+                .ok_or_else(|| self.not_running(id))?
+        };
+        self.settle(id, &mut record, now_ms());
+        let was_running = matches!(record.vm, VmState::Running(_));
+        if let VmState::Running(live) = record.vm {
+            let Live {
+                vm,
+                channel,
+                index,
+                volumes,
+                ..
+            } = *live;
+            if volumes {
+                flush(&channel).await;
+            }
+            drop(channel);
+            vm.stop().await;
+            self.release(index);
+        }
+        remove_dir(&self.paused_dir(id));
+        if !self.node.kill(&ids::host_name(id)).await {
+            return Err(ApiError::internal(format!(
+                "{id}: processes are left in its cgroup"
+            )));
+        }
+        self.db.set_cold(id, generation)?;
+        self.cold_event(origin, &record.tenant, id, "drained");
+        Ok(was_running)
+    }
+
     /// Ends a move that failed: the sandbox stays here, and runs again if
     /// it ran before.
     pub async fn abort_move(&self, id: &str) -> Result<(), ApiError> {
