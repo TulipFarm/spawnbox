@@ -906,14 +906,24 @@ async fn run(
         }
         std::future::pending().await
     };
+    let fencing: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::default();
+    let fenced = Arc::clone(&fencing);
     let shutdown = async move {
         let fence = tokio::select! {
             () = shutdown_signal() => false,
             () = lease_lost => true,
         };
         if fence {
+            // Another primary may lead now, so stop taking calls at once.
             eprintln!("lost the leader lease; stopping persistent sandboxes");
-            on_shutdown.sandboxes.fence_all("lease_lost").await;
+            let task = tokio::spawn(async move {
+                on_shutdown.sandboxes.fence_all("lease_lost").await;
+                on_shutdown.templates.close();
+                on_shutdown.sandboxes.stop_all().await;
+                on_shutdown.sandboxes.hub.stop_feeds();
+            });
+            *fenced.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+            return;
         }
         eprintln!("stopping all sandboxes");
         on_shutdown.templates.close();
@@ -1002,6 +1012,10 @@ async fn run(
     };
     for task in background {
         task.abort();
+    }
+    let fence = fencing.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(fence) = fence {
+        let _ = fence.await;
     }
     app.templates.close();
     app.sandboxes.stop_all().await;
