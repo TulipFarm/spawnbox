@@ -1,8 +1,9 @@
 import type { APIRoute } from "astro";
+import { docPages } from "../data/docs";
 import { useCases } from "../data/use-cases";
 
 export const GET: APIRoute = ({ site }) => {
-  const paths = ["/", "/use-cases/", ...useCases.map((u) => `/use-cases/${u.slug}/`)];
+  const paths = ["/", "/use-cases/", ...useCases.map((u) => `/use-cases/${u.slug}/`), "/docs/", ...docPages.map((p) => `/docs/${p.slug}/`)];
   const urls = paths.map((p) => `  <url><loc>${new URL(p, site)}</loc></url>`).join("\n");
   return new Response(
     `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`,

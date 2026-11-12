@@ -1,0 +1,110 @@
+---
+import { getCollection, render } from "astro:content";
+import Page from "../../layouts/Page.astro";
+import { docPages, repoUrl, slugify } from "../../data/docs";
+import "../../styles/use-cases.css";
+import "../../styles/docs.css";
+
+export async function getStaticPaths() {
+  const entries = await getCollection("docs");
+  return docPages.map((page) => ({ params: { slug: page.slug }, props: { entry: entries.find((e) => e.id === page.slug)! } }));
+}
+
+const { entry } = Astro.props;
+const { Content, headings } = await render(entry);
+const i = docPages.findIndex((p) => p.slug === entry.id);
+const page = docPages[i];
+const prev = docPages[i - 1];
+const next = docPages[i + 1];
+const toc = headings.filter((h) => h.depth === 2);
+const article = {
+  "@type": "TechArticle",
+  headline: page.name,
+  description: page.description,
+  url: new URL(`/docs/${page.slug}/`, Astro.site).href,
+  isBasedOn: `${repoUrl}#${slugify(page.heading)}`,
+  inLanguage: "en",
+};
+---
+
+<Page
+  title={`${page.name} — Spawnbox docs`}
+  description={page.description}
+  current="docs"
+  og={`docs-${page.slug}`}
+  ogAlt={`Spawnbox docs: ${page.name}. ${page.description}`}
+  crumbs={[["Docs", "/docs/"], [page.name, `/docs/${page.slug}/`]]}
+  schema={[article]}
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/docs/">Docs</a><span aria-hidden="true">/</span><span aria-current="page">{page.name}</span>
+  </nav>
+
+  <div class="docs">
+    <nav class="docs-nav" aria-label="Docs pages">
+      <span class="docs-k">DOCS</span>
+      <ol>
+        {
+          docPages.map((p) => (
+            <li>
+              <a href={`/docs/${p.slug}/`} aria-current={p.slug === page.slug ? "page" : undefined}>
+                {p.name}
+              </a>
+            </li>
+          ))
+        }
+      </ol>
+    </nav>
+
+    <article class="prose">
+      <h1>{page.name}</h1>
+      <p class="lede">{page.description}</p>
+      <Content />
+      <p class="docs-src">
+        This page is the <a href={`${repoUrl}#${slugify(page.heading)}`}>“{page.heading}” section of README.md ↗</a>.
+        Found a mistake? <a href={`${repoUrl}/edit/main/README.md`}>Edit it on GitHub ↗</a>
+      </p>
+      <nav class="pager" aria-label="More docs">
+        {
+          prev ? (
+            <a href={`/docs/${prev.slug}/`}>
+              <span class="k">← PREVIOUS</span>
+              <span>{prev.name}</span>
+            </a>
+          ) : (
+            <span />
+          )
+        }
+        <a href="/docs/" class="all">
+          <span class="k">INDEX</span>
+          <span>All docs</span>
+        </a>
+        {
+          next ? (
+            <a href={`/docs/${next.slug}/`} class="nx">
+              <span class="k">NEXT →</span>
+              <span>{next.name}</span>
+            </a>
+          ) : (
+            <span />
+          )
+        }
+      </nav>
+    </article>
+
+    {
+      toc.length > 1 && (
+        <nav class="docs-toc" aria-label="On this page">
+          <span class="docs-k">ON THIS PAGE</span>
+          <ol>
+            {toc.map((h) => (
+              <li>
+                <a href={`#${h.slug}`}>{h.text}</a>
+              </li>
+            ))}
+          </ol>
+        </nav>
+      )
+    }
+  </div>
+</Page>

@@ -5,7 +5,7 @@ import "../styles/base.css";
 interface Props {
   title: string;
   description: string;
-  current?: "use-cases";
+  current?: "use-cases" | "docs";
   /** Key of the card in lib/og.ts that becomes /og/<key>.png. */
   og: string;
   ogAlt: string;
@@ -65,6 +65,7 @@ const jsonLd = {
 const jsonLdText = JSON.stringify(jsonLd).replace(/</g, "\\u003c");
 const links = [
   ["/use-cases/", "Use cases", "use-cases"],
+  ["/docs/", "Docs", "docs"],
   ["/#features", "Features", ""],
   ["/#how", "How it works", ""],
   ["/#compare", "Compare", ""],

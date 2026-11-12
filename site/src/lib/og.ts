@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Resvg } from "@resvg/resvg-js";
 import satori from "satori";
+import { docPages } from "../data/docs";
 import { useCases } from "../data/use-cases";
 
 export interface OgCard {
@@ -36,6 +37,15 @@ export const ogCards: Record<string, OgCard> = {
         planned: u.status === "soon",
       },
     ]),
+  ),
+  docs: {
+    eyebrow: "DOCS",
+    h1: "Docs.",
+    hl: "Install, use, run.",
+    summary: "Getting started, the CLI, guides, fleets, the API reference, configuration and troubleshooting.",
+  },
+  ...Object.fromEntries(
+    docPages.map((p) => [`docs-${p.slug}`, { eyebrow: "DOCS", h1: `${p.name}.`, hl: "Spawnbox docs", summary: p.description }]),
   ),
 };
 

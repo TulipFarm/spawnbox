@@ -4,7 +4,7 @@
 !.env.example
 .DS_Store
 __pycache__/
-docs/
+/docs/
 .terraform/
 .terraform.lock.hcl
 *.tfstate
