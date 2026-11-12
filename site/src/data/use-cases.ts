@@ -317,14 +317,14 @@ X-Spawnbox-Step: call_7f3
   {
     slug: "coding-agents",
     name: "Coding agents",
-    status: "soon",
+    status: "today",
     summary: "Run Claude Code, Codex or Copilot CLI on a real repo, with root in its own microVM.",
     title: "Run coding agents in sandboxes — Spawnbox",
     description:
       "Run Claude Code, Codex or Copilot CLI on a real repo in a Firecracker microVM on your own servers. API keys stay outside the sandbox.",
     h1: "Let coding agents break things.",
     hl: "Only their own sandbox breaks.",
-    lede: "Run Claude Code, Codex or Copilot CLI on a real repo, with root in its own microVM. This runs today on a plain sandbox: our scale test ran 768 Claude Code agents at once, and every one finished. Ready-made agent templates and a guide are coming.",
+    lede: "Run Claude Code, Codex or Copilot CLI on a real repo, with root in its own microVM. Spawnbox has a ready-made template for each one. Our scale test ran 768 Claude Code agents at once, and every one finished.",
     actor: "YOUR AGENT",
     inside: "claude -p",
     logos: ["claude", "codex", "copilot"],
@@ -332,32 +332,41 @@ X-Spawnbox-Step: call_7f3
       title: "Any agent with a command line, for example",
       items: [["claude", "Claude Code"], ["codex", "Codex"], ["copilot", "Copilot CLI"], ["gemini", "Gemini CLI"]],
     },
-    first: "POST /v1/templates",
-    note: soonNote,
+    first: "POST /v1/sandboxes",
     stops: [
       {
         lane: "api",
-        title: "Make a template with the agent in it",
-        body: "Spawnbox runs the setup one time and saves a snapshot. The response is 202 with a build. Wait until the build is ready, or the next step gives 409.",
+        title: "Build the agent template once",
+        body: "The templates folder of the Spawnbox repo has claude-code, codex and copilot. Each installs one pinned npm release on the base disk, with Node.js 26. A build takes a few minutes, one time for each server. From the next release, a new install builds all three for you.",
         call: {
-          lang: "http",
-          code: `POST /v1/templates
-
-{"name": "claude",
- "base": "node:22-bookworm-slim",
- "setup": ["npm install -g @anthropic-ai/claude-code"],
- "resources": {"vcpus": 2, "memory_mib": 2048}}`,
+          lang: "bash",
+          code: `# waits until the build is ready
+spawnbox templates build templates/claude-code.json`,
         },
       },
       {
         lane: "api",
-        title: "Start it with the keys outside",
-        body: "Save the model key with header x-api-key for api.anthropic.com. The agent sees a placeholder. The sandbox can reach only the model API, GitHub and npm.",
+        title: "Keep the model key outside",
+        body: "Save the key as a held secret. Claude Code sends it in the x-api-key header. The agent sees only a placeholder. The proxy puts the real key in requests to api.anthropic.com.",
+        call: {
+          lang: "http",
+          code: `POST /v1/secrets
+
+{"name": "anthropic", "type": "http_header",
+ "value": "sk-ant-...", "env": "ANTHROPIC_API_KEY",
+ "allowed_hosts": ["api.anthropic.com"],
+ "header": "x-api-key", "format": "{value}"}`,
+        },
+      },
+      {
+        lane: "api",
+        title: "Start a sandbox from the template",
+        body: "It starts from the saved snapshot, with the agent already installed. On our test host this took about 0.1 s. The sandbox can reach only the model API, GitHub and npm.",
         call: {
           lang: "http",
           code: `POST /v1/sandboxes
 
-{"template": "claude",
+{"template": "claude-code",
  "secrets": ["anthropic", "github"],
  "egress": {"mode": "allowlist", "allow": [
    "api.anthropic.com", "github.com",
@@ -402,14 +411,10 @@ Accept: text/event-stream
         call: { lang: "http", code: `POST /v1/sandboxes/$S:fork\n\n{"count": 3}` },
         events: [["sandbox.forked", "3 copies"]],
       },
-      {
-        lane: "api",
-        title: "Coming: ready-made agent templates",
-        body: "Templates for Claude Code, Codex and Copilot CLI that you can start without a setup step, and a step-by-step guide.",
-        planned: true,
-      },
     ],
     limits: [
+      "Each template pins one release of its agent. To update the agent, change the version in its file and build the template again.",
+      "Copilot CLI has no held-secret setup yet, because we have not checked which hosts it sends its token to.",
       "Fork does not work on a paused sandbox or on a sandbox with volumes.",
       "Each copy counts against the quotas of the tenant.",
       "The agent's own settings (permissions, models) are up to you. Spawnbox controls what the sandbox can reach, not what the agent decides.",
