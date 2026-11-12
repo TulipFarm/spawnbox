@@ -1,0 +1,64 @@
+---
+import { Code } from "astro:components";
+import Page from "../../layouts/Page.astro";
+import { docPages, repoUrl } from "../../data/docs";
+import "../../styles/use-cases.css";
+import "../../styles/docs.css";
+
+const pad = (x: number) => String(x).padStart(2, "0");
+const list = {
+  "@type": "ItemList",
+  name: "Spawnbox docs",
+  numberOfItems: docPages.length,
+  itemListElement: docPages.map((p, i) => ({
+    "@type": "ListItem",
+    position: i + 1,
+    name: p.name,
+    url: new URL(`/docs/${p.slug}/`, Astro.site).href,
+  })),
+};
+---
+
+<Page
+  title="Docs — Spawnbox"
+  description="How to install, use and run Spawnbox: getting started, the CLI, guides, fleets, the API reference, configuration and troubleshooting."
+  current="docs"
+  og="docs"
+  ogAlt="Spawnbox docs: getting started, CLI, guides, fleets, API reference, configuration and troubleshooting."
+  crumbs={[["Docs", "/docs/"]]}
+  schema={[list]}
+  pageType="CollectionPage"
+>
+  <section class="hero idx-hero">
+    <h1>
+      Docs.
+      <span class="hl">Install, use, run.</span>
+    </h1>
+    <p class="lede">
+      Every page here comes from the <a href={`${repoUrl}#readme`}>Spawnbox README ↗</a>, so it matches the code on the main
+      branch. Start with one line on a Linux host:
+    </p>
+    <div class="docs-install">
+      <Code code="curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh" lang="bash" theme="github-light" />
+    </div>
+  </section>
+
+  <section class="idx" aria-labelledby="docs-h">
+    <h2 id="docs-h" class="visually-hidden">All docs pages</h2>
+    <ol class="docs-list">
+      {
+        docPages.map((p, n) => (
+          <li>
+            <span class="idx-no">DOC-{pad(n + 1)}</span>
+            <div>
+              <h3>
+                <a href={`/docs/${p.slug}/`}>{p.name}</a>
+              </h3>
+              <p>{p.description}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+</Page>
