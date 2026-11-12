@@ -2,7 +2,7 @@
 # Backs up, or restores, the state a Spawnbox server needs to start again
 # with every tenant, key, template, sandbox record and secret it had:
 #
-#   the database   SQLite (spawnbox.db, copied with sqlite3 .backup) or
+#   the database   SQLite (spawnbox.db, copied with sqlite3 VACUUM INTO) or
 #                  Postgres (pg_dump of the --database-url database)
 #   secrets.key    the key that seals secrets, sandbox env and CA keys
 #   key files      session.key, the egress CA and the fleet CA
@@ -138,7 +138,10 @@ backup() {
   else
     need sqlite3
     [[ -f "$data/spawnbox.db" ]] || die "no database at $data/spawnbox.db"
-    sqlite3 "$data/spawnbox.db" ".backup '$stage/spawnbox.db'" || die "sqlite3 .backup failed"
+    # VACUUM INTO copies one read snapshot, so writes by the running server
+    # do not make it start again, as .backup does.
+    sqlite3 -cmd '.timeout 60000' "$data/spawnbox.db" \
+      "VACUUM INTO '${stage//\'/\'\'}/spawnbox.db'" || die "sqlite3 VACUUM INTO failed"
   fi
   cp "$key_file" "$stage/secrets.key"
   for file in "${files[@]}"; do

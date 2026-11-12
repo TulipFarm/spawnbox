@@ -1653,7 +1653,7 @@ are not backed up: their state comes from the primary.
 Each backup is one file, `spawnbox-<UTC time>.tar.gpg`. It is a tar
 archive, encrypted with gpg (AES-256) under a passphrase. It contains:
 
-- The database: a copy of `spawnbox.db` made with `sqlite3 .backup`, or,
+- The database: a copy of `spawnbox.db` made with `sqlite3 VACUUM INTO`, or,
   with `--database-url`, a `pg_dump` of the Postgres database. This has
   the tenants, keys, templates and their specs, sandbox records and start
   records, events, volumes records, the fleet and the encrypted secrets
@@ -2503,7 +2503,7 @@ Type these commands on the host.
 | A snapshot gives `409 protected_env` | The sandbox was created with `env` values, which the template would show | Use secrets for the values, or create the sandbox without `env`. |
 | The server stops at start with `cannot read the stored env of ...` | `secrets.key` is not the key that encrypted them, or their rows are damaged | Put back the earlier `secrets.key`, or set `--secrets-key-file`, and restart. If the key is right, add `--allow-unreadable-env` to start without those sandboxes; they stay as they are. |
 | You are not sure that `secrets.key` reads the database, for example after you moved or restored it | | Stop the server and type `sudo /opt/spawnbox/bin/spawn-api check-data` (add `--database-url` for Postgres). It decrypts each secret, sandbox env and CA key, and tells which ones fail. |
-| `spawnbox-backup.service` fails | The passphrase file is missing, the target cannot be written, or `pg_dump` is older than the database server | Read `sudo journalctl -u spawnbox-backup`. Refer to [Back up and restore](#back-up-and-restore). |
+| `spawnbox-backup.service` fails | The passphrase file is missing, the target cannot be written, `pg_dump` is older than the database server, or the backup ran longer than its 4-hour limit (`TimeoutStartSec`) | Read `sudo journalctl -u spawnbox-backup`. Refer to [Back up and restore](#back-up-and-restore). |
 | The server stops at start with `downgrades are not supported` | An earlier release runs on a database that a newer release changed | Install the newer release again, or restore the backup from before the upgrade. |
 | A move gives `no host has the same backend, kernel, base disk, Firecracker or runsc, egress CA and CPU model` | The hosts have different backends, files or CPUs | Compare `fingerprint`, `backend` and `cpu` in `GET /v1/nodes`. Sandboxes cannot move between Firecracker and gVisor hosts. Copy `/opt/spawnbox/vmlinux` and `/opt/spawnbox/rootfs.ext4` from the primary to the worker, then restart the worker. |
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |

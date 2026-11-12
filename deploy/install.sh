@@ -219,6 +219,7 @@ After=spawnbox.service
 [Service]
 Type=oneshot
 ExecStart=$prefix/backup.sh
+TimeoutStartSec=4h
 Nice=10
 IOSchedulingClass=idle
 EOF

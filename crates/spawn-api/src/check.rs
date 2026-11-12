@@ -266,9 +266,10 @@ mod tests {
         std::fs::write(&passphrase, "a test passphrase\n").unwrap();
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/backup.sh");
-        let run = |args: &[&str], passphrase: &std::path::Path| {
-            let mut cmd = Command::new("bash");
-            cmd.arg(&script)
+        let run_within = |seconds: u32, args: &[&str], passphrase: &std::path::Path| {
+            let mut cmd = Command::new("timeout");
+            cmd.args([&seconds.to_string(), "bash"])
+                .arg(&script)
                 .args(args)
                 .env("SPAWNBOX_BACKUP_CONFIG", dir.join("none"))
                 .env("SPAWNBOX_ENV_FILE", dir.join("none"))
@@ -288,6 +289,7 @@ mod tests {
             }
             cmd.output().unwrap()
         };
+        let run = |args: &[&str], passphrase: &std::path::Path| run_within(300, args, passphrase);
         let ok = |out: std::process::Output| {
             assert!(
                 out.status.success(),
@@ -296,7 +298,39 @@ mod tests {
             );
         };
 
-        ok(run(&[], &passphrase));
+        // The first backup runs while another connection keeps writing, as
+        // a busy server does. The database is large enough that a copy made
+        // in steps (sqlite3 .backup) starts again after each write and does
+        // not end in time; one read snapshot takes a few seconds.
+        let writes = url.is_none().then(|| {
+            let conn = rusqlite::Connection::open(data.join(crate::DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE busy (n INTEGER, pad BLOB);
+                 WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 20000)
+                 INSERT INTO busy SELECT n, zeroblob(4000) FROM i;",
+            )
+            .unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = std::thread::spawn({
+                let stop = stop.clone();
+                move || {
+                    let mut n = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        conn.execute("UPDATE busy SET n = n + 1 WHERE rowid = 1", ())
+                            .unwrap();
+                        n += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    n
+                }
+            });
+            (stop, writer)
+        });
+        ok(run_within(60, &[], &passphrase));
+        if let Some((stop, writer)) = writes {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(writer.join().unwrap() > 0);
+        }
         // Backups are named by the second.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         ok(run(&[], &passphrase));

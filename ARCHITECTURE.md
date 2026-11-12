@@ -1071,7 +1071,8 @@ another primary, and taking the lease from it is a failover.
 
 `deploy/backup.sh`, run daily by `spawnbox-backup.timer` on the primary,
 writes one gpg-encrypted (AES-256, passphrase) tar archive with the
-database (`sqlite3 .backup` or `pg_dump --format=custom`), `secrets.key`,
+database (`sqlite3 VACUUM INTO`, one read snapshot that the server's
+writes do not restart, or `pg_dump --format=custom`), `secrets.key`,
 `session.key`, the egress CA and the fleet CA, and a manifest. It keeps
 the newest `SPAWNBOX_BACKUP_KEEP` archives in a directory or an S3
 prefix. Builds, paused sandbox files, volumes and `host-id` are left out:
