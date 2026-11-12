@@ -6,6 +6,7 @@
 //! time.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -38,9 +39,17 @@ const EXIT_BY: Duration = CALL
     .saturating_add(EXIT_AFTER);
 const _: () = assert!(EXIT_BY.as_secs() < LEASE_S as u64);
 
+/// The term of the lease this process holds; 0 until it leads.
+static TERM: AtomicI64 = AtomicI64::new(0);
+
+/// The term of the lease this process holds, if it leads.
+pub fn term() -> Option<i64> {
+    Some(TERM.load(Ordering::Relaxed)).filter(|t| *t > 0)
+}
+
 /// Files under the data directory that every primary must have the same:
 /// the egress and fleet CAs and the browser session key.
-const SHARED: &[&str] = &[
+pub const SHARED: &[&str] = &[
     "egress-ca.crt",
     "egress-ca.key",
     "fleet/ca.crt",
@@ -106,6 +115,7 @@ pub async fn lead(target: PgTarget, holder: String) -> Result<Leading> {
 /// Tells the server to stop and kills every VM here at once: the server
 /// may be stuck on the database. Exits `linger` later at most.
 async fn give_up(lost: tokio::sync::oneshot::Sender<()>, linger: Duration) -> ! {
+    TERM.store(0, Ordering::Relaxed);
     let _ = lost.send(());
     kill_vms();
     tokio::time::sleep(linger).await;
@@ -145,6 +155,7 @@ async fn hold(
         tokio::time::sleep(RENEW_EVERY).await;
     };
     let term = lease.0;
+    TERM.store(term, Ordering::Relaxed);
     eprintln!("leading the database as {holder}, term {term}");
     if led.send(lease.1).is_err() {
         return;
@@ -225,7 +236,7 @@ async fn renew(
     Ok(n == 1)
 }
 
-fn label(name: &str) -> String {
+pub fn label(name: &str) -> String {
     format!("shared:{name}")
 }
 

@@ -65,7 +65,7 @@ jobs:
         run: |
           b=dist/spawnbox
           install -m 0755 binaries/spawn-api binaries/spawnbox "$b/bin/"
-          install -m 0755 deploy/install.sh "$b/deploy/"
+          install -m 0755 deploy/install.sh deploy/backup.sh "$b/deploy/"
           cp -r templates "$b/"
           cp LICENSE README.md "$b/"
           echo "${GITHUB_REF_NAME}" > "$b/VERSION"

@@ -23,12 +23,12 @@ use crate::secretbox::SecretBox;
 use crate::tenancy::{scoped, split};
 
 const CA_CERT_FILE: &str = "egress-ca.crt";
-const CA_KEY_FILE: &str = "egress-ca.key";
-const CA_LABEL: &str = "egress-ca";
+pub const CA_KEY_FILE: &str = "egress-ca.key";
+pub const CA_LABEL: &str = "egress-ca";
 
 /// Sealing label. Uses the storage key, so a sealed value cannot be moved
 /// to another tenant's row.
-fn label(key: &str) -> String {
+pub fn label(key: &str) -> String {
     format!("secret:{key}")
 }
 

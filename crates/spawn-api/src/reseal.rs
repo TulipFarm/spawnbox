@@ -72,7 +72,12 @@ pub fn reseal(db: &Db, sbox: &SecretBox) -> Result<Resealed> {
 /// `Some(None)` if `json` is current, `None` if it cannot be read.
 /// Earlier versions stored env in plain, or sealed the env map and the
 /// services apart, in `env_sealed` and `services_sealed`.
-fn reseal_saved(sbox: &SecretBox, tenant: &str, id: &str, json: &str) -> Option<Option<String>> {
+pub(crate) fn reseal_saved(
+    sbox: &SecretBox,
+    tenant: &str,
+    id: &str,
+    json: &str,
+) -> Option<Option<String>> {
     let mut saved: Map<String, Value> = serde_json::from_str(json).ok()?;
     if let Some(sealed) = saved.get(SEALED) {
         let sealed = B64.decode(sealed.as_str()?).ok()?;
@@ -118,7 +123,7 @@ pub(crate) mod tests {
 
     const CANARY: &str = "svc-secret-env";
 
-    fn plain() -> SandboxEnv {
+    pub(crate) fn plain() -> SandboxEnv {
         SandboxEnv {
             env: BTreeMap::from([("TOKEN".to_owned(), "sandbox-secret-env".to_owned())]),
             services: serde_json::from_str(&format!(
@@ -312,6 +317,23 @@ pub(crate) mod tests {
             !db.replace_start_env("sbx_b", (b"old", b""), &sealed)
                 .unwrap()
         );
+    }
+
+    /// A new empty directory for one test.
+    pub(crate) fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spawnbox-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A paused persistent sandbox of tenant `acme` whose start record holds
+    /// `plain()` sealed in the current format.
+    pub(crate) fn persistent(db: &Db, sbox: &SecretBox, id: &str) {
+        let env = sbox.seal_sandbox_env("acme", id, &plain()).unwrap();
+        db.insert_persistent(&row(id), &start(id, env), None)
+            .unwrap()
+            .unwrap();
     }
 
     /// Whether `canary` is in the database's files, the log included.

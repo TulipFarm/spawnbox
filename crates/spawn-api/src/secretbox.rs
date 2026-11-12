@@ -14,6 +14,9 @@ use crate::model::Service;
 
 const KEY_LEN: usize = 32;
 
+/// The label that seals the fleet CA's key in `fleet/ca.key`.
+pub const FLEET_CA_LABEL: &str = "spawnbox fleet ca key v1";
+
 pub struct SecretBox(LessSafeKey);
 
 impl SecretBox {

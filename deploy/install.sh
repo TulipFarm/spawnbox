@@ -24,8 +24,12 @@
 #                                  files, this script
 #   /usr/local/bin/spawnbox        link to the CLI
 #   /etc/spawnbox/spawnbox.env     server flags (SPAWNBOX_ARGS); kept on upgrade
+#   /etc/spawnbox/backup.env       backup settings; kept on upgrade
+#   /etc/spawnbox/backup.passphrase  encrypts backups; copy it off the host
 #   /var/lib/spawnbox/             database, templates, secrets key, logs
+#   /var/backups/spawnbox/         daily encrypted backups (deploy/backup.sh)
 #   spawnbox.service               systemd unit
+#   spawnbox-backup.timer          runs the backup daily, except on workers
 set -euo pipefail
 
 # Boot scripts (cloud-init user data) run without HOME.
@@ -37,6 +41,11 @@ config_dir=/etc/spawnbox
 config="$config_dir/spawnbox.env"
 data=/var/lib/spawnbox
 unit=/etc/systemd/system/spawnbox.service
+backup_unit=/etc/systemd/system/spawnbox-backup.service
+backup_timer=/etc/systemd/system/spawnbox-backup.timer
+backup_config="$config_dir/backup.env"
+backup_passphrase="$config_dir/backup.passphrase"
+backups=/var/backups/spawnbox
 cli_link=/usr/local/bin/spawnbox
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 artifacts="${SPAWNBOX_ARTIFACTS:-$HOME/.cache/spawnbox/artifacts}"
@@ -60,7 +69,8 @@ uninstall() {
   local purge="$1"
   stop_service
   $sudo systemctl disable spawnbox >/dev/null 2>&1 || true
-  $sudo rm -f "$unit"
+  $sudo systemctl disable --now spawnbox-backup.timer >/dev/null 2>&1 || true
+  $sudo rm -f "$unit" "$backup_unit" "$backup_timer"
   $sudo systemctl daemon-reload
   $sudo systemctl reset-failed spawnbox >/dev/null 2>&1 || true
   $sudo rm -rf "$prefix"
@@ -68,6 +78,9 @@ uninstall() {
   if [[ "$purge" == yes ]]; then
     $sudo rm -rf "$config_dir" "$data"
     echo "removed Spawnbox, its settings and its data"
+    if $sudo test -d "$backups"; then
+      echo "kept the backups in $backups; they open only with the passphrase that was in $backup_passphrase"
+    fi
   else
     echo "removed Spawnbox; kept $config_dir and $data (use --purge to remove them)"
   fi
@@ -77,7 +90,7 @@ case "${1:-}" in
   "") ;;
   --uninstall) uninstall no; exit 0 ;;
   --purge) uninstall yes; exit 0 ;;
-  -h | --help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "unknown option $1 (see --help)" ;;
 esac
 
@@ -98,7 +111,7 @@ if [[ "$bundle" == yes ]]; then
   say "installing the tools Spawnbox runs"
   $sudo apt-get update -qq
   $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    e2fsprogs nftables iproute2 procps curl ca-certificates >/dev/null
+    e2fsprogs nftables iproute2 procps curl ca-certificates sqlite3 gnupg >/dev/null
   bins="$repo/bin"
   artifacts="$repo"
 else
@@ -106,7 +119,8 @@ else
   $sudo apt-get update -qq
   $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     build-essential bc bison flex libelf-dev libssl-dev pkg-config musl-tools \
-    debootstrap e2fsprogs nftables iproute2 curl git ca-certificates xz-utils zstd >/dev/null
+    debootstrap e2fsprogs nftables iproute2 curl git ca-certificates xz-utils zstd \
+    sqlite3 gnupg >/dev/null
 
   if ! command -v rustup >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
     # shellcheck source=/dev/null
@@ -148,6 +162,7 @@ if [[ -d "$repo/templates" ]]; then
   $sudo install -d -m 0755 "$prefix/templates"
   $sudo install -m 0644 "$repo"/templates/*.json "$prefix/templates/"
 fi
+$sudo install -m 0755 "$repo/deploy/backup.sh" "$prefix/backup.sh"
 # A release bundle names its tag; a source build has none.
 version=""
 if [[ -f "$repo/VERSION" ]]; then
@@ -167,6 +182,58 @@ if ! $sudo test -f "$config"; then
 SPAWNBOX_ARGS="--listen 127.0.0.1:8080 --preview-listen 127.0.0.1:8081 --preview-url http://{label}.localhost:8081"
 EOF
 fi
+
+args="$($sudo bash -c "source '$config'; echo \"\$SPAWNBOX_ARGS\"")"
+worker=no
+grep -qE -- '--primary([ =]|$)' <<<"$args" && worker=yes
+if grep -qE -- '--database-url([ =]|$)' <<<"$args" && ! command -v pg_dump >/dev/null; then
+  say "installing the Postgres client for backups"
+  $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    postgresql-client >/dev/null
+fi
+
+if ! $sudo test -f "$backup_config"; then
+  $sudo tee "$backup_config" >/dev/null <<EOF
+# Settings for $prefix/backup.sh, run daily by spawnbox-backup.timer.
+# Where to keep backups: a directory, or s3://bucket/prefix (needs the aws CLI).
+SPAWNBOX_BACKUP_TARGET=$backups
+# How many backups to keep there.
+SPAWNBOX_BACKUP_KEEP=14
+# The passphrase that encrypts them. Copy it off this host: a backup cannot
+# be read without it.
+SPAWNBOX_BACKUP_PASSPHRASE_FILE=$backup_passphrase
+# For the SpawnboxBackupMissing alert, a node exporter textfile, such as
+# SPAWNBOX_BACKUP_METRICS_FILE=/var/lib/prometheus/node-exporter/spawnbox-backup.prom
+EOF
+fi
+new_passphrase=no
+if ! $sudo test -f "$backup_passphrase"; then
+  head -c 32 /dev/urandom | base64 | $sudo install -m 0600 /dev/stdin "$backup_passphrase"
+  new_passphrase=yes
+fi
+$sudo tee "$backup_unit" >/dev/null <<EOF
+[Unit]
+Description=Spawnbox backup
+After=spawnbox.service
+
+[Service]
+Type=oneshot
+ExecStart=$prefix/backup.sh
+Nice=10
+IOSchedulingClass=idle
+EOF
+$sudo tee "$backup_timer" >/dev/null <<EOF
+[Unit]
+Description=Daily Spawnbox backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
 
 $sudo tee "$unit" >/dev/null <<EOF
 [Unit]
@@ -203,9 +270,14 @@ fi
 say "starting spawnbox"
 $sudo systemctl daemon-reload
 $sudo systemctl enable --now spawnbox >/dev/null 2>&1
+# A worker's state is the primary's; only the primary is backed up.
+if [[ "$worker" == yes ]]; then
+  $sudo systemctl disable --now spawnbox-backup.timer >/dev/null 2>&1 || true
+else
+  $sudo systemctl enable --now spawnbox-backup.timer >/dev/null 2>&1
+fi
 
-args="$($sudo bash -c "source '$config'; echo \"\$SPAWNBOX_ARGS\"")"
-if grep -qE -- '--primary([ =]|$)' <<<"$args"; then
+if [[ "$worker" == yes ]]; then
   # A fleet worker serves only the primary, so check that it stays up.
   sleep 10
   restarts="$(systemctl show -p NRestarts --value spawnbox)"
@@ -283,4 +355,10 @@ EOF
 EOF
 else
   echo "upgraded; settings in $config were kept"
+fi
+echo
+echo "Backups run daily into $backups (settings: $backup_config)."
+if [[ "$new_passphrase" == yes ]]; then
+  echo "!!! Copy $backup_passphrase off this host now. Backups cannot be"
+  echo "!!! read without it."
 fi

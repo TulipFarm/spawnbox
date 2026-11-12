@@ -4,6 +4,7 @@
 // Pure helpers are used only by the Linux server but tested on every OS.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+mod check;
 mod db;
 mod events;
 mod guard;
@@ -89,6 +90,21 @@ enum Cli {
         #[arg(long, requires = "database_url")]
         database_ca_file: Option<PathBuf>,
     },
+    /// Check a data directory and its database, as after a restore: count
+    /// what they hold and decrypt every sealed value. Changes nothing.
+    CheckData {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+        /// The server's Postgres database, if it uses one.
+        #[arg(long, env = "SPAWNBOX_DATABASE_URL")]
+        database_url: Option<String>,
+        /// PEM CA certificates for the database's TLS certificate.
+        #[arg(long, requires = "database_url")]
+        database_ca_file: Option<PathBuf>,
+        /// The secrets key. Defaults to secrets.key in the data directory.
+        #[arg(long)]
+        secrets_key_file: Option<PathBuf>,
+    },
     /// Started by `serve`: kills the server's VMs once the server is gone.
     #[command(hide = true)]
     Guard {
@@ -111,6 +127,17 @@ fn main() -> Result<()> {
             cgroup_parent,
             own_cgroup,
         } => guard::run(&cgroup_parent, own_cgroup.as_deref()),
+        Cli::CheckData {
+            data_dir,
+            database_url,
+            database_ca_file,
+            secrets_key_file,
+        } => check::run(
+            &data_dir,
+            database_url.as_deref(),
+            database_ca_file.as_deref(),
+            secrets_key_file.as_deref(),
+        ),
         Cli::CreateKey {
             data_dir,
             tenant,

@@ -2427,6 +2427,15 @@ impl Db {
             .optional()
     }
 
+    /// Every sandbox row, per state.
+    pub fn count_sandboxes(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT state, COUNT(*) FROM sandboxes GROUP BY state ORDER BY state")?;
+        stmt.query_map((), |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    }
+
     /// Nodes that are not removed, oldest first.
     /// Sandboxes on this host that have not ended, per state.
     pub fn count_local_sandboxes(&self) -> Result<Vec<(String, i64)>> {
