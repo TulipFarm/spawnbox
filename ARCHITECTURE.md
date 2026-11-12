@@ -369,8 +369,9 @@ lost. A cold sandbox has no VM.
 - **Generations.** Calls in progress and lifecycle updates carry the
   generation they started with. An update from an older generation does
   nothing.
-- **One host.** Persistent sandboxes are placed on the primary only.
-  Moving or draining one gives `409 conflict`.
+- **Placement.** Creates place persistent sandboxes on the primary.
+  Moving or draining one gives `409 conflict`. In a fleet, a cold start
+  can run on any worker; see [Lost hosts and fencing](#lost-hosts-and-fencing).
 
 ## Services
 
@@ -750,7 +751,9 @@ That list is the full inventory: a worker sandbox the primary knows that
 is missing from it for 30 seconds is marked deleted with `sandbox.lost`.
 No heartbeat for 15 seconds makes the node `suspect` (no new sandboxes);
 30 seconds makes it `down` (calls for its sandboxes return
-`503 node_unreachable`). Its rows stay, as it can come back.
+`503 node_unreachable`). Its rows stay, as it can come back. Persistent
+rows are not ended by a missing report; see
+[Lost hosts and fencing](#lost-hosts-and-fencing).
 
 **Config.** Every change to tenants, keys, secrets or templates bumps a
 config version. A worker with an old version asks the primary for the
@@ -870,6 +873,60 @@ flowchart TB
 - **Delete** marks the row deleted on the primary and tells the home to
   remove the file.
 
+**Lost hosts and fencing.** A `down` node may only be cut off from the
+primary and still run its VMs. Starting a persistent sandbox again
+elsewhere could run its programs twice. So the primary makes a lost
+node's persistent rows `cold` only with a proof that their VMs are gone.
+
+```mermaid
+flowchart TB
+    down["worker down or removed,<br/>persistent rows stay"] --> proof{"proof?"}
+    proof -- "worker reports them stopped or missing" --> cold["row: cold, node empty<br/>sandbox.cold"]
+    proof -- "report said self_fence, and<br/>fence_after_s + margin passed" --> cold
+    proof -- "autoscaler removed the machine" --> cold
+    proof -- "POST /v1/nodes/{id}:fenced" --> cold
+    proof -- "none" --> wait["503 node_unreachable"]
+    cold --> next["next call: primary claims<br/>generation + 1, places, forwards"]
+```
+
+- **Generations.** A cold start adds 1 to `generation` with its claim.
+  The primary applies a heartbeat row of a persistent sandbox only at the
+  current generation and on the node in its row, and never moves a row
+  out of `cold`, `starting` or `deleted`. A worker copy with another
+  generation or node is stale: the heartbeat reply lists it, and the
+  worker kills its cgroup and drops it (`sandbox.fenced`,
+  `stale_generation`). It never resumes.
+- **Self-fencing.** Heartbeats carry `self_fence` and `fence_after_s`.
+  A worker with `--self-fence` that has had no answer from the primary
+  for `fence_after_s` writes `cgroup.kill` for each persistent VM's
+  cgroup, waits until `cgroup.procs` is empty, and marks the sandbox
+  `cold` locally (`sandbox.fenced`, `self_fenced`). A copy whose cgroup is
+  not empty stays as it is. The primary trusts time only for a node
+  whose last report had `self_fence`, and only `fence_after_s` plus
+  `--fence-margin-s` after that report. It then records `node.fenced`.
+- **Other proofs.** The autoscaler marks a node fenced after its hook
+  removed the machine. `POST /v1/nodes/{id}:fenced` (admin) does the same
+  for a `down` or removed node. Removing a node does not; a heartbeat
+  clears an earlier proof.
+- **Cold start in a fleet.** Calls for a persistent row that is `cold` or
+  `starting` are not forwarded to the node in the row; edges send them
+  to the primary. The primary checks the caller, then claims the start
+  and places it on a ready worker whose template has the same spec hash
+  as the start record, or on itself. It syncs config, pushes secrets and
+  volumes, and sends the start record with the plain env over mutual TLS.
+  The worker seals the env under its own key and starts the build. If the
+  worker was not reached, the primary starts it locally. If the call
+  broke, the claim stays: the next heartbeat after its deadline makes the
+  row `running` if the worker reports that generation, or `cold`.
+- **Volumes.** If a volume of the sandbox is on a node that is not
+  ready, the cold start fails with `503 volume_unavailable`.
+- **Edges** resend a call to the primary only if the worker could not be
+  connected to, so a call is never sent twice.
+- **Leader failover.** A leader that loses its lease kills its persistent
+  VMs before it exits. The new leader waits `fence_after_s` plus the
+  margin, then makes the old leader's persistent rows `cold`
+  (`sandbox.cold`, `failover`).
+
 ## State on disk
 
 ```text
@@ -911,6 +968,9 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
   are marked deleted with a `sandbox.lost` event, because their memory is
   gone. Persistent sandboxes that were running or starting become `cold`
   with a `sandbox.cold` event instead. The next call starts them again.
+- **Lost lease.** A leader that loses its database lease kills the
+  cgroups of its persistent VMs and marks them `cold`, then shuts down
+  as on SIGTERM. It exits within 5 seconds even if that is not done.
 
 ## Security boundaries
 
