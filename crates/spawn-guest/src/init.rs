@@ -169,6 +169,29 @@ fn prepare_vm() {
             eprintln!("spawn-guest: mount {} failed: {error}", m.target);
         }
     }
+    if let Err(error) = link_dev(Path::new("/dev")) {
+        eprintln!("spawn-guest: /dev links failed: {error}");
+    }
+}
+
+/// devtmpfs lacks the links that udev or systemd would add. Bash process
+/// substitution, `<(...)`, needs `/dev/fd`.
+const DEV_LINKS: &[(&str, &str)] = &[
+    ("fd", "/proc/self/fd"),
+    ("stdin", "/proc/self/fd/0"),
+    ("stdout", "/proc/self/fd/1"),
+    ("stderr", "/proc/self/fd/2"),
+    ("core", "/proc/kcore"),
+];
+
+fn link_dev(dev: &Path) -> std::io::Result<()> {
+    for (name, target) in DEV_LINKS {
+        match std::os::unix::fs::symlink(target, dev.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            result => result?,
+        }
+    }
+    Ok(())
 }
 
 /// Makes `/` writable: the read-only base disk is the lower layer and the
@@ -253,5 +276,35 @@ fn mount_one(m: &Mount) -> nix::Result<()> {
         // The kernel may mount devtmpfs itself.
         Err(Errno::EBUSY) => Ok(()),
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_dev_and_keeps_existing_entries() {
+        let dev = std::env::temp_dir().join(format!("spawn-init-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dev);
+        std::fs::create_dir_all(&dev).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", dev.join("stdin")).unwrap();
+
+        link_dev(&dev).unwrap();
+        link_dev(&dev).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dev.join("fd")).unwrap(),
+            Path::new("/proc/self/fd")
+        );
+        assert_eq!(
+            std::fs::read_link(dev.join("stderr")).unwrap(),
+            Path::new("/proc/self/fd/2")
+        );
+        assert_eq!(
+            std::fs::read_link(dev.join("stdin")).unwrap(),
+            Path::new("/elsewhere")
+        );
+        std::fs::remove_dir_all(&dev).unwrap();
     }
 }
