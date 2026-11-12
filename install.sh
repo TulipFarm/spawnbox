@@ -10,6 +10,8 @@
 #                         (about 30 minutes); then SPAWNBOX_REF picks the
 #                         branch or tag (default main) and SPAWNBOX_DIR the
 #                         directory (default ~/spawnbox)
+#   SPAWNBOX_AGENT_TEMPLATES  set to 0 to skip the first-install builds of
+#                         the coding agent templates
 # To remove Spawnbox: sudo /opt/spawnbox/install.sh --uninstall (or --purge).
 set -eu
 

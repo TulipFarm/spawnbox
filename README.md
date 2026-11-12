@@ -270,11 +270,16 @@ Type all the commands in steps 3 to 7 on **the host**.
    > make a new key with this command:
    > `sudo /opt/spawnbox/bin/spawn-api create-key --data-dir /var/lib/spawnbox`
 
+On a first install, the installer also starts builds of the
+[coding agent templates](#ready-made-coding-agent-templates). To skip them,
+set `SPAWNBOX_AGENT_TEMPLATES=0`, for example
+`curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | SPAWNBOX_AGENT_TEMPLATES=0 sh`.
+
 The installer puts files in these locations:
 
 | Location | Contents |
 | --- | --- |
-| `/opt/spawnbox` | Programs, kernel and base disk |
+| `/opt/spawnbox` | Programs, kernel, base disk and template files |
 | `/etc/spawnbox/spawnbox.env` | Server settings |
 | `/var/lib/spawnbox` | Database, templates, paused sandboxes and secrets |
 
@@ -476,6 +481,59 @@ start as fast as sandboxes from the `base` template.
 > **NOTE:** The base disk is Debian 13 with Node.js 26.13.1 (with npm) and
 > Python 3.15.2 (with pip) in `/usr/local`. It has no apt package lists.
 > Run `apt-get update` before you install packages.
+
+### Ready-made coding agent templates
+
+The `templates/` directory has template files for three coding agent
+CLIs. Each file installs one pinned npm package on the base disk:
+
+| File | Package | Command |
+| --- | --- | --- |
+| `templates/claude-code.json` | `@anthropic-ai/claude-code@2.1.322` | `claude` |
+| `templates/codex.json` | `@openai/codex@0.167.2` | `codex` |
+| `templates/copilot.json` | `@github/copilot@1.0.109` | `copilot` |
+
+A first install starts a build of each template in the background. The
+builds take a few minutes, one time for each server. Builds stay after a
+restart. Then each sandbox starts from the saved snapshot, as fast as a
+sandbox from `base`:
+
+```sh
+spawnbox templates ls                   # wait until the build is ready
+spawnbox create --template claude-code
+```
+
+The installer copies the files to `/opt/spawnbox/templates`. If you
+upgraded from an older version, or the install skipped the builds, build a
+template with the CLI:
+
+```sh
+spawnbox templates build /opt/spawnbox/templates/claude-code.json
+```
+
+Each template uses 2 vCPUs, 4096 MiB of memory and 20 GiB of disk. To get a
+newer agent, change the version in the file and build it again.
+
+Give the agent its API key as a held secret, so the real key never enters
+the sandbox:
+
+```sh
+# Claude Code sends the key in the x-api-key header.
+curl -s -H "$A" $B/secrets -d '{
+  "name": "anthropic", "type": "http_header", "value": "sk-ant-...",
+  "allowed_hosts": ["api.anthropic.com"], "env": "ANTHROPIC_API_KEY",
+  "header": "x-api-key", "format": "{value}"
+}'
+curl -s -H "$A" -d '{"template": "claude-code", "secrets": ["anthropic"]}' $B/sandboxes
+```
+
+For Codex, use the `openai` secret from
+[Use a secret safely](#use-a-secret-safely) (`OPENAI_API_KEY`).
+
+> **NOTE:** These templates are not yet tested in a real Firecracker VM.
+> The packages were checked in a `linux/amd64` container with Node.js
+> 26.13.1. The held-secret setup for Copilot CLI is not documented here,
+> because the hosts that it sends its token to are not verified.
 
 ### Start a template from a container image
 
@@ -2292,6 +2350,7 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `crates/spawn-bench` | The boot and restore benchmark |
 | `crates/spawnbox-cli` | The `spawnbox` CLI |
 | `guest/` | The guest kernel settings and the Debian base image, with Node.js and Python |
+| `templates/` | Ready-made template files for coding agent CLIs |
 | `install.sh` | The one-line installer: downloads a release (or the code) and runs `deploy/install.sh` |
 | `deploy/install.sh` | The installer for one server, from a release bundle or the code |
 | `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |

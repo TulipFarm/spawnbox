@@ -1616,6 +1616,25 @@ mod tests {
     }
 
     #[test]
+    fn repo_templates_are_valid() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let spec = template(&std::fs::read_to_string(&path).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                assert_eq!(
+                    Some(spec.name.as_str()),
+                    path.file_stem().and_then(|s| s.to_str())
+                );
+                count += 1;
+            }
+        }
+        assert!(count > 0);
+    }
+
+    #[test]
     fn template_base_is_an_image_reference() {
         let spec = template(r#"{"name":"n","base":"ghcr.io/acme/node:22@sha256:ab12"}"#).unwrap();
         assert!(spec.own_rootfs());

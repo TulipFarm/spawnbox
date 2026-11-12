@@ -66,6 +66,7 @@ jobs:
           b=dist/spawnbox
           install -m 0755 binaries/spawn-api binaries/spawnbox "$b/bin/"
           install -m 0755 deploy/install.sh "$b/deploy/"
+          cp -r templates "$b/"
           cp LICENSE README.md "$b/"
           echo "${GITHUB_REF_NAME}" > "$b/VERSION"
           tar -C dist --owner=0 --group=0 --numeric-owner -czf spawnbox-x86_64-linux.tar.gz spawnbox
