@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Soak and failover checks for a Spawnbox server or fleet on real KVM hosts.
 Uses only the standard library. Writes a JSON summary and exits 1 if any
-invariant is broken, 2 on a usage error.
+invariant is broken, 2 on a usage error, and 3 if the soak could not set up
+what it tests (for example it cannot write its markers, or cannot get a
+failover sandbox onto its host).
 
 Modes:
   soak      For --duration (default 72h), keeps about --density sandboxes
@@ -14,9 +16,16 @@ Modes:
             checks the invariants below. At the end it wakes every
             persistent sandbox, checks its data and deletes what it made.
   failover  Runs the scenarios in --scenarios once, each against
-            persistent sandboxes on one host, most with a volume and some
-            without. Those without are woken while the host is still cut
-            off, so they start again elsewhere before it returns:
+            persistent sandboxes on one host. New persistent sandboxes
+            start on the primary, so each is moved to a worker by cold
+            starts (kill its VM, wake it) until placement picks that
+            worker, up to --place-tries times. Sandboxes without a volume
+            are woken while the host is still cut off, so they start
+            again elsewhere before it returns. A cold start prefers the
+            host that holds a sandbox's volume, so sandboxes with one
+            (--failover-volume-sandboxes, default 0) reach a worker only
+            when the primary has no room; the leader scenario always has
+            some. Scenarios:
               worker     kill -9 a worker's server, then start it again
               partition  cut a worker off from the primary with iptables,
                          then heal it
@@ -25,7 +34,8 @@ Modes:
 Invariants:
   lost       every persistent sandbox answers (within --verify-wait while
              its host restarts or its volume's host is away), with its volume marker
-             intact, and its disk marker intact unless it was cold started
+             intact, and its disk marker ($HOME of the guest's default
+             user) intact unless it was cold started
              since the marker was written; its env value is still there
   duplicate  a sandbox's VM never runs on two hosts at once, nor twice on
              one host, and runs only on the host the API names
@@ -75,6 +85,14 @@ import urllib.parse
 LIVE = ("starting", "running", "paused")
 # 503 codes that mean "not yet": the sandbox's host is restarting or cut
 # off, a wake is under way, or a volume's host is away.
+# Setup errors in a row that stop the run.
+SETUP_ERRORS_IN_A_ROW = 3
+
+
+class SetupError(Exception):
+    """The soak cannot set up what it tests; not a fault of the server."""
+
+
 NOT_YET = ("node_unreachable", "sandbox_cold", "rebuilding", "volume_unavailable")
 VM_NAME = re.compile(r"sbx-[a-z0-9]{8,}")
 SOAK_NAME = re.compile(r"^soak-")
@@ -120,7 +138,13 @@ def parse_args(argv):
     p.add_argument("--max-rss-growth-mib", type=int, default=512)
     p.add_argument("--max-fd-growth", type=int, default=2000)
     p.add_argument("--scenarios", default="worker,partition,leader", help="failover scenarios, comma separated")
-    p.add_argument("--failover-sandboxes", type=int, default=4, help="persistent sandboxes per failover scenario")
+    p.add_argument("--failover-sandboxes", type=int, default=4,
+                   help="persistent sandboxes without a volume per failover scenario")
+    p.add_argument("--failover-volume-sandboxes", type=int, default=0,
+                   help="persistent sandboxes with a volume per worker or partition scenario; they reach a worker"
+                        " only when the primary has no room (the leader scenario always uses some)")
+    p.add_argument("--place-tries", type=int, default=12,
+                   help="cold starts tried to move a failover sandbox onto its host")
     p.add_argument("--primary-ip", help="primary's address as workers reach it (partition)")
     p.add_argument("--fleet-port", type=int, default=7443)
     p.add_argument("--node-port", type=int, default=7444)
@@ -313,6 +337,7 @@ class Soak:
             "actions": {},
             "errors": {},
             "violations": [],
+            "setup_errors": [],
             "checks": 0,
             "growth": {},
             "scenarios": [],
@@ -325,12 +350,22 @@ class Soak:
         self.baselines = {}
         self.first_rules = {}
         self.seq = 0
+        self.setup_streak = 0
 
     # --- reporting -------------------------------------------------------
 
     def log(self, msg):
         t = time.time() - self.started
         print(f"[{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}] {msg}", flush=True)
+
+    def setup_error(self, detail):
+        """Records a fault of the soak's own setup, not of the server. A few
+        in a row stop the run: it would only repeat them."""
+        self.log(f"SETUP ERROR: {detail}")
+        self.summary["setup_errors"].append({"at_s": round(time.time() - self.started), "detail": detail})
+        self.setup_streak += 1
+        if self.setup_streak >= SETUP_ERRORS_IN_A_ROW:
+            raise SetupError(f"{SETUP_ERRORS_IN_A_ROW} setup errors in a row; the last: {detail}")
 
     def violate(self, kind, detail):
         self.summary["violations"].append({"at_s": round(time.time() - self.started), "kind": kind, "detail": detail})
@@ -351,7 +386,7 @@ class Soak:
 
     def write_summary(self):
         self.summary["elapsed_s"] = round(time.time() - self.started)
-        self.summary["ok"] = not self.summary["violations"]
+        self.summary["ok"] = not self.summary["violations"] and not self.summary["setup_errors"]
         with open(self.args.summary, "w") as f:
             json.dump(self.summary, f, indent=2, sort_keys=True)
         self.log(f"summary in {self.args.summary}: {len(self.summary['violations'])} violation(s)")
@@ -426,11 +461,16 @@ class Soak:
         self.mine[sid] = rec
         if persistent:
             data = f"echo {token} > /data/soak-marker && " if volume else ""
-            stdout, exit_code, raw = self.exec(sid, f"{data}echo {token} > /root/soak-marker && sync && echo ok")
+            stdout, exit_code, raw = self.exec(sid, f'{data}echo {token} > "$HOME/soak-marker" && sync && echo ok')
             if exit_code != 0 or (stdout or "").strip() != "ok":
-                self.violate("lost", f"{sid}: cannot write markers: {json.dumps(raw)[:300]}")
-            else:
-                rec["disk_gen"] = self.generation(sid)
+                # Nothing was stored yet, so nothing is lost: the soak
+                # itself cannot do its work.
+                self.count(kind, "marker_write_failed")
+                self.delete(sid)
+                self.setup_error(f"{sid}: cannot write the markers: {json.dumps(raw)[:300]}")
+                return None
+            self.setup_streak = 0
+            rec["disk_gen"] = self.generation(sid)
         self.count(kind)
         self.log(f"created {'persistent' if persistent else 'ephemeral'} {sid}")
         return sid
@@ -448,7 +488,7 @@ class Soak:
         deadline = time.time() + (self.args.verify_wait if wait is None else wait)
         while True:
             stdout, exit_code, raw = self.exec(
-                sid, 'printf "%s|%s|%s" "$(cat /data/soak-marker 2>/dev/null)" "$(cat /root/soak-marker 2>/dev/null)" "$SOAK_TOKEN"'
+                sid, 'printf "%s|%s|%s" "$(cat /data/soak-marker 2>/dev/null)" "$(cat "$HOME/soak-marker" 2>/dev/null)" "$SOAK_TOKEN"'
             )
             if stdout is not None or exit_code != 503 or code(raw) not in NOT_YET or time.time() >= deadline:
                 break
@@ -469,7 +509,7 @@ class Soak:
                 self.violate("lost", f"{sid} ({why}): disk marker is {disk!r} at the same generation {gen}")
             if rec["disk_gen"] != gen:
                 # A cold start keeps volumes only; write the disk marker again.
-                self.exec(sid, f"echo {rec['token']} > /root/soak-marker && sync")
+                self.exec(sid, f"echo {rec['token']} > \"$HOME/soak-marker\" && sync")
                 rec["disk_gen"] = gen
         if gen is not None and rec["generation"] is not None and gen < rec["generation"]:
             self.violate("duplicate", f"{sid}: generation went back from {rec['generation']} to {gen}")
@@ -532,19 +572,23 @@ class Soak:
             self.count("cold_start", "no_host")
             return
         gen = view.get("generation")
-        self.hosts.run(host, f"pkill -9 -f -- '--id {host_name(sid)}( |$)'")
-        for _ in range(90):
-            s = self.get(sid)
-            if s and s.get("state") == "cold":
-                break
-            time.sleep(1)
-        else:
-            self.violate("lost", f"{sid}: did not become cold after its VM was killed on {host}")
+        if not self.kill_vm(sid, host):
             return
         if self.verify(sid, "cold start"):
             if (self.mine[sid]["generation"] or 0) <= (gen or 0):
                 self.violate("duplicate", f"{sid}: cold start kept generation {gen}")
             self.count("cold_start")
+
+    def kill_vm(self, sid, host):
+        """Kills the VM of `sid` on `host` and waits until the API says cold."""
+        self.hosts.run(host, f"pkill -9 -f -- '--id {host_name(sid)}( |$)'")
+        for _ in range(90):
+            s = self.get(sid)
+            if s and s.get("state") == "cold":
+                return True
+            time.sleep(1)
+        self.violate("lost", f"{sid}: did not become cold after its VM was killed on {host}")
+        return False
 
     def act_service_crash(self):
         sid = self.pick(states=("running",))
@@ -780,20 +824,53 @@ class Soak:
         return last_seen, cold_at
 
     def place(self, n, want_host, volume=True):
-        """Creates persistent sandboxes until `n` run on `want_host`."""
+        """Creates `n` persistent sandboxes running on `want_host`. They are
+        made on the primary, so each one is moved by cold starts: kill its
+        VM and wake it, until placement picks `want_host`. Raises
+        SetupError if one does not get there."""
         ids = []
-        for _ in range(n * 6):
-            sid = self.create(True, volume)
-            if not sid:
-                continue
-            view = self.get(sid)
-            if view and self.host_of(view) == want_host:
+        try:
+            for _ in range(n):
+                sid = None
+                for _ in range(3):
+                    sid = self.create(True, volume)
+                    if sid:
+                        break
+                if not sid:
+                    raise SetupError(f"cannot create a persistent sandbox to place on {want_host}; see the errors in the summary")
                 ids.append(sid)
-                if len(ids) == n:
-                    break
-            else:
+                where = self.move_to(sid, want_host)
+                if where != want_host:
+                    why = (" A cold start prefers the host that holds the sandbox's volume, which is the primary"
+                           " where it was made, so one with a volume reaches a worker only when the primary has"
+                           " no room.") if volume else ""
+                    raise SetupError(f"{sid} still runs on {where} after {self.args.place_tries} cold starts,"
+                                     f" not on {want_host}.{why}")
+        except SetupError:
+            for sid in ids:
                 self.delete(sid)
+            raise
         return ids
+
+    def move_to(self, sid, want_host):
+        """Cold starts `sid` until it runs on `want_host`, at most
+        --place-tries times. Returns the host it runs on at the end."""
+        where = None
+        for attempt in range(self.args.place_tries + 1):
+            view = self.get(sid)
+            where = view and self.host_of(view)
+            if where == want_host and view.get("state") == "running":
+                if attempt:
+                    self.log(f"placed {sid} on {want_host} after {attempt} cold start(s)")
+                return where
+            if attempt == self.args.place_tries:
+                break
+            if view and view.get("state") == "running" and where:
+                if not self.kill_vm(sid, where):
+                    return where
+            self.verify(sid, f"placing on {want_host}")
+            self.count("place_cold_start")
+        return where
 
     def scenario(self, name, host, ids, cut, heal):
         """Runs one failover: `cut` breaks the host, then checks the design's
@@ -852,10 +929,10 @@ class Soak:
                 self.violate("api", "cannot tell which primary is the leader")
                 continue
             self.log(f"== {name} on {host}")
-            ids = self.place(n, host) + self.place(max(1, n // 2), host, volume=False)
-            if not ids:
-                self.log(f"{name}: no sandbox landed on {host}; skipped")
-                continue
+            # Those with a volume reach a worker only when the primary is full;
+            # see place().
+            volumes = max(1, n // 2) if name == "leader" else self.args.failover_volume_sandboxes
+            ids = self.place(n, host, volume=False) + self.place(volumes, host)
             if name == "worker" or name == "leader":
                 def cut(h=host):
                     self.hosts.run(h, self.args.server_kill_cmd)
@@ -957,9 +1034,18 @@ def main(argv):
     except KeyboardInterrupt:
         soak.log("interrupted")
         soak.summary["interrupted"] = True
+    except SetupError as e:
+        soak.log(f"SETUP ERROR, stopping: {e}")
+        soak.summary["setup_failed"] = str(e)
+        try:
+            soak.teardown()
+        except Exception as cleanup:  # the summary matters more
+            soak.log(f"teardown raised {cleanup!r}")
     finally:
         soak.write_summary()
-    return 1 if soak.summary["violations"] else 0
+    if soak.summary["violations"]:
+        return 1
+    return 3 if soak.summary["setup_errors"] or "setup_failed" in soak.summary else 0
 
 
 if __name__ == "__main__":

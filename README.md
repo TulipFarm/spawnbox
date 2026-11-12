@@ -2769,8 +2769,15 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
   - A killed service runs again.
   - The memory and open files of `spawn-api` do not grow beyond
     `--max-rss-growth-mib` and `--max-fd-growth`.
-- The failover mode puts persistent sandboxes on one host, most with a
-  volume and some without, then cuts the host off. It checks that no
+- The failover mode puts persistent sandboxes on one host, then cuts the
+  host off. New persistent sandboxes start on the primary, so the script
+  moves each one to the worker by cold starts: it kills the VM and wakes
+  the sandbox until placement picks that worker, up to `--place-tries`
+  times (default 12). A cold start prefers the host that holds the
+  sandbox's volume, so a sandbox with a volume reaches a worker only when
+  the primary has no room. The worker scenarios use sandboxes without a
+  volume unless you set `--failover-volume-sandboxes`. The leader
+  scenario also uses sandboxes with a volume. It checks that no
   sample of the host's processes taken after the API made a sandbox cold
   still shows its VM. It wakes the sandboxes without a volume while the
   host is still cut off, so a second copy starts elsewhere, and checks
@@ -2781,7 +2788,11 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
   `--verify-wait` (default 3 minutes) before it counts the sandbox as
   lost.
 - The script writes the summary (`--summary`) and exits with 1 if a check
-  fails. `scripts/soak.py --help` lists every option.
+  fails. It exits with 3 if it cannot set up what it tests, for example
+  if it cannot write its markers or cannot get a sandbox onto the host of
+  a scenario. These are not counted as lost sandboxes.
+- `python3 scripts/soak_test.py` tests the script's own logic against a
+  stubbed API, without a server. `scripts/soak.py --help` lists every option.
 
 > **CAUTION:** The failover mode kills servers and adds `iptables` rules
 > on the hosts. Use it only on a test fleet. Do not run the soak on a fleet
