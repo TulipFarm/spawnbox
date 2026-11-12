@@ -336,12 +336,15 @@ X-Spawnbox-Step: call_7f3
     stops: [
       {
         lane: "api",
-        title: "Build the agent template once",
-        body: "The templates folder of the Spawnbox repo has claude-code, codex and copilot. Each installs one pinned npm release on the base disk, with Node.js 26. A build takes a few minutes, one time for each server. From the next release, a new install builds all three for you.",
+        title: "Let the install build the templates",
+        body: "Spawnbox comes with claude-code, codex and copilot templates. Each installs one pinned npm release on the base disk, with Node.js 26. A new install builds all three for you in a few minutes, one time for each server. On an install from before v0.1.10, run the installer again to upgrade, then build the one you need.",
         call: {
           lang: "bash",
-          code: `# waits until the build is ready
-spawnbox templates build templates/claude-code.json`,
+          code: `# see when the builds are ready
+spawnbox templates ls
+
+# installed before v0.1.10: upgrade, then build one
+spawnbox templates build /opt/spawnbox/templates/claude-code.json`,
         },
       },
       {
