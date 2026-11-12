@@ -1935,6 +1935,15 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     refuses a TCP connection without a name on any port, for example to a
     bare address or TLS without SNI. It also drops UDP (except DNS) and
     ICMP. Without a `deny` list, `allow_all` allows these.
+    An address written as a name, such as `Host: 93.184.215.14` or
+    `0x5db8d70e`, counts as no name.
+  - `deny` blocks names, not addresses. Spawnbox does not compare the
+    address that an allowed name resolves to with the addresses of denied
+    names. A sandbox that can use a name whose DNS it controls, such as a
+    wildcard DNS service that answers `1-2-3-4.example` with `1.2.3.4`,
+    can reach the address of a denied host. Thus, a `deny` list stops
+    mistakes and casual use, not a determined program. Use `allowlist`
+    when that matters.
   - A name check sees only the name that the client sends in clear text.
     A server that hosts many names, such as a CDN, can serve a denied
     name behind an allowed one (domain fronting or TLS Encrypted Client

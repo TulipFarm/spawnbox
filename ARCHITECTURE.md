@@ -628,7 +628,11 @@ flowchart LR
   strictest wins.
   - `allow_all` allows any public address. With a `deny` list it needs a
     name (TLS SNI or HTTP `Host`) on every TCP port, since `deny` is
-    checked by name, and the namespace forwards only TCP and DNS.
+    checked by name, and the namespace forwards only TCP and DNS. A name
+    that a resolver would read as an address (`1.2.3.4`, `0x5db8d70e`)
+    is no name. The proxy does not match addresses against denied names,
+    so a name with attacker-controlled DNS can still reach a denied
+    host's address.
   - `allowlist` reads the TLS SNI or HTTP `Host` name and allows only
     listed names on ports 80 and 443.
   - `deny_all` blocks everything, including DNS.
