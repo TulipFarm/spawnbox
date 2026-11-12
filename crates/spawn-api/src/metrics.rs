@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::model::ApiError;
+
 /// Upper bounds of the histogram buckets, in seconds.
 const BUCKETS: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0,
@@ -24,6 +26,21 @@ const METRICS: &[(&str, &str, &str)] = &[
         "spawnbox_create_step_seconds",
         "histogram",
         "Time of each create step on this host: prepare, restore or fixups.",
+    ),
+    (
+        "spawnbox_creates_total",
+        "counter",
+        "Create calls this host answered, by result: ok or the error code.",
+    ),
+    (
+        "spawnbox_cold_starts_total",
+        "counter",
+        "Cold starts of persistent sandboxes on this host, by result: ok or the error code.",
+    ),
+    (
+        "spawnbox_cold_start_seconds",
+        "histogram",
+        "Time of each cold start of a persistent sandbox on this host that worked.",
     ),
     (
         "spawnbox_api_errors_total",
@@ -110,6 +127,26 @@ const METRICS: &[(&str, &str, &str)] = &[
         "gauge",
         "Workers being retired, by state: draining, blocked or ready_to_terminate.",
     ),
+    (
+        "spawnbox_leader_term",
+        "gauge",
+        "With --database-url: the term of the leader lease this primary holds. It grows each time a primary takes the lease.",
+    ),
+    (
+        "spawnbox_data_dir_available_bytes",
+        "gauge",
+        "Bytes free for the server on the file system of the data directory.",
+    ),
+    (
+        "spawnbox_data_dir_size_bytes",
+        "gauge",
+        "Size in bytes of the file system of the data directory.",
+    ),
+    (
+        "spawnbox_start_time_seconds",
+        "gauge",
+        "When this server process started, in seconds since the Unix epoch.",
+    ),
 ];
 
 pub type Labels = Vec<(&'static str, String)>;
@@ -144,6 +181,15 @@ impl Metrics {
     pub fn inc(&self, name: &'static str, labels: Labels) {
         let mut registry = self.registry();
         *registry.counters.entry((name, labels)).or_default() += 1;
+    }
+
+    /// Counts a call by its `result` label: `ok`, or its error code.
+    pub fn inc_result<T>(&self, name: &'static str, outcome: &Result<T, ApiError>) {
+        let result = match outcome {
+            Ok(_) => "ok",
+            Err(error) => error.code.as_str(),
+        };
+        self.inc(name, vec![("result", result.into())]);
     }
 
     pub fn observe(&self, name: &'static str, labels: Labels, seconds: f64) {
@@ -233,6 +279,10 @@ pub fn inc(name: &'static str, labels: Labels) {
     REGISTRY.inc(name, labels);
 }
 
+pub fn inc_result<T>(name: &'static str, outcome: &Result<T, ApiError>) {
+    REGISTRY.inc_result(name, outcome);
+}
+
 pub fn observe(name: &'static str, labels: Labels, seconds: f64) {
     REGISTRY.observe(name, labels, seconds);
 }
@@ -285,5 +335,56 @@ mod tests {
             )
         );
         assert!(out.contains("spawnbox_sandboxes{state=\"run\\\"ning\"} 3\n"));
+    }
+    #[test]
+    fn counts_results_by_error_code() {
+        use crate::model::{ApiError, Code};
+        let metrics = Metrics::new();
+        metrics.inc_result("spawnbox_creates_total", &Ok::<(), ApiError>(()));
+        metrics.inc_result("spawnbox_creates_total", &Ok::<(), ApiError>(()));
+        let refused: Result<(), _> = Err(ApiError::new(Code::NoCapacity, "full"));
+        metrics.inc_result("spawnbox_creates_total", &refused);
+        let out = metrics.render(&[]);
+        assert!(out.contains("spawnbox_creates_total{result=\"ok\"} 2\n"));
+        assert!(out.contains("spawnbox_creates_total{result=\"no_capacity\"} 1\n"));
+    }
+
+    /// Every metric the alert rules use is one the server exports, or the
+    /// one the backup script writes.
+    #[test]
+    fn alert_rules_use_known_metrics() {
+        let rules = include_str!("../../../deploy/prometheus/spawnbox-alerts.yml");
+        let backup = include_str!("../../../deploy/backup.sh");
+        let mut used = 0;
+        for word in rules.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if !word.starts_with("spawnbox_") {
+                continue;
+            }
+            used += 1;
+            let base = ["_bucket", "_count", "_sum"]
+                .iter()
+                .find_map(|suffix| word.strip_suffix(suffix))
+                .filter(|base| {
+                    METRICS
+                        .iter()
+                        .any(|(name, kind, _)| name == base && *kind == "histogram")
+                })
+                .unwrap_or(word);
+            assert!(
+                METRICS.iter().any(|(name, _, _)| *name == base) || backup.contains(base),
+                "{word} is not exported"
+            );
+        }
+        assert!(used > 20);
+        let docs = include_str!("../../../deploy/prometheus/README.md");
+        for line in rules.lines() {
+            if let Some(alert) = line.trim().strip_prefix("- alert: ") {
+                assert!(
+                    docs.contains(&format!("### {alert}"))
+                        || docs.contains(&format!(", {alert} (")),
+                    "{alert} is not documented"
+                );
+            }
+        }
     }
 }
