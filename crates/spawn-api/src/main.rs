@@ -6,6 +6,7 @@
 
 mod db;
 mod events;
+mod guard;
 mod ids;
 mod leader;
 mod metering;
@@ -88,6 +89,16 @@ enum Cli {
         #[arg(long, requires = "database_url")]
         database_ca_file: Option<PathBuf>,
     },
+    /// Started by `serve`: kills the server's VMs once the server is gone.
+    #[command(hide = true)]
+    Guard {
+        /// The parent cgroup of the VM cgroups.
+        #[arg(long)]
+        cgroup_parent: PathBuf,
+        /// The cgroup to move this process into.
+        #[arg(long)]
+        own_cgroup: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -96,6 +107,10 @@ fn main() -> Result<()> {
         Cli::Serve(args) => tokio::runtime::Runtime::new()?.block_on(server::serve(*args)),
         #[cfg(target_os = "linux")]
         Cli::Edge(args) => tokio::runtime::Runtime::new()?.block_on(fleet::edge::run(*args)),
+        Cli::Guard {
+            cgroup_parent,
+            own_cgroup,
+        } => guard::run(&cgroup_parent, own_cgroup.as_deref()),
         Cli::CreateKey {
             data_dir,
             tenant,

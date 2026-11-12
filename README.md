@@ -725,8 +725,9 @@ are gone. Its ID, env, secrets, network rules, volumes and published
 ports are the same.
 
 A tenant needs the `persistent_sandboxes` quota. It is `0` by default.
-Persistent sandboxes run only on the primary. They cannot move to a
-worker yet.
+Persistent sandboxes are created on the primary, and you cannot move
+them. In a fleet, a cold sandbox can start again on any worker that has
+its template build. Refer to [Fence lost hosts](#fence-lost-hosts).
 
 ### Fork a sandbox or save it as a template
 
@@ -903,6 +904,9 @@ Prometheus adds the `instance` label.
 | `spawnbox_fleet_load` (gauge) | None | Primary only: load of the primary and the ready workers that are not drained, from 0 to 1 |
 | `spawnbox_service_restarts_total` (counter) | `reason` | Restarts of services |
 | `spawnbox_fleet_create_refused_total` (counter) | `reason` | Primary only: creates refused with `no_capacity` |
+| `spawnbox_self_fences_total` (counter) | `reason` (`self_fenced`, `lease_lost`) | Times this host stopped its persistent sandboxes because it lost the primary or its lease |
+| `spawnbox_fenced_cold_total` (counter) | `reason` | Primary only: persistent sandboxes of a lost host that became `cold`, by proof (`operator`, `autoscaler`, `self_fence`, `failover`) |
+| `spawnbox_stale_copies_total` (counter) | None | Copies of persistent sandboxes from an older generation that a host deleted |
 | `spawnbox_fleet_retirements` (gauge) | `state` | Primary only: workers that retire, in each state (`draining`, `blocked`, `ready_to_terminate`) |
 
 ## Use more than one host
@@ -1043,6 +1047,79 @@ certificate in `/var/lib/spawnbox/fleet/worker/`.
   host. Its paused sandboxes stay. To keep the running sandboxes,
   [drain the worker](#drain-a-worker-and-move-its-sandboxes) before you
   restart it.
+- **Persistent sandboxes on a `down` worker** stay on that worker until
+  Spawnbox knows that their VMs are stopped. Refer to
+  [Fence lost hosts](#fence-lost-hosts).
+
+### Fence lost hosts
+
+A `down` worker can still run its VMs: maybe only its network to the
+primary is cut. If Spawnbox started a persistent sandbox again on a
+different host, two copies of its programs could run. So a persistent
+sandbox of a `down` or removed worker becomes `cold` only when one of
+these proves that its VM is stopped:
+
+- The worker comes back and reports the sandbox stopped or missing.
+- The fleet uses `--self-fence`, and `--fence-after-s` plus
+  `--fence-margin-s` passed since the last report of the worker.
+- The autoscaler hook removed the machine of the worker.
+- You tell the primary that the host is off:
+
+  ```sh
+  curl -s -H "$A" -X POST http://127.0.0.1:8080/v1/nodes/NODE_ID:fenced \
+    -d '{"reason":"machine powered off"}'
+  ```
+
+  Do this only after you stop the machine. The primary records the
+  `node.fenced` event with your key.
+
+`DELETE /v1/nodes/{id}` and the `down` state alone prove nothing. Until
+there is a proof, requests for these sandboxes give
+`503 node_unreachable`.
+
+**Self-fencing.** A worker with `--self-fence` that cannot reach the
+primary for `--fence-after-s` seconds (default 60) stops all its
+persistent VMs. Each one becomes `cold` on the worker, with a
+`sandbox.fenced` event. Other sandboxes continue to run. Add
+`--self-fence` to every worker: each worker tells the primary if it uses
+the flag, and the primary waits for a time only for the workers that do.
+
+```sh
+SPAWNBOX_ARGS="... --primary https://10.0.0.1:7443 --self-fence --fence-after-s 60"
+```
+
+On the primary, `--fence-margin-s` (default 30) is the time to add for
+clocks and slow hosts. The worker counts from when it sent its last
+heartbeat that got an answer, and the primary from when it got that
+heartbeat, so the worker always fences first. Keep the margin above 10
+seconds: a worker can take a few seconds to see the fence time and stop
+its VMs.
+
+**When the server process dies.** VMs run in their own cgroups, outside
+the `spawn-api` process and its systemd service, so they would keep
+running after a crash. The time proofs above need them stopped. So
+`spawn-api serve` starts a small guard process, `spawn-api guard`, before
+any VM. When the server process ends in any way, also with `kill -9`, the
+out-of-memory killer or a crash, the guard kills all the VMs of the host
+within about a second. A normal stop with `SIGTERM` stops the VMs first
+and then tells the guard to exit. The guard is in its own cgroup,
+`/sys/fs/cgroup/spawnbox-guard`, and ignores `SIGINT` and `SIGTERM`, so
+stopping the service does not stop it too early. If the guard cannot
+start, a server with `--self-fence`, `--fleet-listen` or `--database-url`
+does not start. If the guard stops while such a server runs, the server
+kills its VMs and exits.
+
+**Generations.** Each cold start adds 1 to the `generation` of the
+sandbox. A host runs a sandbox only for the generation that the primary
+gave it. When a worker comes back with an older copy, the primary tells
+it to delete that copy (`sandbox.fenced` with the reason
+`stale_generation`). The old copy never resumes.
+
+**Where a cold sandbox starts.** Calls for a `cold` or `starting`
+sandbox go to the primary, also through an edge. The primary checks the
+key, starts the sandbox on a host with its template build and room, then
+forwards the call. Previews start it on the primary. If the start on a
+worker fails before the worker got it, the primary starts it on itself.
 
 ### Keep the API up when the primary stops
 
@@ -1088,8 +1165,13 @@ When a standby becomes the leader:
 - Sandboxes that ran on the old leader are lost. Paused sandboxes whose
   files were on the old leader are marked `failed`.
 - Volumes whose file was on the old leader are lost.
-- If the leader cannot reach the database for 8 seconds, it stops, so
-  that two primaries never serve at the same time.
+- Persistent sandboxes of the old leader become `cold` after
+  `--fence-after-s` plus `--fence-margin-s`. Until then, requests for them
+  give `409`.
+- If the leader cannot reach the database for 6 seconds, or another
+  primary took its lease, it stops taking requests, kills all its VMs and
+  exits, before its lease ends. So two primaries never serve at the same
+  time.
 
 To use TLS with a certificate check, give the CA of the database in
 `--database-ca-file`. Without it, the connection uses TLS if the server
@@ -1171,7 +1253,8 @@ primary.
   `409`.
 - A volume moves only between hosts with the same backend.
 - If the home of a volume is down, sandboxes cannot use the volume. The
-  response is `503 node_unreachable`. Try again when the host comes back.
+  response is `503 node_unreachable`, or `503 volume_unavailable` when a
+  cold sandbox starts. Try again when the host comes back.
 
 - When you drain a worker with `{"migrate":true}`, the primary also
   copies the volumes of the worker to other hosts. The event
@@ -1852,7 +1935,9 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   - `sandbox.created` (with `forked_from` for a copy), `.paused`,
     `.resumed`, `.forked`, `.snapshotted`, `.expired`, `.killed`, `.lost`,
     `.cold` (with `reason`), `.cold_started` (with `generation`, `build`
-    and `duration_ms`)
+    and `duration_ms`), `.fenced` (with `reason` and `generation`: a host
+    stopped its copy)
+  - `node.fenced` (with `node` and `reason`, primary only)
   - `exec.started`, `exec.finished` (with the last 64 KiB of output)
   - `pty.opened`, `pty.closed`
   - `service.started` (with `pid`), `service.exited` (with `exit`),
@@ -1926,6 +2011,7 @@ These calls operate only on a primary. The key must have the scope
 | `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes to other hosts. Gives `202` when it moves sandboxes. |
 | `POST /v1/nodes/{id}:undrain` | Put new sandboxes on the worker again. Gives `409` if the worker retires. |
 | `POST /v1/nodes/{id}:retire` | Retire the worker before you stop its machine. Optional body: `{"migrate":true,"reason":"..."}`. Gives `202`. Refer to [Retire a worker safely](#retire-a-worker-safely). |
+| `POST /v1/nodes/{id}:fenced` | Tell the primary that the host of a `down` or removed worker is off. Its persistent sandboxes become `cold`. Optional body: `{"reason":"..."}`. The response has `sandboxes_cold`. Gives `409` if the worker is not `down` or removed. Refer to [Fence lost hosts](#fence-lost-hosts). |
 | `POST /v1/sandboxes/{id}:migrate` | Move one sandbox to a different host. Optional body: `{"node":"nod_..."}` or `{"node":"primary"}`. |
 
 Each node has `id`, `kind` (`worker` or `edge`), `url`, `state` (`ready`, `suspect`, `down`),
@@ -2024,6 +2110,9 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--advertise` | None | Worker: URL of `--node-listen` for the primary, for example `https://10.0.0.2:7444` |
 | `--join-token` | None | Worker: token from `POST /v1/nodes/tokens`. You can also use `SPAWNBOX_JOIN_TOKEN`. Necessary only for the first start. |
 | `--primary-ca-sha256` | None | Worker: `ca_sha256` from the same response. Necessary only for the first start. |
+| `--self-fence` | Off | Worker: stop persistent VMs after `--fence-after-s` without the primary. Use it on every worker. A leader always stops them when it loses its lease. Refer to [Fence lost hosts](#fence-lost-hosts). |
+| `--fence-after-s` | 60 | Seconds without the primary before a worker with `--self-fence` stops its persistent VMs. A new leader waits this time plus `--fence-margin-s` before the old leader's persistent sandboxes become `cold`. |
+| `--fence-margin-s` | 30 | Primary: seconds added to the fence time of a worker before its persistent sandboxes become `cold` |
 | `--autoscale-hook` | None | Primary: program (absolute path) or webhook URL that adds and removes workers. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `--autoscale-secret` | None | Key to sign webhook requests. You can also use `SPAWNBOX_AUTOSCALE_SECRET`. |
 | `--autoscale-min-workers` | 0 | Minimum number of workers |
@@ -2062,6 +2151,8 @@ Type these commands on the host.
 | The server stops at start with `downgrades are not supported` | An earlier release runs on a database that a newer release changed | Install the newer release again, or restore the backup from before the upgrade. |
 | A move gives `no host has the same backend, kernel, base disk, Firecracker or runsc, egress CA and CPU model` | The hosts have different backends, files or CPUs | Compare `fingerprint`, `backend` and `cpu` in `GET /v1/nodes`. Sandboxes cannot move between Firecracker and gVisor hosts. Copy `/opt/spawnbox/vmlinux` and `/opt/spawnbox/rootfs.ext4` from the primary to the worker, then restart the worker. |
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |
+| A request for a persistent sandbox gives `503 node_unreachable` for a long time | Its worker is `down`, and no proof says that its VM is stopped | Bring the worker back, or stop its machine and call `POST /v1/nodes/{id}:fenced`. Refer to [Fence lost hosts](#fence-lost-hosts). |
+| A request for a cold sandbox gives `503 volume_unavailable` | The only copy of its volume is on a host that is `down` | Bring the host back. |
 | A worker stops with `the join token is unknown, used or expired` | The token was used or is older than one hour | Make a new token on the primary. |
 | A worker log shows `not a node of this fleet` | The worker was removed | Remove `/var/lib/spawnbox/fleet/worker/` and add the worker again with a new token. |
 

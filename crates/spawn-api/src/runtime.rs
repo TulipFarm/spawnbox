@@ -122,7 +122,7 @@ struct Booted {
 const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// How long a cold start may take before its claim is given up.
-const COLD_START_CLAIM: Duration = Duration::from_secs(120);
+pub const COLD_START_CLAIM: Duration = Duration::from_secs(120);
 
 impl Record {
     fn is_moving(&self) -> bool {
@@ -367,6 +367,9 @@ pub struct Settings {
     pub memory_pressure_pct: u8,
     /// How long shutdown waits for running persistent sandboxes to pause.
     pub shutdown_pause_s: u64,
+    /// Whether a call may start a cold sandbox here. A worker starts one
+    /// only when the primary asks.
+    pub cold_starts: bool,
 }
 
 #[derive(Clone)]
@@ -387,6 +390,9 @@ pub struct Shared {
     warm: Warm,
     pressure: pressure::State,
     closing: AtomicBool,
+    /// Set while this host may not run persistent sandboxes: it lost the
+    /// primary or the leader lease.
+    fenced: AtomicBool,
 }
 
 impl Deref for Sandboxes {
@@ -447,6 +453,7 @@ impl Sandboxes {
                 waking: HashMap::new(),
             })),
             closing: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
         }))
     }
 
@@ -754,6 +761,16 @@ impl Sandboxes {
 
     fn shutting_down() -> ApiError {
         ApiError::new(Code::NoCapacity, "server is shutting down")
+    }
+
+    fn check_fenced(&self) -> Result<(), ApiError> {
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(ApiError::new(
+                Code::NodeUnreachable,
+                "this host cannot reach the primary; try again later",
+            ));
+        }
+        Ok(())
     }
 
     /// Counts a sandbox of `limits` against `tenant`'s quotas, and against
@@ -1620,7 +1637,23 @@ impl Sandboxes {
         if !sandbox.persistent || sandbox.node.is_some() || !cold {
             return Err(self.not_running(id));
         }
-        let gate = Arc::clone(self.inner().waking.entry(id.to_owned()).or_default());
+        if !self.settings.cold_starts {
+            return Err(ApiError::new(
+                Code::Conflict,
+                format!("sandbox is {}; call it through the primary", sandbox.state),
+            ));
+        }
+        self.start_cold_gated(id, origin).await
+    }
+
+    /// Held while cold sandbox `id` is being started, here or elsewhere.
+    pub fn waking_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(self.inner().waking.entry(id.to_owned()).or_default())
+    }
+
+    /// Starts cold sandbox `id` here, or waits for the start in progress.
+    pub async fn start_cold_gated(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
+        let gate = self.waking_gate(id);
         // In its own task: a client that disconnects must not stop a start
         // halfway.
         let this = self.clone();
@@ -1642,6 +1675,7 @@ impl Sandboxes {
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
+        self.check_fenced()?;
         let sandbox = self.get(id)?;
         if sandbox.state == state::STARTING {
             return Err(ApiError::new(
@@ -1667,9 +1701,9 @@ impl Sandboxes {
         let ready = self.templates.root(&start.build)?;
         let claim = ids::base32(&ids::random::<10>().map_err(ApiError::internal)?);
         let claim_ms = i64::try_from(COLD_START_CLAIM.as_millis()).unwrap_or(i64::MAX);
-        let Some(generation) = self
-            .db
-            .claim_cold(id, &claim, now_ms().saturating_add(claim_ms))?
+        let Some(generation) =
+            self.db
+                .claim_cold(id, None, &claim, now_ms().saturating_add(claim_ms))?
         else {
             return Err(self.not_running(id));
         };
@@ -1696,7 +1730,7 @@ impl Sandboxes {
                     self.node.remove_failed(&ids::host_name(id), index).await;
                     self.release(index);
                 }
-                if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+                if let Err(error) = self.db.abandon_claim(id, None, generation, &claim) {
                     eprintln!("record {id} as cold: {error}");
                 }
                 return Err(match error.code {
@@ -1757,10 +1791,17 @@ impl Sandboxes {
                 protected,
             },
         );
+        // `fence_all` sets the flag before it lists records, so it either
+        // finds this one or the check below sees the flag.
         let finished = if self.closing.load(Ordering::SeqCst) {
             Err(Self::shutting_down())
+        } else if let Err(error) = self.check_fenced() {
+            Err(error)
         } else {
-            match self.db.finish_cold_start(id, generation, &claim, now_ms()) {
+            match self
+                .db
+                .finish_cold_start(id, None, generation, &claim, now_ms())
+            {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(ApiError::new(
                     Code::Conflict,
@@ -1783,7 +1824,7 @@ impl Sandboxes {
                 vm.stop().await;
                 self.release(index);
             }
-            if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+            if let Err(error) = self.db.abandon_claim(id, None, generation, &claim) {
                 eprintln!("record {id} as cold: {error}");
             }
             return Err(error);
@@ -2167,6 +2208,9 @@ impl Sandboxes {
                 }
             }
         };
+        if persistent {
+            self.check_fenced()?;
+        }
         // Read again: quotas and egress may have changed while it slept.
         let row = self.db.get_tenant(&tenant)?;
         let quotas = row.as_ref().map(|t| t.quotas).unwrap_or_default();
@@ -2252,6 +2296,26 @@ impl Sandboxes {
                 )));
             }
         };
+        // As in `start_cold`: a fence that began during the restore either
+        // killed this VM's cgroup or is seen here.
+        if persistent && let Err(error) = self.check_fenced() {
+            restored.vm.stop().await;
+            self.node.remove_failed(&name, index).await;
+            self.release(index);
+            if let Some(mut record) = self.inner().records.remove(id) {
+                self.settle(id, &mut record, now_ms());
+            }
+            remove_dir(&dir);
+            self.db.set_cold(id, generation)?;
+            self.event(
+                "sandbox.fenced",
+                origin,
+                &tenant,
+                id,
+                json!({ "reason": "resume_fenced", "generation": generation }),
+            );
+            return Err(error);
+        }
         let expires_at = if persistent {
             i64::MAX
         } else {
@@ -2776,6 +2840,119 @@ impl Sandboxes {
         }
         remove_dir(&self.paused_dir(id));
         self.db.hand_off(id, node)?;
+        Ok(())
+    }
+
+    /// Whether this host is fenced: then starts and resumes of persistent
+    /// sandboxes fail.
+    pub fn set_fenced(&self, fenced: bool) {
+        self.fenced.store(fenced, Ordering::SeqCst);
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// Destroys this host's copy of persistent sandbox `id`: kills every
+    /// process of its VM, checks that none is left and drops its record
+    /// and snapshot. Returns its record's tenant and generation, if it had
+    /// one, and whether the VM is known to be gone.
+    async fn destroy_copy(&self, id: &str) -> (Option<(String, i64)>, bool) {
+        let gone = self.node.kill(&ids::host_name(id)).await;
+        let lock = self.record_lock(id);
+        // A pause or start in progress fails without its VM.
+        let _changing = match &lock {
+            Some(lock) => tokio::time::timeout(Duration::from_secs(2), lock.lock())
+                .await
+                .ok(),
+            None => None,
+        };
+        let record = self.inner().records.remove(id);
+        let mut held = None;
+        if let Some(mut record) = record {
+            self.settle(id, &mut record, now_ms());
+            held = Some((record.tenant.clone(), record.generation));
+            if let VmState::Running(live) = record.vm {
+                let Live {
+                    vm, channel, index, ..
+                } = *live;
+                drop(channel);
+                vm.stop().await;
+                self.release(index);
+            }
+        }
+        remove_dir(&self.paused_dir(id));
+        if !gone {
+            eprintln!("warning: {id}: processes are left in its cgroup");
+        }
+        (held, gone)
+    }
+
+    /// Stops every persistent sandbox here and makes it cold, because
+    /// this host may no longer run them: `reason` is `self_fenced` or
+    /// `lease_lost`. Starts and resumes of them fail until `set_fenced`
+    /// turns this off. Returns how many were stopped.
+    pub async fn fence_all(&self, reason: &str) -> usize {
+        self.set_fenced(true);
+        let ids: Vec<String> = self
+            .inner()
+            .records
+            .iter()
+            .filter(|(_, r)| r.persistent)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let copies = ids.iter().map(|id| self.destroy_copy(id));
+        let destroyed = futures_util::future::join_all(copies).await;
+        let mut stopped = 0;
+        for (id, (held, gone)) in ids.iter().zip(destroyed) {
+            let Some((tenant, generation)) = held else {
+                continue;
+            };
+            stopped += 1;
+            if !gone {
+                continue;
+            }
+            if let Err(error) = self.db.set_cold(id, generation) {
+                eprintln!("record {id} as cold: {error}");
+            }
+            self.event(
+                "sandbox.fenced",
+                &Origin::system(),
+                &tenant,
+                id,
+                json!({ "reason": reason, "generation": generation }),
+            );
+        }
+        crate::metrics::inc(
+            "spawnbox_self_fences_total",
+            vec![("reason", reason.into())],
+        );
+        eprintln!("fenced: stopped {stopped} persistent sandboxes ({reason})");
+        stopped
+    }
+
+    /// Destroys this host's copy of persistent sandbox `id`, which the
+    /// primary runs at a newer generation or not at all.
+    pub async fn drop_stale(&self, id: &str) -> Result<(), ApiError> {
+        let sandbox = self.db.get_sandbox(id)?;
+        let (held, gone) = self.destroy_copy(id).await;
+        if !gone {
+            return Err(ApiError::internal(format!(
+                "{id}: processes are left in its cgroup"
+            )));
+        }
+        self.db.drop_copy(id)?;
+        if let (Some(sandbox), Some((_, generation))) = (sandbox, held) {
+            crate::metrics::inc("spawnbox_stale_copies_total", Vec::new());
+            eprintln!("{id}: destroyed the copy of generation {generation}; a newer one runs");
+            self.event(
+                "sandbox.fenced",
+                &Origin::system(),
+                &sandbox.tenant,
+                id,
+                json!({ "reason": "stale_generation", "generation": generation }),
+            );
+        }
         Ok(())
     }
 

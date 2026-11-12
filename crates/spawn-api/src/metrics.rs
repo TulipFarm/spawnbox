@@ -86,6 +86,21 @@ const METRICS: &[(&str, &str, &str)] = &[
         "Creates the primary refused because no host had room, by reason.",
     ),
     (
+        "spawnbox_self_fences_total",
+        "counter",
+        "Times this host stopped its persistent sandboxes because it lost the primary or the leader lease, by reason.",
+    ),
+    (
+        "spawnbox_fenced_cold_total",
+        "counter",
+        "Persistent sandboxes of a lost worker made cold once its copies were known to be stopped, by proof.",
+    ),
+    (
+        "spawnbox_stale_copies_total",
+        "counter",
+        "Copies of persistent sandboxes destroyed on this host because a newer generation runs elsewhere.",
+    ),
+    (
         "spawnbox_fleet_retirements",
         "gauge",
         "Workers being retired, by state: draining, blocked or ready_to_terminate.",

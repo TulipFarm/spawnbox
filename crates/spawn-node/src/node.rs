@@ -1388,6 +1388,17 @@ fn keep(src: &Path, dest: &Path) -> Result<()> {
 impl Node {
     /// Removes what a failed `restore` left for `id`, so that `index` can be
     /// used again. Drop the `Vm`, if any, first.
+    /// Kills every process of sandbox `id`, whatever runs it. True once
+    /// none is left.
+    pub async fn kill(&self, id: &str) -> bool {
+        // First, as removing a container can take a while.
+        let gone = self.host.kill_cgroup(id).await;
+        if let Some(runsc) = &self.runsc {
+            runsc.remove(id).await;
+        }
+        gone
+    }
+
     pub async fn remove_failed(&self, id: &str, index: u32) {
         if let Some(runsc) = &self.runsc {
             runsc.remove(id).await;

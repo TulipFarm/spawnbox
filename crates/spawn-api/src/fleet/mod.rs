@@ -149,6 +149,12 @@ pub struct Heartbeat {
     pub capacity: Capacity,
     /// Every sandbox that has not ended, and those that ended lately.
     pub sandboxes: Vec<db::Sandbox>,
+    /// The worker stops its persistent sandboxes once it has not reached
+    /// the primary for `fence_after_s`.
+    #[serde(default)]
+    pub self_fence: bool,
+    #[serde(default)]
+    pub fence_after_s: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -160,6 +166,21 @@ pub struct HeartbeatReply {
     /// worker removes them without events.
     #[serde(default)]
     pub release: Vec<String>,
+    /// Copies of persistent sandboxes that are not the current
+    /// generation. The worker destroys them.
+    #[serde(default)]
+    pub stale: Vec<String>,
+}
+
+/// The primary asks a worker to start a cold persistent sandbox at
+/// `generation`, which the primary claimed for it.
+#[derive(Serialize, Deserialize)]
+pub struct ColdStart {
+    pub sandbox: db::Sandbox,
+    /// Its `env` is empty: the worker seals `env` with its own key.
+    pub start: db::StartRecord,
+    pub env: crate::secretbox::SandboxEnv,
+    pub generation: i64,
 }
 
 /// The egress CA every host of a fleet uses, so their template

@@ -137,7 +137,28 @@ impl Edge {
         Ok(tls)
     }
 
+    /// Connects to `target`. Returns its URL and name too.
+    async fn connect(
+        &self,
+        target: Target,
+    ) -> Result<(Result<forward::Connection, Failure>, String, String), ApiError> {
+        let (tls, url, name) = match target {
+            Target::Primary => (
+                Arc::clone(&self.to_primary),
+                self.primary.current().to_owned(),
+                "the primary".to_owned(),
+            ),
+            Target::Worker { node, url } => (
+                self.client(&node).map_err(ApiError::internal)?,
+                url,
+                format!("node {node}"),
+            ),
+        };
+        Ok((forward::connect(tls, &url).await, url, name))
+    }
+
     /// Sends a client's call on. `route` is `Some("preview")` for previews.
+    /// If its worker cannot be reached, the primary gets it.
     async fn send(
         &self,
         target: Target,
@@ -150,17 +171,15 @@ impl Edge {
                 "this edge was removed from the fleet",
             ));
         }
-        let (tls, url, name) = match target {
-            Target::Primary => (
-                Arc::clone(&self.to_primary),
-                self.primary.current().to_owned(),
-                "the primary".to_owned(),
-            ),
-            Target::Worker { node, url } => (
-                self.client(&node).map_err(ApiError::internal)?,
-                url,
-                format!("node {node}"),
-            ),
+        let (connected, url, name) = match self.connect(target).await? {
+            (Ok(connection), url, name) => (Ok(connection), url, name),
+            // Its sandbox may have stopped there and start elsewhere. The
+            // call never reached the worker, so the primary can take it.
+            (Err(Failure::Unreachable(e)), url, name) if url != self.primary.current() => {
+                eprintln!("edge: {name}: {e:#}; asking the primary");
+                self.connect(Target::Primary).await?
+            }
+            failed => failed,
         };
         let headers = req.headers_mut();
         headers.remove(ROUTE_HEADER);
@@ -178,7 +197,7 @@ impl Edge {
         }
         let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
         *req.uri_mut() = Uri::try_from(path).unwrap_or_default();
-        match forward::send(tls, &url, req).await {
+        match async { connected?.send(req).await }.await {
             Ok(resp) => Ok(resp),
             Err(Failure::Unreachable(e)) => {
                 eprintln!("edge: {name}: {e:#}");

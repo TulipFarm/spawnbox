@@ -182,6 +182,21 @@ pub struct Args {
     /// pause. Ones not paused by then are stopped and become cold.
     #[arg(long, default_value_t = 30)]
     shutdown_pause_s: u64,
+    /// Workers: stop every persistent sandbox after `--fence-after-s`
+    /// without an answer from the primary. Set it on every worker, or the
+    /// primary waits for a lost worker to return, or for `:fenced`, before
+    /// it starts that worker's persistent sandboxes elsewhere.
+    #[arg(long)]
+    self_fence: bool,
+    /// How long a worker with `--self-fence` runs without the primary, and
+    /// a new leader waits for the old one's sandboxes to stop.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    fence_after_s: u64,
+    /// Extra wait, on top of `--fence-after-s`, for clock and heartbeat
+    /// delays, before a lost host's persistent sandboxes are started
+    /// elsewhere.
+    #[arg(long, default_value_t = 30)]
+    fence_margin_s: u64,
     /// Host port the egress proxy listens on. Only sandboxes can reach it.
     #[arg(long, default_value_t = 15_001)]
     egress_port: u16,
@@ -458,6 +473,25 @@ pub async fn serve(args: Args) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("run as root: it creates jails, cgroups, network namespaces and firewall rules");
     }
+    // Before any VM starts: other hosts may start this host's persistent
+    // sandboxes once the fence time passed, so its VMs must not outlive it.
+    let fences = args.self_fence || args.fleet_listen.is_some() || args.database_url.is_some();
+    let guard = match crate::guard::Guard::start(
+        &spawn_node::firecracker::cgroups(),
+        Some(&spawn_node::firecracker::guard_cgroup()),
+        fences,
+    ) {
+        Ok(guard) => Some(guard),
+        Err(error) if fences => {
+            return Err(
+                error.context("--self-fence, --fleet-listen and --database-url need the VM guard")
+            );
+        }
+        Err(error) => {
+            eprintln!("warning: {error:#}; if this server dies, its VMs keep running");
+            None
+        }
+    };
     let data = crate::open_data_dir(&args.data_dir)?;
     let db = crate::leader::open(
         &data,
@@ -469,9 +503,15 @@ pub async fn serve(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| data.join("secrets.key"));
     let sbox = SecretBox::open_or_create(&key_file).context("open secrets key")?;
+    let mut lease = None;
     if let Some(url) = &args.database_url {
         let target = crate::leader::target(url, args.database_ca_file.as_deref())?;
-        crate::leader::lead(target, crate::leader::host_id(&data)?).await?;
+        let host = crate::leader::host_id(&data)?;
+        let leading = crate::leader::lead(target, host.clone()).await?;
+        // Another host led: its persistent sandboxes may still run there
+        // until it fences itself.
+        let failover = leading.previous.is_some_and(|previous| previous != host);
+        lease = Some((failover, leading.lost));
         if let Some(path) = &args.import_sqlite {
             match db
                 .import_sqlite(path)
@@ -577,17 +617,22 @@ pub async fn serve(args: Args) -> Result<()> {
         runsc: runsc.clone(),
         dns: args.dns,
     };
-    let result = run(&args, node, inputs, db, &data, sbox, ca).await;
+    let result = run(&args, node, inputs, db, &data, sbox, ca, lease).await;
 
     if let Some(runsc) = &runsc {
         runsc.remove_all().await;
     }
     let _ = net::remove_stale_namespaces().await;
     host.remove_all().await;
+    // Every VM is stopped; the guard need not kill them.
+    if let Some(guard) = &guard {
+        guard.disarm();
+    }
     host_net.teardown().await;
     result
 }
 
+#[expect(clippy::too_many_arguments, reason = "called once, at startup")]
 async fn run(
     args: &Args,
     node: Node,
@@ -596,7 +641,12 @@ async fn run(
     data: &std::path::Path,
     sbox: SecretBox,
     ca: Arc<Ca>,
+    lease: Option<(bool, tokio::sync::oneshot::Receiver<()>)>,
 ) -> Result<()> {
+    let (failover, lease_lost) = match lease {
+        Some((failover, lost)) => (failover, Some(lost)),
+        None => (false, None),
+    };
     // The OTLP exporter's and the autoscale webhook's HTTPS clients use the
     // process-wide crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -609,6 +659,8 @@ async fn run(
                 args.advertise.as_deref().unwrap_or_default(),
                 args.join_token.as_deref(),
                 args.primary_ca_sha256.as_deref(),
+                args.self_fence,
+                Duration::from_secs(args.fence_after_s),
             )
             .await?,
         )
@@ -657,7 +709,17 @@ async fn run(
     };
     let hub = Hub::start(db.clone(), otlp, usize::try_from(args.events_output_bytes)?);
     let meter = Arc::new(Meter::new(db.clone()));
-    let cooled = db.cool_unfinished()?;
+    // After a failover the old leader's sandboxes wait for the fence time.
+    let inherited = if failover {
+        db.unfinished_persistent()?
+    } else {
+        Vec::new()
+    };
+    let cooled = if failover {
+        Vec::new()
+    } else {
+        db.cool_unfinished()?
+    };
     if !cooled.is_empty() {
         eprintln!(
             "marked {} persistent sandboxes from the last run as cold",
@@ -805,6 +867,7 @@ async fn run(
                 memory_limit_mib: host_memory_mib()? * u64::from(args.memory_overcommit_pct) / 100,
                 memory_pressure_pct: args.memory_pressure_pct,
                 shutdown_pause_s: args.shutdown_pause_s,
+                cold_starts: !matches!(role, Role::Worker(_)),
             },
         ),
         templates,
@@ -858,8 +921,33 @@ async fn run(
         })
     };
     let on_shutdown = Arc::clone(&app);
+    let lease_lost = async move {
+        if let Some(lost) = lease_lost
+            && lost.await.is_ok()
+        {
+            return;
+        }
+        std::future::pending().await
+    };
+    let fencing: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::default();
+    let fenced = Arc::clone(&fencing);
     let shutdown = async move {
-        shutdown_signal().await;
+        let fence = tokio::select! {
+            () = shutdown_signal() => false,
+            () = lease_lost => true,
+        };
+        if fence {
+            // Another primary may lead now, so stop taking calls at once.
+            eprintln!("lost the leader lease; stopping persistent sandboxes");
+            let task = tokio::spawn(async move {
+                on_shutdown.sandboxes.fence_all("lease_lost").await;
+                on_shutdown.templates.close();
+                on_shutdown.sandboxes.stop_all().await;
+                on_shutdown.sandboxes.hub.stop_feeds();
+            });
+            *fenced.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+            return;
+        }
         eprintln!("stopping all sandboxes");
         on_shutdown.templates.close();
         // Ends open exec streams, so the server can finish.
@@ -868,6 +956,10 @@ async fn run(
         on_shutdown.sandboxes.hub.stop_feeds();
     };
     let mut background = vec![reaper];
+    if !inherited.is_empty() {
+        let fence_after = Duration::from_secs(args.fence_after_s + args.fence_margin_s);
+        background.push(inherit(Arc::clone(&app), inherited, fence_after));
+    }
     if let Some(addr) = args.metrics_listen {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -923,7 +1015,10 @@ async fn run(
                         eprintln!("fleet listener: {error}");
                     }
                 }));
-                background.push(primary::watch(Arc::clone(&app)));
+                background.push(primary::watch(
+                    Arc::clone(&app),
+                    Duration::from_secs(args.fence_margin_s),
+                ));
                 background.push(fleet::retire::start(Arc::clone(&app)));
                 if let Some(settings) = autoscale.take() {
                     background.push(fleet::autoscale::start(Arc::clone(&app), settings)?);
@@ -941,6 +1036,10 @@ async fn run(
     for task in background {
         task.abort();
     }
+    let fence = fencing.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(fence) = fence {
+        let _ = fence.await;
+    }
     app.templates.close();
     app.sandboxes.stop_all().await;
     if let Err(error) = app.sandboxes.flush_usage() {
@@ -950,6 +1049,42 @@ async fn run(
     app.sandboxes.hub.close().await;
     let _ = tokio::task::spawn_blocking(traces::shutdown).await;
     served.context("serve HTTP")
+}
+
+/// Makes the old leader's persistent sandboxes cold once `wait` has
+/// passed: it stops them when it loses its lease.
+fn inherit(
+    app: AppState,
+    sandboxes: Vec<(String, String, i64)>,
+    wait: Duration,
+) -> tokio::task::JoinHandle<()> {
+    eprintln!(
+        "{} persistent sandboxes of the last leader become cold in {} s",
+        sandboxes.len(),
+        wait.as_secs()
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(wait).await;
+        for (id, tenant, generation) in sandboxes {
+            match app.db.set_cold(&id, generation) {
+                Ok(true) => {
+                    crate::metrics::inc(
+                        "spawnbox_fenced_cold_total",
+                        vec![("reason", "failover".into())],
+                    );
+                    app.sandboxes.hub.record(
+                        "sandbox.cold",
+                        &Origin::system(),
+                        Some(&tenant),
+                        Some(&id),
+                        json!({ "reason": "failover" }),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("record {id} as cold: {error}"),
+            }
+        }
+    })
 }
 
 /// The registry plus gauges read now, in the Prometheus text format.
@@ -1199,9 +1334,36 @@ async fn auth(State(app): State<AppState>, mut req: Request, next: Next) -> Resp
     if let Some((node, id)) = remote {
         return primary::forward_api(&app, &node, &id, req).await;
     }
+    if matches!(app.role, Role::Primary(_))
+        && let Some(id) = tenancy::sandbox_in_path(req.uri().path())
+        && ids::is_valid_id("sbx", id)
+        && wakes(req.method(), req.uri().path(), id)
+    {
+        let id = id.to_owned();
+        if let Err(error) = primary::wake_cold(&app, &id, false).await {
+            return error.into_response();
+        }
+        if let Some(node) = primary::node_of(&app, &id) {
+            return primary::forward_api(&app, &node, &id, req).await;
+        }
+    }
     req.extensions_mut().insert(caller);
     req.extensions_mut().insert(origin);
     next.run(req).await
+}
+
+/// Whether a call for sandbox `id` needs its VM, so starts it if cold.
+fn wakes(method: &axum::http::Method, path: &str, id: &str) -> bool {
+    let Some(rest) = path
+        .strip_prefix("/v1/sandboxes/")
+        .and_then(|rest| rest.strip_prefix(id))
+    else {
+        return false;
+    };
+    (method == axum::http::Method::POST && rest == ":resume")
+        || ["/exec", "/pty", "/files", "/git:clone", "/services"]
+            .iter()
+            .any(|under| rest.starts_with(under))
 }
 
 /// Worker node and ID of a sandbox that another host runs.
@@ -2642,6 +2804,35 @@ fn totals_json(totals: &Totals) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_calls_that_need_the_vm_wake_a_cold_sandbox() {
+        let id = "sbx_0123456789abcdef";
+        let post = axum::http::Method::POST;
+        let get = axum::http::Method::GET;
+        for (method, tail) in [
+            (&post, ":resume"),
+            (&post, "/exec"),
+            (&get, "/pty"),
+            (&get, "/files?path=/x"),
+            (&post, "/git:clone"),
+            (&get, "/services"),
+        ] {
+            assert!(
+                wakes(method, &format!("/v1/sandboxes/{id}{tail}"), id),
+                "{tail}"
+            );
+        }
+        for (method, path) in [
+            (&get, format!("/v1/sandboxes/{id}")),
+            (&get, format!("/v1/sandboxes/{id}:resume")),
+            (&post, format!("/v1/sandboxes/{id}:pause")),
+            (&get, format!("/v1/sandboxes/{id}/events")),
+            (&post, "/v1/sandboxes/sbx_other/exec".to_owned()),
+        ] {
+            assert!(!wakes(method, &path, id), "{path}");
+        }
+    }
 
     #[test]
     fn unreadable_env_stops_the_start_unless_allowed() {

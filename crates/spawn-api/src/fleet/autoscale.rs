@@ -680,6 +680,16 @@ async fn remove_worker(app: &App, s: &Settings, request: &ScaleRequest, node: &N
         eprintln!("autoscale: remove {}: {}", node.id, error.message);
         return false;
     }
+    // The hook stopped the machine: its persistent sandboxes can start
+    // elsewhere.
+    let fenced = app
+        .db
+        .set_node_fenced(&node.id, "autoscaler", now_ms())
+        .map_err(anyhow::Error::from)
+        .and_then(|_| primary::cool_fenced(app, &node.id, "autoscaler", &Origin::system()));
+    if let Err(error) = fenced {
+        eprintln!("autoscale: fence {}: {error:#}", node.id);
+    }
     end(app, request, Some(&node.id), "removed", "autoscale.done");
     true
 }

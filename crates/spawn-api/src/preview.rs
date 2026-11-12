@@ -137,7 +137,17 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
         }
     }
     // Only now, so that requests without access cannot wake a sandbox.
-    // Preview visitors have no API key, so their wakes have no actor.
+    // Preview visitors have no API key, so their wakes have no actor. On a
+    // primary, a cold sandbox starts here: its volumes are gathered first.
+    if matches!(app.role, crate::fleet::Role::Primary(_))
+        && let Err(error) = crate::fleet::primary::wake_cold(&app, &id, true).await
+    {
+        return plain(StatusCode::SERVICE_UNAVAILABLE, &error.message);
+    }
+    // A start on a worker may have finished meanwhile.
+    if let Some(node) = crate::fleet::primary::node_of(&app, &id) {
+        return crate::fleet::primary::forward(&app, &node, req, Some("preview")).await;
+    }
     let opened = match app.sandboxes.open(&id, &Origin::default()).await {
         Ok(opened) => opened,
         Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.message),

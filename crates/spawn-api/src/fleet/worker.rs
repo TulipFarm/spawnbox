@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::body::Bytes;
@@ -26,7 +26,7 @@ use super::forward::Failure;
 use super::migrate;
 use super::pki::{self, Identity, Peer};
 use super::{
-    Config, ConfigRequest, EgressCa, EventBatch, EventReply, HEARTBEAT_EVERY, Heartbeat,
+    ColdStart, Config, ConfigRequest, EgressCa, EventBatch, EventReply, HEARTBEAT_EVERY, Heartbeat,
     HeartbeatReply, JoinReply, JoinRequest, NODE_HEADER, REPORT_ENDED_MS, ROUTE_HEADER, SELF_NODE,
     SecretPush, SyncReply, UsageBatch, local_capacity, unhex,
 };
@@ -42,6 +42,8 @@ const NODE_FILE: &str = "id";
 const EVENTS_EVERY: Duration = Duration::from_secs(1);
 const USAGE_EVERY: Duration = Duration::from_secs(60);
 const EVENT_BATCH: usize = 500;
+/// Longest wait for the primary to answer a heartbeat.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Worker {
     pub node: String,
@@ -60,6 +62,11 @@ pub struct Worker {
     syncing: tokio::sync::Mutex<()>,
     /// Edges that may call the node listener, from the last config copy.
     edges: RwLock<HashSet<String>>,
+    /// Stop persistent sandboxes after `fence_after` without the primary.
+    self_fence: bool,
+    fence_after: Duration,
+    /// When the last heartbeat that the primary answered was sent.
+    reached: std::sync::Mutex<Instant>,
 }
 
 /// Where a worker keeps its fleet identity.
@@ -75,6 +82,8 @@ impl Worker {
         advertise: &str,
         token: Option<&str>,
         ca_sha256: Option<&str>,
+        self_fence: bool,
+        fence_after: Duration,
     ) -> Result<Arc<Self>> {
         let dir = dir(data);
         let id_file = dir.join(NODE_FILE);
@@ -117,7 +126,18 @@ impl Worker {
             events_after: AtomicI64::new(-1),
             syncing: tokio::sync::Mutex::new(()),
             edges: RwLock::default(),
+            self_fence,
+            fence_after,
+            reached: std::sync::Mutex::new(Instant::now()),
         }))
+    }
+
+    /// How long since the primary last answered.
+    pub fn unreached_for(&self) -> Duration {
+        self.reached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
     }
 
     /// TLS for the node listener: callers need a fleet certificate. The
@@ -255,6 +275,7 @@ impl Quiet {
 
 async fn heartbeat(app: &App, w: &Worker) -> Result<()> {
     let now = now_ms();
+    let sent = Instant::now();
     let hb = Heartbeat {
         url: w.advertise.clone(),
         boot: w.boot.clone(),
@@ -262,11 +283,30 @@ async fn heartbeat(app: &App, w: &Worker) -> Result<()> {
         config_version: w.version.load(Ordering::SeqCst),
         capacity: local_capacity(app),
         sandboxes: app.db.local_report(now - REPORT_ENDED_MS)?,
+        self_fence: w.self_fence,
+        fence_after_s: w.fence_after.as_secs(),
     };
-    let reply: HeartbeatReply = w
-        .call("/fleet/v1/heartbeat", &hb)
-        .await
-        .map_err(Failure::error)?;
+    let reply: HeartbeatReply = tokio::time::timeout(
+        heartbeat_timeout(w.fence_after),
+        w.call("/fleet/v1/heartbeat", &hb),
+    )
+    .await
+    .context("the primary did not answer in time")?
+    .map_err(Failure::error)?;
+    {
+        let mut reached = w.reached.lock().unwrap_or_else(|e| e.into_inner());
+        *reached = (*reached).max(sent);
+    }
+    // Copies the primary no longer wants go before this host runs any.
+    for id in &reply.stale {
+        if let Err(error) = app.sandboxes.drop_stale(id).await {
+            eprintln!("fleet: drop stale copy of {id}: {}", error.message);
+        }
+    }
+    // An answer to a call sent before the fence time does not undo it.
+    if sent.elapsed() < w.fence_after {
+        app.sandboxes.set_fenced(false);
+    }
     w.events_after.store(reply.events_after, Ordering::SeqCst);
     for id in &reply.release {
         eprintln!("fleet: {id} runs on another host now; removing it here");
@@ -309,6 +349,11 @@ async fn send_usage(app: &App, w: &Worker) -> Result<()> {
     Ok(())
 }
 
+/// Well under the fence time, so a slow answer cannot hold off a fence.
+fn heartbeat_timeout(fence_after: Duration) -> Duration {
+    HEARTBEAT_TIMEOUT.min(fence_after / 2)
+}
+
 /// Starts the loops that report to the primary.
 pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> {
     let beat = {
@@ -331,6 +376,22 @@ pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> 
             }
         })
     };
+    let fence = {
+        let (app, w) = (Arc::clone(&app), Arc::clone(&w));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let lost = w.self_fence && w.unreached_for() >= w.fence_after;
+                if lost && !app.sandboxes.is_fenced() {
+                    eprintln!(
+                        "fleet: no answer from the primary for {}s; stopping persistent sandboxes",
+                        w.fence_after.as_secs()
+                    );
+                    app.sandboxes.fence_all("self_fenced").await;
+                }
+            }
+        })
+    };
     let usage = tokio::spawn(async move {
         let mut quiet = Quiet(None);
         loop {
@@ -338,7 +399,7 @@ pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> 
             quiet.see("send usage", send_usage(&app, &w).await);
         }
     });
-    vec![beat, events, usage]
+    vec![beat, events, fence, usage]
 }
 
 fn peer_of(req: &Request) -> Peer {
@@ -374,6 +435,7 @@ pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/fleet/v1/sync", post(sync_now))
         .route("/fleet/v1/secrets", post(take_secrets))
+        .route("/fleet/v1/cold-start", post(cold_start_here))
         .route("/fleet/v1/migrate/export", post(migrate::export_here))
         .route("/fleet/v1/migrate/import", post(migrate::import_here))
         .route("/fleet/v1/migrate/release", post(migrate::release_here))
@@ -440,8 +502,87 @@ async fn sync_now(State(app): State<AppState>) -> Response {
     }
 }
 
+/// Starts a cold persistent sandbox here at the generation the primary
+/// claimed for it. Its env is sealed with this host's key.
+async fn cold_start_here(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let ColdStart {
+        mut sandbox,
+        mut start,
+        env,
+        generation,
+    } = parse(&body)?;
+    let id = sandbox.id.clone();
+    if !ids::is_valid_id("sbx", &id) || start.sandbox != id || !sandbox.persistent {
+        return Err(ApiError::invalid("not a persistent sandbox"));
+    }
+    // Template builds are made on each host: use the one made from the
+    // same spec here.
+    let wanted = super::build_hash(&start.spec);
+    let build = app
+        .templates
+        .ready_builds()
+        .into_iter()
+        .map(|(_, build, _)| build)
+        .chain([start.build.clone()])
+        .find(|build| {
+            app.db
+                .get_build(build)
+                .ok()
+                .flatten()
+                .is_some_and(|b| super::build_hash(&b.spec) == wanted)
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                crate::model::Code::NoCapacity,
+                format!("no build of template {:?} here", start.template),
+            )
+        })?;
+    // An older copy here must not run beside the new one.
+    app.sandboxes.drop_stale(&id).await?;
+    start.build.clone_from(&build);
+    start.env = app
+        .secrets
+        .sbox()
+        .seal_sandbox_env(&start.tenant, &id, &env)
+        .map_err(ApiError::internal)?;
+    sandbox.build = Some(build);
+    sandbox.node = None;
+    sandbox.state = db::state::COLD.into();
+    sandbox.paused_at = None;
+    sandbox.generation = generation - 1;
+    app.db.replace_persistent(&sandbox, &start)?;
+    app.sandboxes
+        .start_cold_gated(&id, &crate::events::Origin::system())
+        .await?;
+    let running = app.db.get_sandbox(&id)?.map(|s| s.generation);
+    if running != Some(generation) {
+        return Err(ApiError::internal(format!(
+            "{id} runs generation {running:?} here, not {generation}"
+        )));
+    }
+    Ok(Json(json!({ "generation": generation })))
+}
+
 async fn take_secrets(State(app): State<AppState>, body: Bytes) -> Result<Json<Value>, ApiError> {
     let push: SecretPush = parse(&body)?;
     app.secrets.import(&push.secrets, None)?;
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heartbeat_gives_up_well_before_the_fence_time() {
+        for fence_after_s in [1, 4, 20, 60, 3600] {
+            let fence_after = Duration::from_secs(fence_after_s);
+            let timeout = heartbeat_timeout(fence_after);
+            assert!(timeout <= fence_after / 2, "{fence_after_s}");
+            assert!(timeout <= HEARTBEAT_TIMEOUT, "{fence_after_s}");
+        }
+    }
 }
