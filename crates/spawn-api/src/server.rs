@@ -1535,7 +1535,7 @@ fn session_caller(app: &App, req: &Request) -> Result<Option<Caller>, ApiError> 
     match token {
         Some(token) => Ok(app
             .sessions
-            .caller(&app.db, &token, id, now_ms())?
+            .caller(&app.db, &token, id, crate::session::TERMINAL, now_ms())?
             .map(|(caller, _)| caller)),
         None => Ok(None),
     }
@@ -1545,6 +1545,28 @@ fn session_caller(app: &App, req: &Request) -> Result<Option<Caller>, ApiError> 
 #[serde(deny_unknown_fields)]
 struct SessionTokenRequest {
     ttl_s: Option<u64>,
+    audience: Option<String>,
+    port: Option<u16>,
+}
+
+impl SessionTokenRequest {
+    /// The token's audience: the terminal, or the private preview on one
+    /// port.
+    fn audience(&self) -> Result<String, ApiError> {
+        match (self.audience.as_deref(), self.port) {
+            (Some("terminal"), None) => Ok(crate::session::TERMINAL.to_owned()),
+            (Some("preview"), Some(port)) if port > 0 => Ok(crate::session::preview(port)),
+            (Some("preview"), _) => Err(ApiError::invalid(
+                "a preview token needs port, the published port it opens",
+            )),
+            (Some("terminal"), Some(_)) => {
+                Err(ApiError::invalid("port is only for a preview token"))
+            }
+            _ => Err(ApiError::invalid(
+                "audience must be \"terminal\" or \"preview\"",
+            )),
+        }
+    }
 }
 
 /// `POST /v1/sandboxes/{id}/session-tokens`.
@@ -1556,13 +1578,14 @@ async fn session_token(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let req: SessionTokenRequest = parse(&body)?;
+    let audience = req.audience()?;
     let max = crate::session::MAX_TTL_S;
     let ttl_s = req.ttl_s.unwrap_or(max);
     if !(1..=max).contains(&ttl_s) {
         return Err(ApiError::invalid(format!("ttl_s must be 1 to {max}")));
     }
     let sandbox = app.sandboxes.get(&id)?;
-    let claims = crate::session::claims(&caller, &sandbox.tenant, &id, ttl_s, now_ms())
+    let claims = crate::session::claims(&caller, &sandbox.tenant, &id, &audience, ttl_s, now_ms())
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let token = app.sessions.issue(&claims)?;
     let expires_at = rfc3339_ms(claims.exp * 1000);
@@ -1571,7 +1594,7 @@ async fn session_token(
         &origin,
         &sandbox.tenant,
         &id,
-        json!({ "token_id": claims.jti, "expires_at": expires_at }),
+        json!({ "token_id": claims.jti, "audience": claims.aud, "expires_at": expires_at }),
     );
     Ok(Json(json!({ "token": token, "expires_at": expires_at })))
 }
@@ -2074,8 +2097,12 @@ async fn update_secret(
     } else {
         "secret.updated"
     };
-    let view = app.secrets.update(ns.as_deref(), &name, input, now_ms())?;
-    app.admin_event(kind, &origin, ns.as_deref(), secret_attrs(&view));
+    let (view, previous_hosts) = app.secrets.update(ns.as_deref(), &name, input, now_ms())?;
+    let mut attrs = secret_attrs(&view);
+    if previous_hosts != view.spec.allowed_hosts {
+        attrs["previous_allowed_hosts"] = json!(previous_hosts);
+    }
+    app.admin_event(kind, &origin, ns.as_deref(), attrs);
     Ok(Json(view))
 }
 
@@ -2955,5 +2982,29 @@ mod tests {
         assert!(refused.contains("2 sandboxes"), "{refused}");
         assert!(refused.contains("--allow-unreadable-env"), "{refused}");
         assert!(check_unreadable(&ids, key, true).is_ok());
+    }
+
+    #[test]
+    fn session_tokens_name_one_audience() {
+        let audience = |body: &str| {
+            parse::<SessionTokenRequest>(&Bytes::from(body.to_owned()))
+                .and_then(|req| req.audience())
+                .map_err(|e| e.message)
+        };
+        assert_eq!(audience(r#"{"audience":"terminal"}"#).unwrap(), "terminal");
+        assert_eq!(
+            audience(r#"{"audience":"preview","port":3000}"#).unwrap(),
+            "preview:3000"
+        );
+        for bad in [
+            "{}",
+            r#"{"ttl_s":60}"#,
+            r#"{"audience":"preview"}"#,
+            r#"{"audience":"preview","port":0}"#,
+            r#"{"audience":"terminal","port":3000}"#,
+            r#"{"audience":"admin"}"#,
+        ] {
+            assert!(audience(bad).is_err(), "{bad}");
+        }
     }
 }

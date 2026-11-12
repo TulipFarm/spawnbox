@@ -677,10 +677,13 @@ Type `exit` to close the terminal.
 ### Open a terminal or a private preview in a browser
 
 Do not give your API key to a browser. Get a session token for one
-sandbox from your server, and give the token to the browser:
+sandbox from your server, and give the token to the browser. A token
+opens one thing: the terminal, or the `private` preview of one port.
 
 ```sh
-curl -s -H "$A" -d '{"ttl_s": 900}' $B/sandboxes/$S/session-tokens
+curl -s -H "$A" -d '{"ttl_s": 900, "audience": "terminal"}' $B/sandboxes/$S/session-tokens
+curl -s -H "$A" -d '{"ttl_s": 900, "audience": "preview", "port": 3000}' \
+  $B/sandboxes/$S/session-tokens
 ```
 
 - For the terminal, the browser opens
@@ -1778,20 +1781,28 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 - At the end, the server sends
   `{"type":"exit","exit_code","signal","duration_ms"}`.
 - If you close the WebSocket, Spawnbox stops the shell.
-- A browser can use a session token instead of an API key: add
-  `session_token=<token>` to the query.
+- A browser can use a session token with the `terminal` audience
+  instead of an API key: add `session_token=<token>` to the query.
 
 ### Browser session tokens
 
 - `POST /v1/sandboxes/{id}/session-tokens` makes a token for one
-  sandbox. Field: `ttl_s` (1 to 900, default 900). The response has
-  `token` and `expires_at`. The key must have `sandboxes:write`.
-- The token is a JWT (HS256). It opens only the terminal and the
-  `private` preview URLs of that sandbox. It does not work on other API
-  calls.
+  sandbox. Fields:
+  - `audience` (required): `terminal` or `preview`.
+  - `port`: the published port that a `preview` token opens. It is
+    required for `preview`, and not allowed for `terminal`.
+  - `ttl_s`: 1 to 900, default 900.
+- The response has `token` and `expires_at`. The key must have
+  `sandboxes:write`. A missing or bad `audience` or `port` gives
+  `400 invalid_request`.
+- The token is a JWT (HS256) with an `aud` claim. A `terminal` token
+  opens only the terminal of that sandbox. A `preview` token opens only
+  the `private` preview URL of that port. A token does not work on other
+  API calls.
 - The token stops at `expires_at`, or when the key that made it is
   revoked.
-- Each new token records a `sandbox.session_token_created` event.
+- Each new token records a `sandbox.session_token_created` event, with
+  its `audience`.
 - Spawnbox signs tokens with `<data-dir>/session.key`. The primary sends
   this key to the workers. If you delete the file, all tokens stop.
 
@@ -1889,9 +1900,16 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     `ttl_s` (default 24 hours). At the first visit, it becomes a cookie.
   - `public`: all persons with the URL can open it.
   - `private`: the request must have the API key in `Authorization`, or
-    a session token for the sandbox. Add the token to the URL as
+    a `preview` session token for the port. Add the token to the URL as
     `?spawnbox_session=<token>`. At the first visit, it becomes a cookie.
     Spawnbox removes this cookie before the request goes to the app.
+- For each `access`, Spawnbox removes these from a request before it goes
+  to the app: the `spawnbox_session` and `spawnbox_preview` cookies, the
+  `spawnbox_session` query parameter, and an `Authorization` header with a
+  Spawnbox API key (`Bearer sbx_...`) or a session token that this
+  install made. On `public` and `token` ports, other `Authorization`
+  values go to the app, so an app can use its own logins. On `private`
+  ports, Spawnbox removes all `Authorization` values.
 - Spawnbox serves previews on `--preview-listen` at `--preview-url`. It
   finds the sandbox from the host name.
 - HTTP/1.1 and WebSockets are supported.
@@ -1912,6 +1930,24 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   A pattern is a host name or `*.example.com`.
   - `allowlist` checks the TLS SNI or the HTTP `Host` name. It allows only
     ports 80 and 443.
+  - `deny` is checked by name too: the TLS SNI, the HTTP `Host` name or
+    the DNS query. Thus, when any policy has a `deny` list, `allow_all`
+    refuses a TCP connection without a name on any port, for example to a
+    bare address or TLS without SNI. It also drops UDP (except DNS) and
+    ICMP. Without a `deny` list, `allow_all` allows these.
+    An address written as a name, such as `Host: 93.184.215.14` or
+    `0x5db8d70e`, counts as no name.
+  - `deny` blocks names, not addresses. Spawnbox does not compare the
+    address that an allowed name resolves to with the addresses of denied
+    names. A sandbox that can use a name whose DNS it controls, such as a
+    wildcard DNS service that answers `1-2-3-4.example` with `1.2.3.4`,
+    can reach the address of a denied host. Thus, a `deny` list stops
+    mistakes and casual use, not a determined program. Use `allowlist`
+    when that matters.
+  - A name check sees only the name that the client sends in clear text.
+    A server that hosts many names, such as a CDN, can serve a denied
+    name behind an allowed one (domain fronting or TLS Encrypted Client
+    Hello). Use `allowlist` when that matters.
   - `deny_all` also blocks DNS.
 - Each DNS query from a sandbox goes to the DNS forwarder of Spawnbox,
   for all DNS server addresses. The forwarder sends the query to `--dns`
@@ -1949,6 +1985,14 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   header of the secret. The default header is `Authorization: Bearer`.
   `git_https` uses Basic authentication.
 - After a `PATCH`, the next request uses the new value.
+- A `PATCH` that adds to `allowed_hosts` or changes `header` or `format`
+  must also send `value`. Without it, the response is
+  `400 value_required`, so a key that can change a secret cannot send its
+  stored value to a new host. A `PATCH` that only removes hosts does not
+  need `value`.
+- The `secret.updated` and `secret.rotated` events show `allowed_hosts`.
+  When the hosts change, they also show `previous_allowed_hosts`. They
+  never show the value.
 - Sandboxes trust the CA of the proxy. `SSL_CERT_FILE`,
   `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` point
   to the system certificate bundle.
@@ -2225,6 +2269,13 @@ To show previews on the internet:
 2. Add these flags:
    `--preview-listen 0.0.0.0:8081 --preview-url https://{label}.preview.example.com`.
 3. Keep `--listen` on `127.0.0.1`, or use `--tls-cert` and `--tls-key`.
+
+Use a registrable domain only for previews, such as
+`*.example-preview.com`, not a name under the domain of your own site.
+An app in a sandbox can set cookies for its parent domains. Under your
+own domain, it could set cookies that your site reads. Previews of
+different sandboxes can also set cookies for each other. To stop that,
+add the preview domain to the [Public Suffix List](https://publicsuffix.org/).
 
 ## Troubleshooting
 

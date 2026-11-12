@@ -10,7 +10,8 @@ const MAX_MBPS: u32 = 100_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// Any host, except platform blocks and `deny`.
+    /// Any host, except platform blocks and `deny`. With a `deny` list,
+    /// only named TCP connections and DNS.
     AllowAll,
     /// Only hosts in `allow` and not in `deny`, by name, on ports 80 and 443.
     Allowlist,
@@ -76,11 +77,13 @@ impl Policy {
 
     /// Whether this policy lets a connection to `host` through. `host` is
     /// `None` when the connection carries no name (not HTTP, or TLS without
-    /// SNI); only `allow_all` lets those through.
+    /// SNI); only `allow_all` without a `deny` list lets those through,
+    /// since a `deny` list is checked by name. An address written as a
+    /// name, such as `1.2.3.4` or `0x5db8d70e`, counts as no name.
     pub fn allows(&self, host: Option<&str>) -> bool {
-        match (self.mode, host) {
+        match (self.mode, host.filter(|h| !is_address(h))) {
             (Mode::DenyAll, _) => false,
-            (Mode::AllowAll, None) => true,
+            (Mode::AllowAll, None) => self.deny.is_empty(),
             (Mode::Allowlist, None) => false,
             (Mode::AllowAll, Some(host)) => !matches_any(&self.deny, host),
             (Mode::Allowlist, Some(host)) => {
@@ -137,12 +140,26 @@ pub fn check_pattern(pattern: &str) -> Result<String, String> {
         None => (false, pattern),
     };
     let name = normalize_host(name).ok_or_else(|| format!("bad host pattern: {pattern:?}"))?;
-    if name.parse::<Ipv4Addr>().is_ok() {
+    if is_address(&name) {
         return Err(format!(
             "host patterns are names, not addresses: {pattern:?}"
         ));
     }
     Ok(if wildcard { format!("*.{name}") } else { name })
+}
+
+/// Whether a resolver would read `host` as an address rather than look it
+/// up: a name whose last label is a number, in decimal, octal or hex
+/// (`1.2.3.4`, `1572395022`, `0x5db8d70e`), or an IPv6 address. No
+/// top-level domain is a number.
+pub fn is_address(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let last = host.rsplit('.').next().unwrap_or(host);
+    let hex = last
+        .strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    hex || (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit())) || host.contains(':')
 }
 
 /// Lowercases a DNS name and drops a trailing dot. `None` if it is not a
@@ -219,11 +236,34 @@ mod tests {
 
     #[test]
     fn allow_all_and_deny_all() {
+        assert!(Policy::allow_all().allows(None));
         let p = policy(r#"{"mode":"allow_all","deny":["example.com"]}"#);
-        assert!(p.allows(None));
+        assert!(!p.allows(None), "a deny list needs a name to check");
         assert!(p.allows(Some("github.com")));
         assert!(!p.allows(Some("example.com")));
         assert!(!policy(r#"{"mode":"deny_all"}"#).allows(Some("github.com")));
+    }
+
+    #[test]
+    fn an_address_as_a_name_is_no_name() {
+        let p = policy(r#"{"mode":"allow_all","deny":["example.com"]}"#);
+        for host in [
+            "93.184.215.14",
+            "93.184.215.14.",
+            "1572395022",
+            "0x5db8d70e",
+            "0X5DB8D70E",
+            "93.0xb8.0327.14",
+            "93.184.55054",
+            "::1",
+        ] {
+            assert!(is_address(host), "{host}");
+            assert!(!p.allows(Some(host)), "{host}");
+        }
+        for host in ["github.com", "1-2-3-4.sslip.io", "0x.example", "a1"] {
+            assert!(!is_address(host), "{host}");
+        }
+        assert!(Policy::allow_all().allows(Some("93.184.215.14")));
     }
 
     #[test]
@@ -232,6 +272,8 @@ mod tests {
             r#"{"mode":"allow_all","allow":["a.com"]}"#,
             r#"{"mode":"deny_all","deny":["a.com"]}"#,
             r#"{"mode":"allowlist","allow":["1.2.3.4"]}"#,
+            r#"{"mode":"allowlist","allow":["*.4"]}"#,
+            r#"{"mode":"allow_all","deny":["0x5db8d70e"]}"#,
             r#"{"mode":"allowlist","allow":["a..com"]}"#,
             r#"{"mode":"allowlist","allow":["*"]}"#,
             r#"{"mode":"allowlist","allow":["a.com/x"]}"#,

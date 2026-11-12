@@ -626,7 +626,13 @@ flowchart LR
   by its source address, and decides.
 - **Policy.** The server, tenant and sandbox policies all apply; the
   strictest wins.
-  - `allow_all` allows any public address.
+  - `allow_all` allows any public address. With a `deny` list it needs a
+    name (TLS SNI or HTTP `Host`) on every TCP port, since `deny` is
+    checked by name, and the namespace forwards only TCP and DNS. A name
+    that a resolver would read as an address (`1.2.3.4`, `0x5db8d70e`)
+    is no name. The proxy does not match addresses against denied names,
+    so a name with attacker-controlled DNS can still reach a denied
+    host's address.
   - `allowlist` reads the TLS SNI or HTTP `Host` name and allows only
     listed names on ports 80 and 443.
   - `deny_all` blocks everything, including DNS.
@@ -813,7 +819,15 @@ config version. A worker with an old version asks the primary for the
 full set and applies it in one transaction: tenants, key hashes, template
 specs (each worker builds them itself), and the current values of the
 secrets that it holds. Before a create, the primary pushes the secrets
-that the sandbox attaches.
+that the sandbox attaches. A config sync returns values only for held
+secrets that the primary pushed to that worker, or that the worker's
+sandboxes or the templates' `registry_secrets` attach. A tenant's name
+counts for both its own and the org-wide secret, since a sandbox keeps the
+one it started with when the tenant later adds or removes its own. The
+sync leaves out any other key that a worker names, and that worker keeps
+its copy. A worker removes a secret only when the sync lists it as
+deleted on the primary, so a restart of the primary never takes a secret
+from a running sandbox.
 
 **Placing a sandbox.** The primary checks the tenant's quota against its
 own sandboxes, the worker sandboxes it knows, and creates in flight. Then
@@ -1077,6 +1091,8 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 | Boundary | What protects it |
 | --- | --- |
 | Sandbox to host | KVM hardware virtualization, Firecracker's minimal device model, jailer chroot, unprivileged uid, cgroups, seccomp. On gVisor hosts: the gVisor user-space kernel with its seccomp filter, cgroups, and a network namespace that `runsc` owns. |
+| Guest agent to host | The host takes gRPC messages of at most 4 MiB from a guest agent, and keeps at most 10 MiB of output from a command that it runs there itself |
+| Jailed VMM to host files | After a pause or snapshot, root takes the files out of the jail without following links: a symlink, hard link or other file that is not a regular one is removed and the pause fails |
 | Sandbox to sandbox | Separate VMs, jails and network namespaces; same addresses inside, but no route between them |
 | Sandbox to your network | Host firewall drops private, link-local, loopback and host addresses; all TCP goes through the proxy |
 | Sandbox to secrets | Only placeholders inside; real values are added outside the VM and only for allowed hosts |
@@ -1084,6 +1100,7 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 | Volume to sandbox | A sandbox gets only the volume files named in its create, looked up in its tenant; the host attaches them, the guest cannot ask for others |
 | API to the world | Hashed API keys with scopes; listens on localhost by default; optional TLS |
 | Primary to worker | Mutual TLS from the fleet CA; one-time join tokens; workers take calls only from the primary's certificate; removed nodes are refused at once |
+| Worker to fleet | A worker gets only the secret values that its sandboxes and template pulls use. It does get every API key hash, as it checks API keys itself, and the browser session key, as it makes and checks session tokens. Thus, someone with root on a worker can make session tokens for any sandbox in the fleet that an active key may open, for up to 15 minutes each. Treat a worker host as you treat the primary |
 
 The guest agent runs as root inside the VM and is **not trusted** by the
 host: the VM boundary is the security boundary. Spawnbox has not had an

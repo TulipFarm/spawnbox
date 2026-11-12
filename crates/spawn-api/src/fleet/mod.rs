@@ -244,8 +244,13 @@ pub struct Config {
     pub keys: Vec<KeyCopy>,
     /// Every template but `base`, which each host makes itself.
     pub templates: Vec<TemplateCopy>,
-    /// Current values of the held secrets that still exist.
+    /// Current values of the held secrets that still exist and that the
+    /// worker's sandboxes and templates may use.
     pub secrets: Vec<SecretCopy>,
+    /// Held secrets that the primary has deleted. The worker removes only
+    /// these, never a secret just left out of `secrets`.
+    #[serde(default)]
+    pub gone: Vec<String>,
     /// Hex key that signs browser session tokens.
     #[serde(default)]
     pub session_key: Option<String>,

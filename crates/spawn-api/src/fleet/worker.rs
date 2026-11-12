@@ -215,7 +215,7 @@ pub async fn sync(app: &App, w: &Worker) -> Result<u64> {
     let _syncing = w.syncing.lock().await;
     let held = app.secrets.keys().map_err(|e| anyhow::anyhow!(e.message))?;
     let config: Config = w
-        .call("/fleet/v1/config", &ConfigRequest { held: held.clone() })
+        .call("/fleet/v1/config", &ConfigRequest { held })
         .await
         .map_err(Failure::error)?;
     let keys = config
@@ -241,7 +241,7 @@ pub async fn sync(app: &App, w: &Worker) -> Result<u64> {
         .remove_others(&keep)
         .map_err(|e| anyhow::anyhow!(e.message))?;
     app.secrets
-        .import(&config.secrets, Some(&held))
+        .import(&config.secrets, &config.gone)
         .map_err(|e| anyhow::anyhow!(e.message))?;
     if let Some(key) = &config.session_key {
         app.sessions.set(unhex(key).context("bad session key")?);
@@ -566,7 +566,7 @@ async fn cold_start_here(
 
 async fn take_secrets(State(app): State<AppState>, body: Bytes) -> Result<Json<Value>, ApiError> {
     let push: SecretPush = parse(&body)?;
-    app.secrets.import(&push.secrets, None)?;
+    app.secrets.import(&push.secrets, &[])?;
     Ok(Json(json!({})))
 }
 

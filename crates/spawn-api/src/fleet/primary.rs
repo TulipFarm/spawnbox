@@ -90,6 +90,10 @@ pub struct Primary {
     pub busy: Busy,
     pub retirer: Retirer,
     failed_builds: FailedBuilds,
+    /// Storage keys of the secrets pushed to each node since this primary
+    /// started. A node's config sync gets values only for these and the
+    /// secrets its sandboxes and templates attach.
+    pushed: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 /// When a node last failed to build a template spec, by node and spec hash;
@@ -137,6 +141,7 @@ impl Primary {
             busy: Busy::default(),
             retirer: Retirer::default(),
             failed_builds: FailedBuilds::default(),
+            pushed: Mutex::default(),
         })
     }
 
@@ -163,6 +168,25 @@ impl Primary {
 
     pub fn ca_sha256(&self) -> Result<String> {
         self.ca.fingerprint()
+    }
+
+    /// Notes that the secrets with storage keys `keys` were sent to `node`.
+    pub fn note_pushed(&self, node: &str, keys: &[String]) {
+        self.pushed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(node.to_owned())
+            .or_default()
+            .extend(keys.iter().cloned());
+    }
+
+    fn pushed_to(&self, node: &str) -> HashSet<String> {
+        self.pushed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn version(&self) -> u64 {
@@ -517,7 +541,7 @@ async fn config(
     body: Bytes,
 ) -> Result<Json<Config>, ApiError> {
     let p = primary(&app)?;
-    worker(&app, &peer, &headers)?;
+    let node = worker(&app, &peer, &headers)?;
     let req: ConfigRequest = parse(&body)?;
     // Read first: a change while copying gives a newer version, so the
     // worker asks again.
@@ -548,6 +572,27 @@ async fn config(
         };
         *uses.entry(key).or_default() += count;
     }
+    // A worker gets values only for secrets it was sent or that its
+    // sandboxes and every host's template pulls attach, not for any key it
+    // names.
+    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+    for sandbox in app.db.node_sandboxes(&node.id)? {
+        refs.extend(
+            sandbox
+                .secrets
+                .into_iter()
+                .map(|name| (Some(sandbox.tenant.clone()), name)),
+        );
+    }
+    for t in &names {
+        if let Ok(spec) = serde_json::from_str::<TemplateSpec>(&t.spec) {
+            let ns = crate::tenancy::split(&t.name).0.map(str::to_owned);
+            refs.extend(spec.registry_secrets.into_iter().map(|n| (ns.clone(), n)));
+        }
+    }
+    let held = app
+        .secrets
+        .shareable(&req.held, &p.pushed_to(&node.id), &refs);
     let templates = names
         .into_iter()
         .map(|t| TemplateCopy {
@@ -561,7 +606,8 @@ async fn config(
         tenants: app.db.list_tenants()?,
         keys,
         templates,
-        secrets: app.secrets.export(&req.held)?,
+        secrets: app.secrets.export(&held)?,
+        gone: app.secrets.gone(&req.held)?,
         session_key: app.sessions.key_hex(),
         edges: app.db.edge_ids()?,
     }))
@@ -1011,6 +1057,7 @@ async fn start_on(
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        p.note_pushed(&node.id, &keys);
         let push = SecretPush {
             secrets: app.secrets.export(&keys).map_err(fail)?,
         };
@@ -1304,6 +1351,7 @@ async fn place(
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        p.note_pushed(&node.id, &keys);
         let push = SecretPush {
             secrets: app
                 .secrets

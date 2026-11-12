@@ -26,6 +26,14 @@ use tonic::{Status, Streaming};
 use crate::handshake;
 use crate::netplan::GUEST_IP;
 
+/// The largest gRPC message the host takes from a guest agent. This is
+/// tonic's default, set here so that it cannot grow unnoticed: the guest is
+/// not trusted.
+pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most stdout and stderr, together, that [`exec`] keeps in memory.
+pub const MAX_EXEC_OUTPUT: usize = 10 * 1024 * 1024;
+
 /// How the host reaches a guest's agent.
 #[derive(Clone, Debug)]
 pub enum Dialer {
@@ -186,6 +194,7 @@ impl IncompatibleGuest {
 /// `IncompatibleGuest` if this host does not accept the guest.
 pub async fn hello(channel: &Channel) -> Result<(String, ProtocolVersion)> {
     let reply = HealthClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .hello(HelloRequest {
             host_version: Some(PROTOCOL_VERSION),
         })
@@ -201,7 +210,10 @@ pub async fn hello(channel: &Channel) -> Result<(String, ProtocolVersion)> {
 }
 
 pub async fn apply(channel: &Channel, request: ApplyRequest) -> Result<()> {
-    IdentityClient::new(channel.clone()).apply(request).await?;
+    IdentityClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .apply(request)
+        .await?;
     Ok(())
 }
 
@@ -223,13 +235,17 @@ pub async fn mount(channel: &Channel, volumes: &[(crate::Attach, String)]) -> Re
             size_bytes,
         });
     }
-    VolumesClient::new(channel.clone()).mount(request).await?;
+    VolumesClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .mount(request)
+        .await?;
     Ok(())
 }
 
 /// Flushes and freezes the guest's writable disk. Stop the VM right after.
 pub async fn seal(channel: &Channel) -> Result<()> {
     ImageClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .seal(SealRequest {})
         .await?;
     Ok(())
@@ -250,6 +266,7 @@ pub async fn unpack(
         extra_ca_pem: ca.unwrap_or_default().to_owned(),
     };
     let mut events = ImageClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .unpack(request)
         .await?
         .into_inner();
@@ -278,6 +295,7 @@ pub async fn exec_stream(
     request: ExecRequest,
 ) -> Result<Streaming<ExecEvent>, Status> {
     Ok(ProcessClient::new(channel.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .exec(request)
         .await?
         .into_inner())
@@ -292,29 +310,86 @@ pub async fn exec(channel: &Channel, cmd: &str) -> Result<Output> {
         ..Default::default()
     };
     let mut events = exec_stream(channel, request).await?;
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let mut first_output = None;
-    let mut exit: Option<ExecExit> = None;
+    let mut collected = Collected::default();
     while let Some(event) = events.message().await? {
-        match event.event {
-            Some(Event::Stdout(bytes)) => {
-                first_output.get_or_insert_with(|| started.elapsed());
-                stdout.extend(bytes);
-            }
-            Some(Event::Stderr(bytes)) => stderr.extend(bytes),
-            Some(Event::Exit(e)) => exit = Some(e),
-            None => {}
+        if matches!(event.event, Some(Event::Stdout(_))) {
+            collected
+                .first_output
+                .get_or_insert_with(|| started.elapsed());
         }
+        // Dropping the stream on error kills the command.
+        collected.push(event).with_context(|| format!("`{cmd}`"))?;
     }
-    let exit = exit.context("exec stream ended without an exit event")?;
+    let exit = collected
+        .exit
+        .context("exec stream ended without an exit event")?;
     if exit.exit_code != Some(0) {
         bail!(
             "`{cmd}` failed with {exit:?}: {}",
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(&collected.stderr)
         );
     }
     Ok(Output {
-        stdout: String::from_utf8_lossy(&stdout).trim().to_owned(),
-        first_output,
+        stdout: String::from_utf8_lossy(&collected.stdout).trim().to_owned(),
+        first_output: collected.first_output,
     })
+}
+
+/// The events of one [`exec`], with at most [`MAX_EXEC_OUTPUT`] bytes of
+/// output.
+#[derive(Default)]
+struct Collected {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    first_output: Option<Duration>,
+    exit: Option<ExecExit>,
+}
+
+impl Collected {
+    fn push(&mut self, event: ExecEvent) -> Result<()> {
+        let kept = self.stdout.len() + self.stderr.len();
+        let (buf, bytes) = match event.event {
+            Some(Event::Stdout(bytes)) => (&mut self.stdout, bytes),
+            Some(Event::Stderr(bytes)) => (&mut self.stderr, bytes),
+            Some(Event::Exit(e)) => {
+                self.exit = Some(e);
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
+        if kept + bytes.len() > MAX_EXEC_OUTPUT {
+            bail!("output is over {} MiB", MAX_EXEC_OUTPUT / (1024 * 1024));
+        }
+        buf.extend(bytes);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(stdout: bool, len: usize) -> ExecEvent {
+        let bytes = vec![b'x'; len];
+        ExecEvent {
+            event: Some(if stdout {
+                Event::Stdout(bytes)
+            } else {
+                Event::Stderr(bytes)
+            }),
+        }
+    }
+
+    #[test]
+    fn exec_output_is_capped() {
+        let mut collected = Collected::default();
+        collected.push(chunk(true, MAX_EXEC_OUTPUT / 2)).unwrap();
+        collected.push(chunk(false, MAX_EXEC_OUTPUT / 2)).unwrap();
+        assert!(collected.push(chunk(true, 1)).is_err());
+        assert!(collected.push(chunk(false, 1)).is_err());
+        assert_eq!(
+            collected.stdout.len() + collected.stderr.len(),
+            MAX_EXEC_OUTPUT
+        );
+    }
 }
