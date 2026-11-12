@@ -89,6 +89,7 @@ pub struct Primary {
     /// Calls that may still put a sandbox on each node.
     pub busy: Busy,
     pub retirer: Retirer,
+    pub drain_passes: migrate::DrainPasses,
     failed_builds: FailedBuilds,
     /// Storage keys of the secrets pushed to each node since this primary
     /// started. A node's config sync gets values only for these and the
@@ -140,6 +141,7 @@ impl Primary {
             autoscaler: OnceLock::new(),
             busy: Busy::default(),
             retirer: Retirer::default(),
+            drain_passes: migrate::DrainPasses::default(),
             failed_builds: FailedBuilds::default(),
             pushed: Mutex::default(),
         })
@@ -1751,6 +1753,7 @@ fn node_view(p: &Primary, node: &NodeRow, held: Held, retired: Option<&Retiremen
         "url": node.url,
         "state": node.state,
         "draining": node.draining,
+        "drain_running": p.drain_passes.running(&node.id),
         "created_at": rfc3339_ms(node.created_at),
         "last_seen": node.last_seen.map(rfc3339_ms),
         "capacity": report.get("capacity"),
@@ -1938,11 +1941,21 @@ pub async fn node_action(
         json!({ "node": id, "migrate": input.migrate }),
     );
     eprintln!("node {id}: {kind}");
-    if input.migrate {
+    // A second `:drain` while a pass runs starts nothing; the running pass
+    // takes what is there.
+    let pass = if !input.migrate {
+        None
+    } else if p.drain_passes.running(id) {
+        Some("already_running")
+    } else {
         tokio::spawn(migrate::drain(Arc::clone(&app), id.to_owned(), origin));
-    }
+        Some("started")
+    };
     let node = app.db.get_node(id)?.ok_or_else(node_not_found)?;
-    let view = view_of(&app, p, &node)?;
+    let mut view = view_of(&app, p, &node)?;
+    if let Some(pass) = pass {
+        view["drain_pass"] = json!(pass);
+    }
     let status = if input.migrate {
         StatusCode::ACCEPTED
     } else {

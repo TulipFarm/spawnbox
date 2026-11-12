@@ -1317,7 +1317,12 @@ commands on the primary.
    of sandboxes that moved and that did not move. The primary also moves
    the [volumes](#volumes-on-more-than-one-host) of the worker. One drain
    call moves what it can once. If something did not move, call `:drain`
-   again.
+   again. Only one move pass runs on a worker at a time: while one runs,
+   `GET /v1/nodes/NODE_ID` shows `"drain_running": true`, and another
+   `:drain` call starts nothing and answers `"drain_pass":
+   "already_running"`. A pass ends if the primary stops. A standby that
+   takes over keeps the worker drained but does not start a new pass, so
+   call `:drain` again.
 
 3. Do your work on the worker.
 4. Let the worker take new sandboxes again:
@@ -1327,9 +1332,12 @@ commands on the primary.
    ```
 
 With the CLI, `spawnbox nodes drain NODE_ID --wait` does steps 1 and 2.
-It calls `:drain` again each minute until the worker holds no sandboxes
-and no volumes, and exits with `1` after `--timeout` seconds (default
-1800). `spawnbox nodes ls` shows `SANDBOXES`, `VOLUMES` and the
+Until the worker holds no sandboxes and no volumes, it calls `:drain`
+again when no pass runs and a minute has passed since its last call, so
+it also restarts the drain after a standby takes over. It waits out
+errors, such as the API being away during that takeover, and exits with
+`1` after `--timeout` seconds (default 1800), or at once if someone
+undrains the worker. `spawnbox nodes ls` shows `SANDBOXES`, `VOLUMES` and the
 `VERSION` of each worker, and `spawnbox nodes undrain NODE_ID` does
 step 4.
 
@@ -2475,7 +2483,7 @@ These calls operate only on a primary. The key must have the scope
 | `GET /v1/nodes/autoscale` | Get the load, the workers in each state and the autoscaler requests. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `GET /v1/nodes/{id}` | Get one worker or edge |
 | `DELETE /v1/nodes/{id}` | Remove a worker or an edge. The sandboxes of a worker are marked deleted. |
-| `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes and volumes to other hosts: persistent sandboxes become `cold` and start again on other hosts. Gives `202` when it moves sandboxes. Call it again to retry what did not move. |
+| `POST /v1/nodes/{id}:drain` | Put no new sandboxes on the worker. You cannot drain an edge. With the body `{"migrate":true}`, also move its sandboxes and volumes to other hosts: persistent sandboxes become `cold` and start again on other hosts. Gives `202` when it moves sandboxes, with `drain_pass` set to `started`, or to `already_running` when a pass already runs, in which case it starts nothing. Call it again to retry what did not move. |
 | `POST /v1/nodes/{id}:undrain` | Put new sandboxes on the worker again. Gives `409` if the worker retires. |
 | `POST /v1/nodes/{id}:retire` | Retire the worker before you stop its machine. Optional body: `{"migrate":true,"reason":"..."}`. Gives `202`. Refer to [Retire a worker safely](#retire-a-worker-safely). |
 | `POST /v1/nodes/{id}:fenced` | Tell the primary that the host of a `down` or removed worker is off. Its persistent sandboxes become `cold`. Optional body: `{"reason":"..."}`. The response has `sandboxes_cold`. Gives `409` if the worker is not `down` or removed. Refer to [Fence lost hosts](#fence-lost-hosts). |
@@ -2761,9 +2769,17 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
   - A killed service runs again.
   - The memory and open files of `spawn-api` do not grow beyond
     `--max-rss-growth-mib` and `--max-fd-growth`.
-- The failover mode checks that a worker that is cut off stops its VMs
-  before the primary makes them cold. It also checks that a stale copy
-  does not run again, and that each sandbox starts again with its data.
+- The failover mode puts persistent sandboxes on one host, most with a
+  volume and some without, then cuts the host off. It checks that no
+  sample of the host's processes taken after the API made a sandbox cold
+  still shows its VM. It wakes the sandboxes without a volume while the
+  host is still cut off, so a second copy starts elsewhere, and checks
+  that the two never run at once, also after the host returns. Then it
+  checks that each sandbox starts again with its data.
+- A sandbox whose host is restarting or cut off, or whose volume's host
+  is away, may answer 503 for a while. The script asks again for up to
+  `--verify-wait` (default 3 minutes) before it counts the sandbox as
+  lost.
 - The script writes the summary (`--summary`) and exits with 1 if a check
   fails. `scripts/soak.py --help` lists every option.
 

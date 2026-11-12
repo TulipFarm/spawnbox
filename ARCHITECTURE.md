@@ -867,7 +867,11 @@ little.
 **Drain and migration.** `POST /v1/nodes/{id}:drain` sets `draining` on
 the node row; placement skips it. With `{"migrate":true}` a background
 task moves its sandboxes, persistent ones first (they are made cold, not
-copied; see below), then running ones, and records `node.drained`.
+copied; see below), then running ones, and records `node.drained`. One
+such pass runs per node at a time, the retirer's included; a second
+`:drain` while one runs is a no-op. The pass lives in the leader's
+memory: a new leader keeps `draining` but starts no pass until `:drain`
+is called again.
 `POST /v1/sandboxes/{id}:migrate` moves one. The primary drives every
 move; workers never call each other:
 

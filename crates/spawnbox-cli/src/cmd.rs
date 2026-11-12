@@ -902,6 +902,14 @@ async fn volumes(api: &Api, out: &Out, command: VolumesCommand) -> Result<i32> {
 const DRAIN_POLL: Duration = Duration::from_secs(5);
 const DRAIN_RETRY: Duration = Duration::from_secs(60);
 
+/// Whether `nodes drain --wait` should ask for another pass: things are
+/// left, no pass runs (it ended, or a new leader never started one), and
+/// the last ask was a while ago. A server too old to say whether a pass
+/// runs is asked every `DRAIN_RETRY`; it then runs passes side by side.
+fn ask_again(node: &Value, no_move: bool, since_asked: Duration) -> bool {
+    !no_move && !drained(node) && node["drain_running"] != json!(true) && since_asked >= DRAIN_RETRY
+}
+
 /// Whether a node view shows nothing left on the node.
 fn drained(node: &Value) -> bool {
     node["sandboxes"].as_u64() == Some(0) && node["volumes"].as_u64().unwrap_or(0) == 0
@@ -940,9 +948,15 @@ async fn nodes(api: &Api, out: &Out, command: NodesCommand) -> Result<i32> {
             let body = json!({ "migrate": !no_move });
             let mut node = api.post(&path, &body).await?;
             if wait {
+                let get = format!("/nodes/{}", seg(&id));
                 let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
                 let mut asked = std::time::Instant::now();
+                let mut last_error = None;
                 while !drained(&node) {
+                    if node["draining"] == json!(false) {
+                        eprintln!("{id} is no longer draining; someone undrained it");
+                        return Ok(1);
+                    }
                     if std::time::Instant::now() >= deadline {
                         eprintln!(
                             "{id} still holds {} sandboxes and {} volumes; see `spawnbox events` \
@@ -950,14 +964,28 @@ async fn nodes(api: &Api, out: &Out, command: NodesCommand) -> Result<i32> {
                             text(&node["sandboxes"]),
                             text(&node["volumes"])
                         );
+                        if let Some(error) = last_error {
+                            eprintln!("last error: {error:#}");
+                        }
                         return Ok(1);
                     }
                     tokio::time::sleep(DRAIN_POLL).await;
-                    node = api.get(&format!("/nodes/{}", seg(&id))).await?;
-                    if !no_move && !drained(&node) && asked.elapsed() >= DRAIN_RETRY {
-                        // A pass ends at what it could not move; try again.
-                        node = api.post(&path, &body).await?;
-                        asked = std::time::Instant::now();
+                    // Errors here, such as while a standby takes over, are
+                    // waited out until the deadline.
+                    let step = async {
+                        let mut next = api.get(&get).await?;
+                        if ask_again(&next, no_move, asked.elapsed()) {
+                            next = api.post(&path, &body).await?;
+                            asked = std::time::Instant::now();
+                        }
+                        anyhow::Ok(next)
+                    };
+                    match step.await {
+                        Ok(next) => node = next,
+                        Err(error) => {
+                            eprintln!("{id}: {error:#}; trying again");
+                            last_error = Some(error);
+                        }
                     }
                 }
             }
@@ -1239,6 +1267,20 @@ mod tests {
         assert!(!drained(&json!({ "sandboxes": 1, "volumes": 0 })));
         assert!(!drained(&json!({ "sandboxes": 0, "volumes": 2 })));
         assert!(!drained(&json!({})));
+    }
+
+    #[test]
+    fn a_drain_is_asked_again_only_when_no_pass_runs() {
+        let left = json!({ "sandboxes": 2, "volumes": 0, "drain_running": false });
+        let running = json!({ "sandboxes": 2, "volumes": 0, "drain_running": true });
+        let old_server = json!({ "sandboxes": 2, "volumes": 0 });
+        let done = json!({ "sandboxes": 0, "volumes": 0, "drain_running": false });
+        assert!(ask_again(&left, false, DRAIN_RETRY));
+        assert!(!ask_again(&left, false, DRAIN_POLL));
+        assert!(!ask_again(&left, true, DRAIN_RETRY));
+        assert!(!ask_again(&running, false, DRAIN_RETRY * 10));
+        assert!(ask_again(&old_server, false, DRAIN_RETRY));
+        assert!(!ask_again(&done, false, DRAIN_RETRY));
     }
 
     #[test]

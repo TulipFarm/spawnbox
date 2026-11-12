@@ -872,6 +872,49 @@ fn unreachable_or_broken(node: &NodeRow, failure: Failure) -> ApiError {
 pub struct Drained {
     pub failed: u32,
     pub volumes_failed: u32,
+    /// Another pass was already running on the node, so this one did
+    /// nothing.
+    pub skipped: bool,
+}
+
+/// The nodes a drain pass runs on now. Only one pass runs per node, so two
+/// `:drain` calls, or a drain and a retirement, never move the same
+/// sandboxes at once.
+#[derive(Default)]
+pub struct DrainPasses(Mutex<HashSet<String>>);
+
+impl DrainPasses {
+    pub fn running(&self, node: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(node)
+    }
+
+    /// Marks a pass on `node` as running until the guard is dropped, or
+    /// gives `None` if one already runs.
+    fn claim(&self, node: &str) -> Option<PassGuard<'_>> {
+        let mut running = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        running.insert(node.to_owned()).then(|| PassGuard {
+            passes: self,
+            node: node.to_owned(),
+        })
+    }
+}
+
+struct PassGuard<'a> {
+    passes: &'a DrainPasses,
+    node: String,
+}
+
+impl Drop for PassGuard<'_> {
+    fn drop(&mut self) {
+        self.passes
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.node);
+    }
 }
 
 fn still_draining(app: &App, node: &str) -> bool {
@@ -962,6 +1005,21 @@ async fn restart(app: &App, id: &str, origin: &Origin) -> Result<(), ApiError> {
 /// start now, paused ones on their next call. Plain sandboxes move with
 /// their memory. Then the volumes left there move.
 pub async fn drain(app: AppState, node: String, origin: Origin) -> Drained {
+    let Ok(p) = super::primary::primary(&app) else {
+        return Drained {
+            failed: 0,
+            volumes_failed: 0,
+            skipped: true,
+        };
+    };
+    let Some(_pass) = p.drain_passes.claim(&node) else {
+        eprintln!("drain {node}: a pass is already running");
+        return Drained {
+            failed: 0,
+            volumes_failed: 0,
+            skipped: true,
+        };
+    };
     let mut sandboxes = app.db.node_sandboxes(&node).unwrap_or_default();
     drain_order(&mut sandboxes);
     let (mut moved, mut failed, mut cold) = (0u32, 0u32, 0u32);
@@ -1027,6 +1085,7 @@ pub async fn drain(app: AppState, node: String, origin: Origin) -> Drained {
     Drained {
         failed,
         volumes_failed,
+        skipped: false,
     }
 }
 
@@ -1084,6 +1143,20 @@ mod tests {
             .unwrap()
             .set_len(64 << 20)
             .unwrap();
+    }
+
+    #[test]
+    fn only_one_drain_pass_runs_per_node() {
+        let passes = DrainPasses::default();
+        let first = passes.claim("nod_a").expect("first pass");
+        assert!(passes.running("nod_a"));
+        assert!(passes.claim("nod_a").is_none());
+        let other = passes.claim("nod_b").expect("another node");
+        drop(first);
+        assert!(!passes.running("nod_a"));
+        assert!(passes.claim("nod_a").is_some());
+        drop(other);
+        assert!(!passes.running("nod_b"));
     }
 
     #[test]
