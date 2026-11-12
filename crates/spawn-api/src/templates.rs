@@ -51,6 +51,16 @@ const CLAIM_STALE: Duration = Duration::from_secs(180);
 const CLAIM_REFRESH: Duration = Duration::from_secs(30);
 const CLAIM_POLL: Duration = Duration::from_secs(5);
 static CLAIMS_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+/// How long a cold start waits for its build to be made again before the
+/// call fails with `rebuilding`; the build goes on.
+const REBUILD_WAIT: Duration = Duration::from_secs(60);
+/// A failed build for persistent sandboxes is not tried again for this
+/// long; calls fail with `build_failed` meanwhile.
+const REBUILD_RETRY: Duration = Duration::from_secs(5 * 60);
+/// A kept build stays this long after its last use even if no start
+/// record names it, so a build made again for a cold start that gave up
+/// waiting is there when the call is repeated.
+const ROOT_GRACE_MS: i64 = 10 * 60 * 1000;
 
 /// This host's claim on building a store key. It is written again while
 /// held, and deleted when dropped.
@@ -151,6 +161,8 @@ impl Slots {
 pub struct ReadyBuild {
     pub id: String,
     seq: i64,
+    /// Made for persistent sandboxes only, never a template's current build.
+    root: bool,
     pub build: Build,
     pub spec: TemplateSpec,
     dir: PathBuf,
@@ -181,6 +193,7 @@ impl ReadyBuild {
         Self {
             id: build.id.clone(),
             seq: build.seq,
+            root: build.root,
             build: files,
             spec,
             dir,
@@ -251,6 +264,83 @@ pub struct Templates {
     cpu: String,
     /// Snapshot templates saved here, and when.
     fresh: Mutex<HashMap<String, Instant>>,
+    /// Builds being made again for persistent sandboxes, by `rebuild_key`.
+    /// Each holds its last failure.
+    rebuilds: Mutex<HashMap<String, RebuildGate>>,
+    /// False on fleet workers, which do not know every start record, so
+    /// they never delete from the build store.
+    collects: bool,
+}
+
+/// Held while a template spec is built again for cold starts; holds when
+/// and why the last such build failed.
+type RebuildGate = Arc<tokio::sync::Mutex<Option<(Instant, String)>>>;
+
+/// Why a persistent sandbox's build was made again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildReason {
+    /// Neither this host nor the build store has it.
+    Missing,
+    /// It was made with another kernel, base disk or runtime.
+    Outdated,
+    /// Its guest is more than two minor versions from this host's.
+    GuestTooOld,
+}
+
+impl RebuildReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Outdated => "outdated",
+            Self::GuestTooOld => "guest_too_old",
+        }
+    }
+
+    /// Why `build`, if known, cannot start a sandbox on a host with
+    /// `fingerprint`.
+    fn of(build: Option<&db::Build>, fingerprint: &str) -> Self {
+        match build {
+            Some(b) if guest_too_old(b) => Self::GuestTooOld,
+            Some(b) if b.fingerprint != fingerprint => Self::Outdated,
+            _ => Self::Missing,
+        }
+    }
+}
+
+/// The build a cold persistent sandbox starts from.
+pub struct Root {
+    pub ready: Arc<ReadyBuild>,
+    /// Set when it was made again, or another build of the same spec was
+    /// taken, because the recorded one could not be used.
+    pub rebuilt: Option<RebuildReason>,
+}
+
+/// True if `build`'s guest is known and this host does not accept it.
+pub fn guest_too_old(build: &db::Build) -> bool {
+    build
+        .guest
+        .as_deref()
+        .and_then(spawn_proto::parse_version)
+        .is_some_and(|guest| !spawn_proto::is_compatible(&spawn_proto::PROTOCOL_VERSION, &guest))
+}
+
+/// Builds of the same template, spec and host inputs share one key, so
+/// cold starts that need the same build wait for one build.
+fn rebuild_key(template: &str, spec: &TemplateSpec, fingerprint: &str) -> String {
+    let spec = serde_json::to_string(&spec.for_build()).unwrap_or_default();
+    let mut hash = Sha256::new();
+    for part in [template, &spec, fingerprint] {
+        hash.update(part.len().to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    crate::fleet::hex(&hash.finalize())
+}
+
+fn build_failed(why: &str) -> ApiError {
+    ApiError::new(
+        Code::BuildFailed,
+        format!("the sandbox's build could not be made again for this host: {why}"),
+    )
 }
 
 impl Templates {
@@ -270,6 +360,7 @@ impl Templates {
         store: Option<Arc<BuildStore>>,
         cache_bytes: u64,
         wait_for_base: bool,
+        collects: bool,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let fingerprint = {
@@ -303,6 +394,8 @@ impl Templates {
             cache_bytes,
             cpu: store::cpu_model(),
             fresh: Mutex::new(HashMap::new()),
+            rebuilds: Mutex::new(HashMap::new()),
+            collects,
         });
         this.load()?;
         if wait_for_base {
@@ -317,6 +410,12 @@ impl Templates {
             });
         }
         for build in this.db.builds_in(&[build_state::QUEUED])? {
+            // Made again when a cold start needs it.
+            if build.root {
+                this.db
+                    .set_build_state(&build.id, build_state::REMOVED, now_ms(), None)?;
+                continue;
+            }
             this.queue(build.id);
         }
         if this.store.is_some() {
@@ -509,6 +608,15 @@ impl Templates {
             .values()
             .filter_map(|b| b.store_key.clone())
             .collect();
+        keep.extend(self.kept().values().filter_map(|b| b.store_key.clone()));
+        // A worker does not know every start record, so it only keeps its
+        // own builds recent and leaves deleting to primaries.
+        if !self.collects {
+            if let Err(error) = store.refresh(&keep).await {
+                eprintln!("build store: clean up: {error:#}");
+            }
+            return;
+        }
         // Builds that persistent sandboxes start from, loaded here or not.
         let roots = self.db.build_roots().and_then(|roots| {
             roots
@@ -765,11 +873,33 @@ impl Templates {
         }
     }
 
-    /// Lets go of kept builds that no start record names any more.
+    /// Lets go of kept builds that no start record names any more and
+    /// that were not used for `ROOT_GRACE_MS`.
     pub fn prune_roots(&self) {
-        match self.db.build_roots() {
-            Ok(roots) => self.kept().retain(|id, _| roots.contains(id)),
-            Err(error) => eprintln!("build roots: {error}"),
+        let roots = match self.db.build_roots() {
+            Ok(roots) => roots,
+            Err(error) => {
+                eprintln!("build roots: {error}");
+                return;
+            }
+        };
+        let now = now_ms();
+        let mut gone = Vec::new();
+        self.kept().retain(|id, ready| {
+            let keep =
+                roots.contains(id) || now - ready.last_used.load(Ordering::SeqCst) < ROOT_GRACE_MS;
+            if !keep && ready.root {
+                gone.push(id.clone());
+            }
+            keep
+        });
+        for id in gone {
+            if let Err(error) = self
+                .db
+                .set_build_state(&id, build_state::REMOVED, now, None)
+            {
+                eprintln!("build {id}: {error}");
+            }
         }
     }
 
@@ -801,6 +931,162 @@ impl Templates {
         Ok(ready)
     }
 
+    /// The build cold sandbox `start` starts from: its recorded build if
+    /// this host can use it, else another ready build of the same template
+    /// and spec, else a new build of that spec. Waits up to
+    /// `REBUILD_WAIT` for a build, then fails with `rebuilding` while the
+    /// build goes on.
+    pub async fn start_root(self: &Arc<Self>, start: &db::StartRecord) -> Result<Root, ApiError> {
+        let row = self.db.get_build(&start.build)?;
+        if !row.as_ref().is_some_and(guest_too_old)
+            && let Some(ready) = self.usable(&start.build).await
+        {
+            return Ok(Root {
+                ready,
+                rebuilt: None,
+            });
+        }
+        let reason = RebuildReason::of(row.as_ref(), &self.fingerprint);
+        let spec: TemplateSpec = serde_json::from_str(&start.spec).map_err(ApiError::internal)?;
+        if spec.snapshot.is_some() {
+            return Err(build_failed(
+                "it is a snapshot saved on another host or by another version",
+            ));
+        }
+        let template = match &row {
+            Some(build) => build.template.clone(),
+            None => self
+                .key(Some(&start.tenant), &start.template)
+                .unwrap_or_else(|_| scoped(Some(&start.tenant), &start.template)),
+        };
+        let this = Arc::clone(self);
+        let json = start.spec.clone();
+        let made = tokio::spawn(async move { this.rebuild_root(template, spec, json).await });
+        let ready = match tokio::time::timeout(REBUILD_WAIT, made).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => return Err(ApiError::internal(format!("task failed: {error}"))),
+            Err(_) => {
+                return Err(ApiError::new(
+                    Code::Rebuilding,
+                    "the sandbox's build is being made again for this host; try again soon",
+                ));
+            }
+        };
+        Ok(Root {
+            ready,
+            rebuilt: Some(reason),
+        })
+    }
+
+    /// Build `id` if a sandbox can start from it here: its files are here,
+    /// or in the build store.
+    async fn usable(&self, id: &str) -> Option<Arc<ReadyBuild>> {
+        let ready = self.root(id).ok()?;
+        // Held while its files are fetched or removed: the store has them.
+        let local = ready.local.try_lock().map_or(true, |local| *local);
+        if local {
+            return Some(ready);
+        }
+        let (Some(store), Some(key)) = (&self.store, &ready.store_key) else {
+            return None;
+        };
+        store.has(key).await.unwrap_or(false).then_some(ready)
+    }
+
+    /// A ready build of `template` from the same parts as `spec` that a
+    /// sandbox can start from here, newest first.
+    async fn same_root(
+        &self,
+        template: &str,
+        spec: &TemplateSpec,
+    ) -> Result<Option<Arc<ReadyBuild>>, ApiError> {
+        let wanted = spec.for_build();
+        let builds = self.db.builds_in(&[build_state::READY])?;
+        for build in builds.iter().rev() {
+            let same = build.template == template
+                && build.fingerprint == self.fingerprint
+                && !guest_too_old(build)
+                && serde_json::from_str::<TemplateSpec>(&build.spec)
+                    .is_ok_and(|built| built.for_build() == wanted);
+            if same && let Some(ready) = self.usable(&build.id).await {
+                return Ok(Some(ready));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Makes `spec` again as a build of `template` for persistent
+    /// sandboxes, unless another call just did. A failure is remembered
+    /// for `REBUILD_RETRY`.
+    async fn rebuild_root(
+        self: Arc<Self>,
+        template: String,
+        spec: TemplateSpec,
+        json: String,
+    ) -> Result<Arc<ReadyBuild>, ApiError> {
+        let key = rebuild_key(&template, &spec, &self.fingerprint);
+        let gate = Arc::clone(
+            self.rebuilds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key.clone())
+                .or_default(),
+        );
+        let mut failed = gate.lock().await;
+        if let Some(ready) = self.same_root(&template, &spec).await? {
+            return Ok(ready);
+        }
+        if let Some((at, why)) = failed.as_ref()
+            && at.elapsed() < REBUILD_RETRY
+        {
+            return Err(build_failed(why));
+        }
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(ApiError::new(
+                Code::Rebuilding,
+                "the server is shutting down; try again soon",
+            ));
+        }
+        let id = ids::new_id("bld").map_err(ApiError::internal)?;
+        self.db
+            .insert_build_as(&id, &template, &json, &self.fingerprint, now_ms(), true)?;
+        eprintln!("building template {template:?} again for persistent sandboxes ({id})");
+        Arc::clone(&self).run(id.clone()).await;
+        let build = self.db.get_build(&id)?;
+        let ready = match build {
+            Some(b) if b.state == build_state::READY => self.root(&id)?,
+            Some(b) if b.state == build_state::QUEUED || b.state == build_state::BUILDING => {
+                return Err(ApiError::new(
+                    Code::Rebuilding,
+                    "the server is shutting down; try again soon",
+                ));
+            }
+            other => {
+                let why = other
+                    .and_then(|b| b.error)
+                    .unwrap_or_else(|| "the build did not finish".into());
+                *failed = Some((Instant::now(), why.clone()));
+                return Err(build_failed(&why));
+            }
+        };
+        *failed = None;
+        drop(failed);
+        self.rebuilds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        if let (Some(store), Some(key)) = (&self.store, &ready.store_key)
+            && !ready.uploaded.load(Ordering::SeqCst)
+            && !ready.uploading.swap(true, Ordering::SeqCst)
+        {
+            if *ready.local.lock().await {
+                self.upload(store, key, &ready).await;
+            }
+            ready.uploading.store(false, Ordering::SeqCst);
+        }
+        Ok(ready)
+    }
+
     /// Picks up ready builds from the last run, drops ones that no longer
     /// match this host's inputs, and removes directories nothing refers to.
     fn load(&self) -> Result<()> {
@@ -810,7 +1096,16 @@ impl Templates {
         }
         let now = now_ms();
         let mut keep = Vec::new();
+        let roots = self.db.build_roots()?;
         for build in self.db.builds_in(&[build_state::READY])? {
+            // Opened when a cold start needs it.
+            if build.root {
+                if !roots.contains(&build.id) {
+                    self.db
+                        .set_build_state(&build.id, build_state::REMOVED, now, None)?;
+                }
+                continue;
+            }
             let template = self.db.get_template(&build.template)?;
             let spec = serde_json::from_str::<TemplateSpec>(&build.spec);
             let ready = match (&template, spec) {
@@ -985,7 +1280,8 @@ impl Templates {
         }
         // Don't leave the build looking busy forever. A published build is
         // already in `current` and keeps its files.
-        let published = self.current().values().any(|b| b.id == id);
+        let published =
+            self.current().values().any(|b| b.id == id) || self.kept().contains_key(&id);
         if !published {
             remove_all_but_log(&self.dir.join(&id));
             if let Err(error) = self.db.fail_build(&id, now_ms(), &message) {
@@ -1198,7 +1494,9 @@ impl Templates {
         }
         let now = now_ms();
         match result {
-            Ok((files, _)) => {
+            Ok((files, info)) => {
+                self.db.set_build_guest(id, &info.guest_version)?;
+                build.guest = Some(info.guest_version);
                 let seconds = started.elapsed().as_secs_f64();
                 let _ = writeln!(log, "== ready in {seconds:.1} s");
                 eprintln!(
@@ -1209,6 +1507,7 @@ impl Templates {
                 // Other hosts wait for this upload, so it is done now.
                 if let (Some(store), Some(_)) = (&self.store, claim) {
                     let ready = self.current().values().find(|b| b.id == id).cloned();
+                    let ready = ready.or_else(|| self.kept().get(id).cloned());
                     if let Some(ready) = ready
                         && !ready.uploading.swap(true, Ordering::SeqCst)
                     {
@@ -1299,6 +1598,9 @@ impl Templates {
 
     /// True while `build` matches its template's current spec.
     fn wanted(&self, build: &db::Build) -> Result<bool> {
+        if build.root {
+            return Ok(true);
+        }
         let Some(template) = self.db.get_template(&build.template)? else {
             return Ok(false);
         };
@@ -1318,6 +1620,18 @@ impl Templates {
         local: bool,
     ) -> Result<()> {
         let now = now_ms();
+        if build.root {
+            self.db
+                .set_build_state(&build.id, build_state::READY, now, None)?;
+            let ready = Arc::new(ReadyBuild::new(build, files, spec, dir, local));
+            ready.retired.store(true, Ordering::SeqCst);
+            self.kept().insert(build.id.clone(), ready);
+            eprintln!(
+                "template {:?} was built again for persistent sandboxes ({})",
+                build.template, build.id
+            );
+            return Ok(());
+        }
         let mut current = self.current();
         let newer = current
             .get(&build.template)
@@ -1860,5 +2174,66 @@ impl Write for CappedLog {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build(fingerprint: &str, guest: Option<&str>) -> db::Build {
+        let db = Db::memory().unwrap();
+        db.insert_build("b", "py", "{}", fingerprint, 1).unwrap();
+        if let Some(guest) = guest {
+            db.set_build_guest("b", guest).unwrap();
+        }
+        db.get_build("b").unwrap().unwrap()
+    }
+
+    #[test]
+    fn tells_why_a_recorded_build_cannot_be_used() {
+        let host = spawn_proto::PROTOCOL_VERSION;
+        let old = spawn_proto::version_string(&spawn_proto::guest::v1::ProtocolVersion {
+            minor: host.minor.saturating_sub(3),
+            ..host
+        });
+        let close = spawn_proto::version_string(&spawn_proto::guest::v1::ProtocolVersion {
+            minor: host.minor.saturating_sub(2),
+            ..host
+        });
+        let next = spawn_proto::version_string(&spawn_proto::guest::v1::ProtocolVersion {
+            major: host.major + 1,
+            ..host
+        });
+        assert!(guest_too_old(&build("f", Some(&old))));
+        assert!(guest_too_old(&build("f", Some(&next))));
+        assert!(!guest_too_old(&build("f", Some(&close))));
+        assert!(!guest_too_old(&build("f", None)));
+        assert!(!guest_too_old(&build("f", Some("garbled"))));
+
+        let of = |b: Option<&db::Build>| RebuildReason::of(b, "f").as_str();
+        assert_eq!(of(None), "missing");
+        assert_eq!(of(Some(&build("f", None))), "missing");
+        assert_eq!(of(Some(&build("g", None))), "outdated");
+        assert_eq!(of(Some(&build("g", Some(&close)))), "outdated");
+        assert_eq!(of(Some(&build("g", Some(&next)))), "guest_too_old");
+    }
+
+    #[test]
+    fn rebuilds_of_the_same_spec_on_one_host_share_a_key() {
+        let spec = TemplateSpec::base(Resources::default());
+        let key = rebuild_key("py", &spec, "f");
+        let warm = TemplateSpec {
+            min_warm: 3,
+            ..spec.clone()
+        };
+        assert_eq!(rebuild_key("py", &warm, "f"), key);
+        assert_ne!(rebuild_key("py", &spec, "g"), key);
+        assert_ne!(rebuild_key("js", &spec, "f"), key);
+        let setup = TemplateSpec {
+            setup: vec!["make".into()],
+            ..spec
+        };
+        assert_ne!(rebuild_key("py", &setup, "f"), key);
     }
 }

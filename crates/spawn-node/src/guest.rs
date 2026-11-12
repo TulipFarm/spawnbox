@@ -12,10 +12,12 @@ use spawn_proto::guest::v1::image_client::ImageClient;
 use spawn_proto::guest::v1::process_client::ProcessClient;
 use spawn_proto::guest::v1::volumes_client::VolumesClient;
 use spawn_proto::guest::v1::{
-    ApplyRequest, ExecEvent, ExecExit, ExecRequest, HelloRequest, MountRequest, SealRequest,
-    UnpackRequest, VolumeMount, unpack_event,
+    ApplyRequest, ExecEvent, ExecExit, ExecRequest, HelloRequest, MountRequest, ProtocolVersion,
+    SealRequest, UnpackRequest, VolumeMount, unpack_event,
 };
-use spawn_proto::{GUEST_TCP_PORT, GUEST_VSOCK_PORT, PROTOCOL_VERSION, is_compatible};
+use spawn_proto::{
+    GUEST_TCP_PORT, GUEST_VSOCK_PORT, PROTOCOL_VERSION, is_compatible, version_string,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -156,7 +158,33 @@ pub async fn connect(dialer: &Dialer, timeout: Duration) -> Result<Channel> {
     }
 }
 
-pub async fn hello(channel: &Channel) -> Result<String> {
+/// A guest whose protocol this host does not accept, usually from a build
+/// made by a much older version.
+#[derive(Debug)]
+pub struct IncompatibleGuest(pub ProtocolVersion);
+
+impl std::fmt::Display for IncompatibleGuest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "guest protocol {} is not compatible",
+            version_string(&self.0)
+        )
+    }
+}
+
+impl std::error::Error for IncompatibleGuest {}
+
+impl IncompatibleGuest {
+    /// True if `error` or one of its causes is this.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|e| e.is::<Self>())
+    }
+}
+
+/// The agent's version and the guest's protocol version. Fails with
+/// `IncompatibleGuest` if this host does not accept the guest.
+pub async fn hello(channel: &Channel) -> Result<(String, ProtocolVersion)> {
     let reply = HealthClient::new(channel.clone())
         .hello(HelloRequest {
             host_version: Some(PROTOCOL_VERSION),
@@ -167,13 +195,9 @@ pub async fn hello(channel: &Channel) -> Result<String> {
         .guest_version
         .context("guest sent no protocol version")?;
     if !is_compatible(&PROTOCOL_VERSION, &guest) {
-        bail!(
-            "guest protocol {}.{} is not compatible",
-            guest.major,
-            guest.minor
-        );
+        return Err(IncompatibleGuest(guest).into());
     }
-    Ok(reply.agent_version)
+    Ok((reply.agent_version, guest))
 }
 
 pub async fn apply(channel: &Channel, request: ApplyRequest) -> Result<()> {

@@ -223,6 +223,8 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO upkeep (task) VALUES ('vacuum');",
     "ALTER TABLE nodes ADD COLUMN fenced_at INTEGER;
     ALTER TABLE nodes ADD COLUMN fenced_by TEXT;",
+    "ALTER TABLE builds ADD COLUMN guest TEXT;
+    ALTER TABLE builds ADD COLUMN root INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -457,6 +459,9 @@ const PG_MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE nodes ADD COLUMN fenced_at BIGINT;
     ALTER TABLE nodes ADD COLUMN fenced_by TEXT COLLATE "C";"#,
+    r#"
+    ALTER TABLE builds ADD COLUMN guest TEXT COLLATE "C";
+    ALTER TABLE builds ADD COLUMN root BIGINT NOT NULL DEFAULT 0;"#,
 ];
 
 pub mod state {
@@ -511,6 +516,11 @@ pub struct Build {
     pub store_key: Option<String>,
     /// When its files were last confirmed in the build store.
     pub uploaded_at: Option<i64>,
+    /// Its guest's protocol version, `major.minor`, if known.
+    pub guest: Option<String>,
+    /// Built again for persistent sandboxes whose own build was gone. It
+    /// is never its template's current build.
+    pub root: bool,
 }
 
 /// An API key without its hash.
@@ -1175,6 +1185,26 @@ impl Db {
         Ok(())
     }
 
+    /// Makes a persistent sandbox start from build `to` instead of `from`.
+    /// False if its start record names another build by now.
+    pub fn set_start_build(&self, sandbox: &str, from: &str, to: &str, now: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE start_records SET build = ?3, updated_at = ?4
+             WHERE sandbox = ?1 AND build = ?2",
+            params![sandbox, from, to, now],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "UPDATE sandboxes SET build = ?2 WHERE id = ?1",
+                params![sandbox, to],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     /// Builds that a persistent sandbox that has not ended starts from.
     pub fn build_roots(&self) -> Result<HashSet<String>> {
         let conn = self.conn();
@@ -1673,11 +1703,25 @@ impl Db {
         fingerprint: &str,
         now: i64,
     ) -> Result<Build> {
+        self.insert_build_as(id, template, spec, fingerprint, now, false)
+    }
+
+    /// Like `insert_build`; a `root` build is made for persistent
+    /// sandboxes only.
+    pub fn insert_build_as(
+        &self,
+        id: &str,
+        template: &str,
+        spec: &str,
+        fingerprint: &str,
+        now: i64,
+        root: bool,
+    ) -> Result<Build> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO builds (id, template, spec, fingerprint, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
-            params![id, template, spec, fingerprint, now],
+            "INSERT INTO builds (id, template, spec, fingerprint, state, created_at, root)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
+            params![id, template, spec, fingerprint, now, i64::from(root)],
         )?;
         conn.query_row(
             &format!("SELECT {BUILD_COLUMNS} FROM builds WHERE id = ?1"),
@@ -1700,7 +1744,7 @@ impl Db {
         self.conn()
             .query_row(
                 &format!(
-                    "SELECT {BUILD_COLUMNS} FROM builds WHERE template = ?1
+                    "SELECT {BUILD_COLUMNS} FROM builds WHERE template = ?1 AND root = 0
                      ORDER BY seq DESC LIMIT 1"
                 ),
                 [template],
@@ -1768,6 +1812,14 @@ impl Db {
             params![id, fingerprint, now, store_key],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn set_build_guest(&self, id: &str, guest: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE builds SET guest = ?2 WHERE id = ?1",
+            params![id, guest],
+        )?;
+        Ok(())
     }
 
     pub fn set_build_uploaded(&self, id: &str, now: i64) -> Result<()> {
@@ -3337,7 +3389,7 @@ fn secret_from_row(row: &Row) -> Result<Secret> {
 
 const BUILD_COLUMNS: &str =
     "seq, id, template, spec, fingerprint, state, created_at, started_at, finished_at, error,
-     store_key, uploaded_at";
+     store_key, uploaded_at, guest, root";
 
 fn template_from_row(row: &Row) -> Result<Template> {
     Ok(Template {
@@ -3362,6 +3414,8 @@ fn build_from_row(row: &Row) -> Result<Build> {
         error: row.get(9)?,
         store_key: row.get(10)?,
         uploaded_at: row.get(11)?,
+        guest: row.get(12)?,
+        root: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -4186,6 +4240,46 @@ mod tests {
             build_state::FAILED
         );
         assert!(db.get_template("py").unwrap().is_none());
+    }
+
+    #[test]
+    fn root_builds_and_guests_are_kept_apart_from_template_builds() {
+        let db = Db::memory().unwrap();
+        db.insert_build("b1", "py", "{}", "f", 1).unwrap();
+        let root = db.insert_build_as("b2", "py", "{}", "f", 2, true).unwrap();
+        assert!(root.root && root.guest.is_none());
+        // A root build never becomes the template's current build.
+        assert_eq!(db.latest_build("py").unwrap().unwrap().id, "b1");
+        db.set_build_guest("b2", "0.4").unwrap();
+        let b2 = db.get_build("b2").unwrap().unwrap();
+        assert_eq!((b2.root, b2.guest.as_deref()), (true, Some("0.4")));
+        assert!(!db.get_build("b1").unwrap().unwrap().root);
+    }
+
+    #[test]
+    fn a_start_record_moves_to_a_new_build_only_from_the_one_it_names() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &Sandbox {
+                build: Some("b1".into()),
+                ..persistent("a", state::COLD)
+            },
+            &start_record("a", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!db.set_start_build("a", "b0", "b2", 5).unwrap());
+        assert_eq!(db.get_start_record("a").unwrap().unwrap().build, "b1");
+        assert!(db.set_start_build("a", "b1", "b2", 5).unwrap());
+        let record = db.get_start_record("a").unwrap().unwrap();
+        assert_eq!((record.build.as_str(), record.updated_at), ("b2", 5));
+        assert_eq!(
+            db.get_sandbox("a").unwrap().unwrap().build.as_deref(),
+            Some("b2")
+        );
+        assert_eq!(db.build_roots().unwrap(), HashSet::from(["b2".to_owned()]));
+        assert!(!db.set_start_build("b", "b1", "b2", 5).unwrap());
     }
 
     #[test]

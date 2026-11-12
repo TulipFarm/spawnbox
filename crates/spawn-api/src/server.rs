@@ -825,6 +825,7 @@ async fn run(
         build_store,
         args.build_cache_gib.saturating_mul(1 << 30),
         wait_for_base,
+        !matches!(role, Role::Worker(_)),
     )
     .await
     .context("load templates")?;

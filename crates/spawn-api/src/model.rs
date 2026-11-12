@@ -1196,6 +1196,10 @@ pub enum Code {
     NodeUnreachable,
     /// A volume's only copy is on a host that cannot be reached.
     VolumeUnavailable,
+    /// A build a sandbox needs could not be made.
+    BuildFailed,
+    /// A build a sandbox needs is being made; the call can be repeated.
+    Rebuilding,
     Internal,
 }
 
@@ -1212,6 +1216,8 @@ impl Code {
             Self::NoCapacity => "no_capacity",
             Self::NodeUnreachable => "node_unreachable",
             Self::VolumeUnavailable => "volume_unavailable",
+            Self::BuildFailed => "build_failed",
+            Self::Rebuilding => "rebuilding",
             Self::Internal => "internal",
         }
     }
@@ -1222,9 +1228,12 @@ impl Code {
             Self::Unauthorized => 401,
             Self::NotFound => 404,
             Self::Forbidden => 403,
-            Self::Conflict | Self::ProtectedEnv => 409,
+            Self::Conflict | Self::ProtectedEnv | Self::BuildFailed => 409,
             Self::QuotaExceeded => 429,
-            Self::NoCapacity | Self::NodeUnreachable | Self::VolumeUnavailable => 503,
+            Self::NoCapacity
+            | Self::NodeUnreachable
+            | Self::VolumeUnavailable
+            | Self::Rebuilding => 503,
             Self::Internal => 500,
         }
     }
@@ -1235,6 +1244,7 @@ impl Code {
             Self::NoCapacity
                 | Self::NodeUnreachable
                 | Self::VolumeUnavailable
+                | Self::Rebuilding
                 | Self::Internal
                 | Self::QuotaExceeded
         )

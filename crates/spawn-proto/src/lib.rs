@@ -22,6 +22,20 @@ pub fn is_compatible(host: &ProtocolVersion, guest: &ProtocolVersion) -> bool {
     host.major == guest.major && host.minor.abs_diff(guest.minor) <= 2
 }
 
+/// `major.minor`, as builds record their guest's version.
+pub fn version_string(version: &ProtocolVersion) -> String {
+    format!("{}.{}", version.major, version.minor)
+}
+
+/// Reads a version written by `version_string`.
+pub fn parse_version(text: &str) -> Option<ProtocolVersion> {
+    let (major, minor) = text.split_once('.')?;
+    Some(ProtocolVersion {
+        major: major.parse().ok()?,
+        minor: minor.parse().ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,6 +51,15 @@ mod tests {
         assert!(is_compatible(&v(1, 3), &v(1, 5)));
         assert!(!is_compatible(&v(1, 5), &v(1, 2)));
         assert!(!is_compatible(&v(1, 2), &v(1, 5)));
+    }
+
+    #[test]
+    fn versions_read_back_as_written() {
+        assert_eq!(parse_version(&version_string(&v(0, 6))), Some(v(0, 6)));
+        assert_eq!(parse_version("12.345"), Some(v(12, 345)));
+        for bad in ["", "1", "1.", ".2", "a.b", "1.2.3", "-1.2"] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

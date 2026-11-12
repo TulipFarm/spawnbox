@@ -528,6 +528,19 @@ impl BuildStore {
             .await
     }
 
+    /// Writes the manifests in `keep` again, so hosts that clean up see
+    /// them as recent.
+    pub async fn refresh(&self, keep: &HashSet<String>) -> Result<()> {
+        for key in keep {
+            let path = self.manifest(key);
+            if let Ok(found) = self.store.get(&path).await {
+                let bytes = found.bytes().await?;
+                self.store.put(&path, PutPayload::from(bytes)).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Deletes manifests older than `max_age` that are not in `keep`, then
     /// blobs older than `max_age` that no manifest refers to. Kept manifests
     /// are written again first, so other hosts see them as recent. Returns
@@ -537,13 +550,7 @@ impl BuildStore {
         keep: &HashSet<String>,
         max_age: Duration,
     ) -> Result<(usize, usize)> {
-        for key in keep {
-            let path = self.manifest(key);
-            if let Ok(found) = self.store.get(&path).await {
-                let bytes = found.bytes().await?;
-                self.store.put(&path, PutPayload::from(bytes)).await?;
-            }
-        }
+        self.refresh(keep).await?;
         let cutoff = now_ms().saturating_sub(i64::try_from(max_age.as_millis())?);
         let old = |meta: &object_store::ObjectMeta| meta.last_modified.timestamp_millis() < cutoff;
 

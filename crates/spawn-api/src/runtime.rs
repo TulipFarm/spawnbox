@@ -33,7 +33,7 @@ use crate::model::{ApiError, BASE_TEMPLATE, Code, CreateSandbox, Exec, Service, 
 use crate::ports::{self, Access, Publish};
 use crate::secretbox::{SandboxEnv, SecretBox};
 use crate::secrets::Secrets;
-use crate::templates::{ReadyBuild, Slots, Startable, Templates};
+use crate::templates::{ReadyBuild, RebuildReason, Slots, Startable, Templates};
 use crate::tenancy::{Quotas, Tenant, Usage};
 use crate::traces::{self, Traced};
 use crate::volumes::Volumes;
@@ -1456,6 +1456,60 @@ impl Sandboxes {
         }
     }
 
+    /// Makes cold sandbox `id` start from `ready` from now on, in place of
+    /// the build its start record names, which could not be used here.
+    fn adopt_root(
+        &self,
+        id: &str,
+        origin: &Origin,
+        start: &mut db::StartRecord,
+        ready: &Arc<ReadyBuild>,
+        reason: RebuildReason,
+    ) -> Result<(), ApiError> {
+        if start.build == ready.id {
+            return Ok(());
+        }
+        if !self
+            .db
+            .set_start_build(id, &start.build, &ready.id, now_ms())?
+        {
+            // Another start of it adopted the same build first.
+            let now = self.db.get_start_record(id)?;
+            if now.is_some_and(|now| now.build == ready.id) {
+                start.build = ready.id.clone();
+                return Ok(());
+            }
+            return Err(ApiError::new(
+                Code::Conflict,
+                "sandbox changed while it started; try again",
+            ));
+        }
+        let from = std::mem::replace(&mut start.build, ready.id.clone());
+        self.templates.hold(ready);
+        self.templates.prune_roots();
+        eprintln!(
+            "{id} starts from build {} now; build {from} is {}",
+            ready.id,
+            reason.as_str()
+        );
+        crate::metrics::inc(
+            "spawnbox_sandbox_rebuilds_total",
+            vec![("reason", reason.as_str().into())],
+        );
+        self.event(
+            "sandbox.rebuilt",
+            origin,
+            &start.tenant,
+            id,
+            json!({
+                "from_build": from,
+                "to_build": ready.id,
+                "reason": reason.as_str(),
+            }),
+        );
+        Ok(())
+    }
+
     fn cold_event(&self, origin: &Origin, tenant: &str, id: &str, reason: &str) {
         eprintln!("{id} is cold: {reason}");
         self.event(
@@ -1686,7 +1740,7 @@ impl Sandboxes {
         if sandbox.state != state::COLD {
             return Err(self.not_running(id));
         }
-        let start = self
+        let mut start = self
             .db
             .get_start_record(id)?
             .ok_or_else(|| ApiError::internal(format!("sandbox {id} has no start record")))?;
@@ -1697,8 +1751,12 @@ impl Sandboxes {
             vcpus: u8::try_from(start.vcpus).unwrap_or(u8::MAX),
             memory_mib: start.memory_mib,
         };
+        let root = self.templates.start_root(&start).await?;
+        let ready = root.ready;
+        if let Some(reason) = root.rebuilt {
+            self.adopt_root(id, origin, &mut start, &ready, reason)?;
+        }
         let _admission = self.admit(&start.tenant, &quotas, id, limits, true)?;
-        let ready = self.templates.root(&start.build)?;
         let claim = ids::base32(&ids::random::<10>().map_err(ApiError::internal)?);
         let claim_ms = i64::try_from(COLD_START_CLAIM.as_millis()).unwrap_or(i64::MAX);
         let Some(generation) =
@@ -1968,12 +2026,17 @@ impl Sandboxes {
     /// Resumes a paused sandbox, or starts a cold one. Does nothing if it
     /// runs.
     pub async fn resume(&self, id: &str, origin: &Origin) -> Result<db::Sandbox, ApiError> {
-        let lock = self.waking_lock(id, origin).await?;
-        {
-            let _changing = lock.lock().await;
-            self.resume_locked(id, origin, "api").await?;
+        loop {
+            let lock = self.waking_lock(id, origin).await?;
+            {
+                let _changing = lock.lock().await;
+                self.resume_locked(id, origin, "api").await?;
+            }
+            // A paused sandbox that became cold instead is started.
+            if self.record_lock(id).is_some() {
+                return self.get(id);
+            }
         }
-        self.get(id)
     }
 
     /// Hold the sandbox's lock. For `Idle`, does nothing once a call has
@@ -2167,6 +2230,36 @@ impl Sandboxes {
         Ok(())
     }
 
+    /// True if paused persistent sandbox `id` runs a guest that this host
+    /// no longer accepts.
+    fn guest_too_old(&self, id: &str) -> bool {
+        self.db
+            .get_start_record(id)
+            .ok()
+            .flatten()
+            .and_then(|start| self.db.get_build(&start.build).ok().flatten())
+            .is_some_and(|build| crate::templates::guest_too_old(&build))
+    }
+
+    /// Drops paused persistent sandbox `id`'s snapshot; the next call
+    /// starts it from its start record. Hold its lock.
+    fn paused_to_cold(
+        &self,
+        id: &str,
+        generation: i64,
+        origin: &Origin,
+        tenant: &str,
+        why: &str,
+    ) -> Result<(), ApiError> {
+        if let Some(mut record) = self.inner().records.remove(id) {
+            self.settle(id, &mut record, now_ms());
+        }
+        remove_dir(&self.paused_dir(id));
+        self.db.set_cold(id, generation)?;
+        self.cold_event(origin, tenant, id, why);
+        Ok(())
+    }
+
     /// Hold the sandbox's lock. `reason` is `api`, `wake` when a call to a
     /// paused sandbox resumes it, or `migrate` on a move's target, where a
     /// failure leaves the row to the caller and records no event.
@@ -2210,6 +2303,11 @@ impl Sandboxes {
         };
         if persistent {
             self.check_fenced()?;
+        }
+        // Started again from its start record instead, with a build this
+        // host accepts.
+        if persistent && reason != "migrate" && self.guest_too_old(id) {
+            return self.paused_to_cold(id, generation, origin, &tenant, "guest_too_old");
         }
         // Read again: quotas and egress may have changed while it slept.
         let row = self.db.get_tenant(&tenant)?;
@@ -2271,12 +2369,16 @@ impl Sandboxes {
                     }
                     remove_dir(&dir);
                 } else if persistent {
-                    if let Some(mut record) = self.inner().records.remove(id) {
-                        self.settle(id, &mut record, now_ms());
+                    if matches!(&error, ResumeError::After(e) if guest::IncompatibleGuest::is(e)) {
+                        return self.paused_to_cold(
+                            id,
+                            generation,
+                            origin,
+                            &tenant,
+                            "guest_too_old",
+                        );
                     }
-                    remove_dir(&dir);
-                    self.db.set_cold(id, generation)?;
-                    self.cold_event(origin, &tenant, id, "resume_failed");
+                    self.paused_to_cold(id, generation, origin, &tenant, "resume_failed")?;
                 } else {
                     if let Some(mut record) = self.inner().records.remove(id) {
                         self.settle(id, &mut record, now_ms());

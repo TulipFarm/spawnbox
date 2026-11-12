@@ -519,14 +519,13 @@ async fn cold_start_here(
         return Err(ApiError::invalid("not a persistent sandbox"));
     }
     // Template builds are made on each host: use the one made from the
-    // same spec here.
+    // same spec here. Without one, the start builds the spec again.
     let wanted = super::build_hash(&start.spec);
     let build = app
         .templates
         .ready_builds()
         .into_iter()
         .map(|(_, build, _)| build)
-        .chain([start.build.clone()])
         .find(|build| {
             app.db
                 .get_build(build)
@@ -534,12 +533,7 @@ async fn cold_start_here(
                 .flatten()
                 .is_some_and(|b| super::build_hash(&b.spec) == wanted)
         })
-        .ok_or_else(|| {
-            ApiError::new(
-                crate::model::Code::NoCapacity,
-                format!("no build of template {:?} here", start.template),
-            )
-        })?;
+        .unwrap_or_else(|| start.build.clone());
     // An older copy here must not run beside the new one.
     app.sandboxes.drop_stale(&id).await?;
     start.build.clone_from(&build);
