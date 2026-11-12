@@ -63,64 +63,84 @@ impl SecretBox {
         Some(plain.to_vec())
     }
 
-    /// Seals a sandbox's whole env map, bound to the tenant and sandbox.
-    pub fn seal_env(
+    /// Seals a sandbox's env and the env of all its services as one blob,
+    /// bound to the tenant and sandbox. Being one blob, no value can be
+    /// moved to another variable, service or sandbox without failing the
+    /// tag.
+    pub fn seal_sandbox_env(
         &self,
         tenant: &str,
         sandbox: &str,
-        env: &BTreeMap<String, String>,
+        env: &SandboxEnv,
     ) -> io::Result<Vec<u8>> {
         let plain = serde_json::to_vec(env).map_err(io::Error::other)?;
-        self.seal(&env_label(tenant, sandbox), &plain)
+        self.seal(&sandbox_env_label(tenant, sandbox), &plain)
     }
 
-    pub fn open_env(
+    pub fn open_sandbox_env(
         &self,
         tenant: &str,
         sandbox: &str,
         sealed: &[u8],
-    ) -> Option<BTreeMap<String, String>> {
-        let plain = self.open(&env_label(tenant, sandbox), sealed)?;
+    ) -> Option<SandboxEnv> {
+        let plain = self.open(&sandbox_env_label(tenant, sandbox), sealed)?;
         serde_json::from_slice(&plain).ok()
     }
 
-    /// Seals a sandbox's services, whose env may hold secrets. Nothing is
-    /// sealed for none.
-    pub fn seal_services(
+    /// Reads the earlier format, which sealed the env map and the services
+    /// apart. An empty `services` means none.
+    pub fn open_legacy(
         &self,
         tenant: &str,
         sandbox: &str,
-        services: &[Service],
-    ) -> io::Result<Vec<u8>> {
-        if services.is_empty() {
-            return Ok(Vec::new());
-        }
-        let plain = serde_json::to_vec(services).map_err(io::Error::other)?;
-        self.seal(&services_label(tenant, sandbox), &plain)
+        env: &[u8],
+        services: &[u8],
+    ) -> Option<SandboxEnv> {
+        let env = self.open(&format!("env:v1:{tenant}:{sandbox}"), env)?;
+        let services = if services.is_empty() {
+            Vec::new()
+        } else {
+            let plain = self.open(&format!("services:v1:{tenant}:{sandbox}"), services)?;
+            serde_json::from_slice(&plain).ok()?
+        };
+        Some(SandboxEnv {
+            env: serde_json::from_slice(&env).ok()?,
+            services,
+        })
     }
+}
 
-    pub fn open_services(
-        &self,
-        tenant: &str,
-        sandbox: &str,
-        sealed: &[u8],
-    ) -> Option<Vec<Service>> {
-        if sealed.is_empty() {
-            return Some(Vec::new());
-        }
-        let plain = self.open(&services_label(tenant, sandbox), sealed)?;
-        serde_json::from_slice(&plain).ok()
+/// What `SecretBox::seal_sandbox_env` protects: the sandbox's env and its
+/// services, whose env may hold secrets.
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SandboxEnv {
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub services: Vec<Service>,
+}
+
+impl SandboxEnv {
+    /// Whether it holds values the caller set, which a template made from
+    /// the sandbox would expose.
+    pub fn is_protected(&self) -> bool {
+        !self.env.is_empty() || self.services.iter().any(|s| !s.env.is_empty())
+    }
+}
+
+impl std::fmt::Debug for SandboxEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxEnv")
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("services", &self.services)
+            .finish()
     }
 }
 
 /// The format version is part of the label so that a later format cannot
 /// be read as this one.
-fn env_label(tenant: &str, sandbox: &str) -> String {
-    format!("env:v1:{tenant}:{sandbox}")
-}
-
-fn services_label(tenant: &str, sandbox: &str) -> String {
-    format!("services:v1:{tenant}:{sandbox}")
+fn sandbox_env_label(tenant: &str, sandbox: &str) -> String {
+    format!("env:v2:{tenant}:{sandbox}")
 }
 
 /// The bytes of a key file, created with `KEY_LEN` random bytes if it is
@@ -181,32 +201,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn env_is_bound_to_its_tenant_and_sandbox() {
-        let sb = SecretBox::new(&[7; 32]).unwrap();
-        let env = BTreeMap::from([("TOKEN".to_owned(), "s3cret".to_owned())]);
-        let sealed = sb.seal_env("acme", "sbx_1", &env).unwrap();
-        assert!(!sealed.windows(6).any(|w| w == b"s3cret"));
-        assert_eq!(sb.open_env("acme", "sbx_1", &sealed), Some(env));
-        assert_eq!(sb.open_env("acme", "sbx_2", &sealed), None);
-        assert_eq!(sb.open_env("other", "sbx_1", &sealed), None);
-        assert_eq!(sb.open("env:v2:acme:sbx_1", &sealed), None);
+    fn sample() -> SandboxEnv {
+        SandboxEnv {
+            env: BTreeMap::from([("TOKEN".to_owned(), "s3cret".to_owned())]),
+            services: serde_json::from_str(
+                r#"[{"name":"web","command":["srv"],"env":{"KEY":"svc-secret"},"port":80}]"#,
+            )
+            .unwrap(),
+        }
     }
 
     #[test]
-    fn services_are_bound_to_their_tenant_and_sandbox() {
+    fn env_is_bound_to_its_tenant_and_sandbox() {
         let sb = SecretBox::new(&[7; 32]).unwrap();
-        let services: Vec<Service> = serde_json::from_str(
-            r#"[{"name":"web","command":["srv"],"env":{"TOKEN":"s3cret"},"port":80}]"#,
-        )
-        .unwrap();
-        let sealed = sb.seal_services("acme", "sbx_1", &services).unwrap();
+        let env = sample();
+        let sealed = sb.seal_sandbox_env("acme", "sbx_1", &env).unwrap();
         assert!(!sealed.windows(6).any(|w| w == b"s3cret"));
-        assert_eq!(sb.open_services("acme", "sbx_1", &sealed), Some(services));
-        assert_eq!(sb.open_services("acme", "sbx_2", &sealed), None);
-        assert_eq!(sb.open_env("acme", "sbx_1", &sealed), None);
-        assert_eq!(sb.seal_services("acme", "sbx_1", &[]).unwrap(), b"");
-        assert_eq!(sb.open_services("acme", "sbx_1", b""), Some(Vec::new()));
+        assert!(!sealed.windows(10).any(|w| w == b"svc-secret"));
+        assert_eq!(sb.open_sandbox_env("acme", "sbx_1", &sealed), Some(env));
+        assert_eq!(sb.open_sandbox_env("acme", "sbx_2", &sealed), None);
+        assert_eq!(sb.open_sandbox_env("other", "sbx_1", &sealed), None);
+        assert_eq!(sb.open("env:v1:acme:sbx_1", &sealed), None);
+        assert_eq!(sb.open("env:v3:acme:sbx_1", &sealed), None);
+        let other_key = SecretBox::new(&[8; 32]).unwrap();
+        assert_eq!(other_key.open_sandbox_env("acme", "sbx_1", &sealed), None);
+    }
+
+    #[test]
+    fn reads_the_earlier_format() {
+        let sb = SecretBox::new(&[7; 32]).unwrap();
+        let want = sample();
+        let env = sb
+            .seal("env:v1:acme:sbx_1", &serde_json::to_vec(&want.env).unwrap())
+            .unwrap();
+        let services = sb
+            .seal(
+                "services:v1:acme:sbx_1",
+                &serde_json::to_vec(&want.services).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            sb.open_legacy("acme", "sbx_1", &env, &services),
+            Some(want.clone())
+        );
+        assert_eq!(sb.open_legacy("acme", "sbx_2", &env, &services), None);
+        assert_eq!(
+            sb.open_legacy("acme", "sbx_1", &env, b"").map(|e| e.env),
+            Some(want.env)
+        );
+        assert_eq!(sb.open_sandbox_env("acme", "sbx_1", &env), None);
     }
 
     #[test]

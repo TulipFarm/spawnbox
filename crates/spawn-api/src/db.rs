@@ -216,6 +216,11 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX start_records_build ON start_records (build);",
     "ALTER TABLE start_records ADD COLUMN services BLOB NOT NULL DEFAULT X'';",
+    // Earlier versions read `saved` and would drop env stored in the
+    // current format, so the rename makes them stop at start instead.
+    "ALTER TABLE sandboxes RENAME COLUMN saved TO saved_state;
+    CREATE TABLE upkeep (task TEXT PRIMARY KEY);
+    INSERT INTO upkeep (task) VALUES ('vacuum');",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -432,6 +437,21 @@ const PG_MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX start_records_build ON start_records (build);"#,
     "ALTER TABLE start_records ADD COLUMN services BYTEA NOT NULL DEFAULT '';",
+    // As in SQLite. Earlier versions also write their own, lower schema
+    // version at start; the trigger turns that into an error.
+    r#"
+    ALTER TABLE sandboxes RENAME COLUMN saved TO saved_state;
+    CREATE TABLE upkeep (task TEXT COLLATE "C" PRIMARY KEY);
+    CREATE FUNCTION refuse_older_schema_version() RETURNS trigger AS $$
+    BEGIN
+        IF NEW.version < 5 THEN
+            RAISE EXCEPTION 'this database was upgraded by a newer spawnbox; downgrades are not supported';
+        END IF;
+        RETURN NEW;
+    END
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER schema_version_floor BEFORE INSERT OR UPDATE ON schema_version
+        FOR EACH ROW EXECUTE FUNCTION refuse_older_schema_version();"#,
 ];
 
 pub mod state {
@@ -596,12 +616,22 @@ pub struct StartRecord {
     /// JSON of the published ports.
     pub ports: String,
     pub idle_pause_s: u64,
-    /// The env map, sealed with `SecretBox::seal_env`.
+    /// The sandbox's own env and its services, sealed with
+    /// `SecretBox::seal_sandbox_env`.
     pub env: Vec<u8>,
-    /// The services, sealed with `SecretBox::seal_services`. Empty if none.
-    pub services: Vec<u8>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A start record's sealed env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartEnv {
+    pub sandbox: String,
+    pub tenant: String,
+    pub env: Vec<u8>,
+    /// The services, as an earlier format sealed them apart from `env`.
+    /// Empty in the current one.
+    pub services: Vec<u8>,
 }
 
 /// Why a sandbox was not added.
@@ -623,6 +653,17 @@ pub struct Secret {
     pub version: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Refuses a database that a later version upgraded.
+fn newer_than_binary(version: i64, known: usize) -> Result<()> {
+    if version > i64::try_from(known).unwrap_or(i64::MAX) {
+        return Err(Error::Connection(format!(
+            "the database has schema version {version}, newer than this spawnbox knows \
+             ({known}); downgrades are not supported"
+        )));
+    }
+    Ok(())
 }
 
 /// One connection behind a lock. Queries are small, so they run directly
@@ -649,6 +690,7 @@ impl Db {
             .query_row("SELECT version FROM schema_version", (), |r| r.get(0))
             .optional()?;
         let version = version.unwrap_or(0);
+        newer_than_binary(version, PG_MIGRATIONS.len())?;
         for sql in PG_MIGRATIONS
             .iter()
             .skip(usize::try_from(version).unwrap_or(0))
@@ -700,7 +742,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Freed space is zeroed, so env that was rewritten sealed leaves no
+        // plain copy behind.
+        conn.pragma_update(None, "secure_delete", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        newer_than_binary(version, MIGRATIONS.len())?;
         let tx = conn.transaction()?;
         for (i, sql) in MIGRATIONS
             .iter()
@@ -960,8 +1006,8 @@ impl Db {
             tx.execute(
                 "INSERT INTO start_records
                  (sandbox, tenant, template, build, spec, vcpus, memory_mib, egress, secrets,
-                  volumes, ports, idle_pause_s, env, created_at, updated_at, services)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  volumes, ports, idle_pause_s, env, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     start.sandbox,
                     start.tenant,
@@ -978,7 +1024,6 @@ impl Db {
                     start.env.clone(),
                     start.created_at,
                     start.updated_at,
-                    start.services.clone(),
                 ],
             )?;
         }
@@ -990,8 +1035,7 @@ impl Db {
         self.conn()
             .query_row(
                 "SELECT sandbox, tenant, template, build, spec, vcpus, memory_mib, egress,
-                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at,
-                        services
+                        secrets, volumes, ports, idle_pause_s, env, created_at, updated_at
                  FROM start_records WHERE sandbox = ?1",
                 [sandbox],
                 |row| {
@@ -1011,11 +1055,110 @@ impl Db {
                         env: row.get(12)?,
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
-                        services: row.get(15)?,
                     })
                 },
             )
             .optional()
+    }
+
+    /// Every start record's sealed env.
+    pub fn start_record_envs(&self) -> Result<Vec<StartEnv>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT sandbox, tenant, env, services FROM start_records ORDER BY sandbox")?;
+        stmt.query_map((), |r| {
+            Ok(StartEnv {
+                sandbox: r.get(0)?,
+                tenant: r.get(1)?,
+                env: r.get(2)?,
+                services: r.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Replaces a start record's env if it still holds `old`. `false` if
+    /// it changed or is gone.
+    pub fn replace_start_env(
+        &self,
+        sandbox: &str,
+        old: (&[u8], &[u8]),
+        env: &[u8],
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE start_records SET env = ?2, services = ?3
+             WHERE sandbox = ?1 AND env = ?4 AND services = ?5",
+            params![
+                sandbox,
+                env.to_vec(),
+                Vec::<u8>::new(),
+                old.0.to_vec(),
+                old.1.to_vec()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Writes the column an earlier format sealed the services in.
+    #[cfg(test)]
+    pub fn set_legacy_start_services(&self, sandbox: &str, services: &[u8]) -> Result<()> {
+        self.conn().execute(
+            "UPDATE start_records SET services = ?2 WHERE sandbox = ?1",
+            params![sandbox, services.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Empties SQLite's write-ahead log, which may hold rows as they were
+    /// before a rewrite. Postgres keeps old row versions until it vacuums.
+    pub fn truncate_log(&self) -> Result<()> {
+        let conn = self.conn();
+        if !conn.is_postgres() {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds an SQLite file once after the upgrade that sealed env:
+    /// pages that earlier versions freed may still hold it in plain.
+    /// Whether it ran.
+    pub fn vacuum_once(&self) -> Result<bool> {
+        let conn = self.conn();
+        if conn.is_postgres() {
+            return Ok(false);
+        }
+        let due = conn
+            .query_row("SELECT 1 FROM upkeep WHERE task = 'vacuum'", (), |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !due {
+            return Ok(false);
+        }
+        conn.execute_batch("VACUUM")?;
+        conn.execute("DELETE FROM upkeep WHERE task = 'vacuum'", ())?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(true)
+    }
+
+    /// The saved state of this host's sandboxes that have one, with their
+    /// tenant.
+    pub fn saved_states(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant, saved_state FROM sandboxes
+             WHERE saved_state IS NOT NULL AND node IS NULL ORDER BY seq",
+        )?;
+        stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    }
+
+    /// Replaces a sandbox's saved state if it is still `old`.
+    pub fn replace_saved(&self, id: &str, old: &str, saved: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE sandboxes SET saved_state = ?2 WHERE id = ?1 AND saved_state = ?3 AND node IS NULL",
+            params![id, saved, old],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records a persistent sandbox's published ports, for its next start.
@@ -1067,7 +1210,7 @@ impl Db {
             "UPDATE sandboxes
              SET state = 'running', claim = NULL, claim_deadline = NULL,
                  cold_starts = cold_starts + 1, last_cold_start_at = ?4, paused_at = NULL,
-                 saved = NULL
+                 saved_state = NULL
              WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
                AND node IS NULL",
             params![id, generation, claim, now],
@@ -1091,7 +1234,7 @@ impl Db {
     pub fn set_cold(&self, id: &str, generation: i64) -> Result<bool> {
         let changed = self.conn().execute(
             "UPDATE sandboxes
-             SET state = 'cold', paused_at = NULL, saved = NULL, claim = NULL,
+             SET state = 'cold', paused_at = NULL, saved_state = NULL, claim = NULL,
                  claim_deadline = NULL
              WHERE id = ?1 AND generation = ?2 AND persistent = 1 AND node IS NULL
                AND state NOT IN ('deleted', 'failed')",
@@ -1127,7 +1270,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "UPDATE sandboxes
              SET state = 'cold', claim = NULL, claim_deadline = NULL, paused_at = NULL,
-                 saved = NULL
+                 saved_state = NULL
              WHERE state IN ('starting', 'running') AND persistent = 1 AND node IS NULL
              RETURNING id, tenant",
         )?;
@@ -1274,7 +1417,7 @@ impl Db {
     /// about, and do nothing once a newer VM runs it.
     pub fn set_paused(&self, id: &str, generation: i64, paused_at: i64, saved: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sandboxes SET state = 'paused', paused_at = ?2, saved = ?3
+            "UPDATE sandboxes SET state = 'paused', paused_at = ?2, saved_state = ?3
              WHERE id = ?1 AND generation = ?4 AND node IS NULL",
             params![id, paused_at, saved, generation],
         )?;
@@ -1284,7 +1427,7 @@ impl Db {
     /// Updates what a paused sandbox needs to resume.
     pub fn set_saved(&self, id: &str, generation: i64, saved: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sandboxes SET saved = ?2 WHERE id = ?1 AND generation = ?3 AND node IS NULL",
+            "UPDATE sandboxes SET saved_state = ?2 WHERE id = ?1 AND generation = ?3 AND node IS NULL",
             params![id, saved, generation],
         )?;
         Ok(())
@@ -1293,7 +1436,7 @@ impl Db {
     pub fn set_resumed(&self, id: &str, generation: i64, expires_at: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE sandboxes
-             SET state = 'running', expires_at = ?2, paused_at = NULL, saved = NULL
+             SET state = 'running', expires_at = ?2, paused_at = NULL, saved_state = NULL
              WHERE id = ?1 AND generation = ?3 AND node IS NULL",
             params![id, expires_at, generation],
         )?;
@@ -1304,7 +1447,7 @@ impl Db {
     pub fn paused_sandboxes(&self) -> Result<Vec<(Sandbox, Option<String>)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {SANDBOX_COLUMNS}, saved FROM sandboxes
+            "SELECT {SANDBOX_COLUMNS}, saved_state FROM sandboxes
              WHERE state = 'paused' AND node IS NULL ORDER BY seq"
         ))?;
         stmt.query_map((), |row| {
@@ -2518,7 +2661,7 @@ impl Db {
         tx.execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
-              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, saved, volumes,
+              idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, saved_state, volumes,
               generation)
              VALUES (?1, 'paused', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14,
                      ?15, ?16)
@@ -2529,7 +2672,7 @@ impl Db {
                  volumes = excluded.volumes,
                  egress = excluded.egress, idle_pause_s = excluded.idle_pause_s,
                  node = NULL, vcpus = excluded.vcpus, memory_mib = excluded.memory_mib,
-                 paused_at = excluded.paused_at, saved = excluded.saved, ended_at = NULL",
+                 paused_at = excluded.paused_at, saved_state = excluded.saved_state, ended_at = NULL",
             params![
                 sandbox.id,
                 sandbox.template,
@@ -2559,7 +2702,7 @@ impl Db {
         match prior {
             None => conn.execute("DELETE FROM sandboxes WHERE id = ?1 AND node IS NULL", [id])?,
             Some(node) => conn.execute(
-                "UPDATE sandboxes SET node = ?2, saved = NULL WHERE id = ?1 AND node IS NULL",
+                "UPDATE sandboxes SET node = ?2, saved_state = NULL WHERE id = ?1 AND node IS NULL",
                 params![id, node],
             )?,
         };
@@ -2570,7 +2713,7 @@ impl Db {
     /// this makes the row a mirror; on a worker it only stops reports.
     pub fn hand_off(&self, id: &str, node: &str) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE sandboxes SET node = ?2, saved = NULL WHERE id = ?1 AND node IS NULL",
+            "UPDATE sandboxes SET node = ?2, saved_state = NULL WHERE id = ?1 AND node IS NULL",
             params![id, node],
         )?;
         Ok(changed > 0)
@@ -3127,7 +3270,6 @@ mod tests {
             ports: "{}".into(),
             idle_pause_s: 600,
             env: vec![1, 2, 3],
-            services: vec![4, 5],
             created_at: 1,
             updated_at: 1,
         }
@@ -3400,6 +3542,54 @@ mod tests {
     }
 
     /// Needs `SPAWNBOX_TEST_DATABASE_URL`; passes without it.
+    #[test]
+    fn earlier_versions_stop_and_later_databases_are_refused() {
+        let db = Db::memory().unwrap();
+        {
+            let conn = db.conn();
+            // Versions before env was sealed read this column at start.
+            assert!(
+                conn.query_row("SELECT saved FROM sandboxes", (), |_| Ok(()))
+                    .optional()
+                    .is_err()
+            );
+            if conn.is_postgres() {
+                // They also write their own schema version at start.
+                let error = conn
+                    .execute("INSERT INTO schema_version (version) VALUES (4)", ())
+                    .unwrap_err();
+                assert!(error.to_string().contains("downgrades are not supported"));
+            }
+        }
+        let path = std::env::temp_dir().join(format!("spawnbox-newer-{}.db", now_ms()));
+        drop(Db::open(&path).unwrap());
+        let later = i64::try_from(MIGRATIONS.len() + 1).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", later)
+            .unwrap();
+        let refused = Db::open(&path).err().unwrap().to_string();
+        assert!(
+            refused.contains("downgrades are not supported"),
+            "{refused}"
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        if let Ok(url) = std::env::var("SPAWNBOX_TEST_DATABASE_URL") {
+            let (db, target) = Db::test_postgres(&url).unwrap();
+            let later = i64::try_from(PG_MIGRATIONS.len() + 1).unwrap();
+            db.conn()
+                .execute("UPDATE schema_version SET version = ?1", [later])
+                .unwrap();
+            let refused = Db::open_postgres(target).err().unwrap().to_string();
+            assert!(
+                refused.contains("downgrades are not supported"),
+                "{refused}"
+            );
+        }
+    }
+
     #[test]
     fn imports_sqlite_into_empty_postgres() {
         let Ok(url) = std::env::var("SPAWNBOX_TEST_DATABASE_URL") else {

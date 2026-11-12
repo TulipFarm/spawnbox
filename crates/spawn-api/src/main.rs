@@ -12,6 +12,7 @@ mod metering;
 mod metrics;
 mod model;
 mod ports;
+mod reseal;
 mod secretbox;
 mod secrets;
 mod session;

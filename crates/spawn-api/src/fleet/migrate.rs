@@ -72,13 +72,25 @@ const MOVED_GRACE_MS: i64 = 60_000;
 /// The name of the primary as a move's target.
 pub const PRIMARY: &str = "primary";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Header {
     sandbox: db::Sandbox,
+    /// Holds env values in plain.
     saved: String,
     was_running: bool,
     fingerprint: String,
     cpu: String,
+}
+
+impl std::fmt::Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Header")
+            .field("sandbox", &self.sandbox)
+            .field("was_running", &self.was_running)
+            .field("fingerprint", &self.fingerprint)
+            .field("cpu", &self.cpu)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The files of `dir` a package may hold.

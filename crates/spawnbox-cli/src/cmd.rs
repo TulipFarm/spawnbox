@@ -39,7 +39,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let api = Api::new(&url, key, cli.step)?;
     let out = Out { json: cli.json };
     match cli.command {
-        Command::Login | Command::Doctor => unreachable!("handled before"),
+        Command::Login | Command::Doctor { .. } => unreachable!("handled before"),
         Command::Create(args) => create(&api, &out, args).await,
         Command::Ls { tenant, state } => list(&api, &out, tenant, state).await,
         Command::Get { id } => {
