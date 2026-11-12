@@ -53,10 +53,10 @@ const CLAIM_POLL: Duration = Duration::from_secs(5);
 static CLAIMS_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 /// How long a cold start waits for its build to be made again before the
 /// call fails with `rebuilding`; the build goes on.
-const REBUILD_WAIT: Duration = Duration::from_secs(60);
+pub const REBUILD_WAIT: Duration = Duration::from_secs(60);
 /// A failed build for persistent sandboxes is not tried again for this
 /// long; calls fail with `build_failed` meanwhile.
-const REBUILD_RETRY: Duration = Duration::from_secs(5 * 60);
+pub const REBUILD_RETRY: Duration = Duration::from_secs(5 * 60);
 /// A kept build stays this long after its last use even if no start
 /// record names it, so a build made again for a cold start that gave up
 /// waiting is there when the call is repeated.
@@ -933,10 +933,13 @@ impl Templates {
 
     /// The build cold sandbox `start` starts from: its recorded build if
     /// this host can use it, else another ready build of the same template
-    /// and spec, else a new build of that spec. Waits up to
-    /// `REBUILD_WAIT` for a build, then fails with `rebuilding` while the
-    /// build goes on.
-    pub async fn start_root(self: &Arc<Self>, start: &db::StartRecord) -> Result<Root, ApiError> {
+    /// and spec, else a new build of that spec. Waits up to `wait` for a
+    /// new build, then fails with `rebuilding` while the build goes on.
+    pub async fn start_root(
+        self: &Arc<Self>,
+        start: &db::StartRecord,
+        wait: Duration,
+    ) -> Result<Root, ApiError> {
         let row = self.db.get_build(&start.build)?;
         if !row.as_ref().is_some_and(guest_too_old)
             && let Some(ready) = self.usable(&start.build).await
@@ -959,10 +962,19 @@ impl Templates {
                 .key(Some(&start.tenant), &start.template)
                 .unwrap_or_else(|_| scoped(Some(&start.tenant), &start.template)),
         };
+        if let Some(why) = self.recent_failure(&rebuild_key(&template, &spec, &self.fingerprint)) {
+            return Err(build_failed(&why));
+        }
+        if let Some(ready) = self.same_root(&template, &spec).await? {
+            return Ok(Root {
+                ready,
+                rebuilt: Some(reason),
+            });
+        }
         let this = Arc::clone(self);
         let json = start.spec.clone();
         let made = tokio::spawn(async move { this.rebuild_root(template, spec, json).await });
-        let ready = match tokio::time::timeout(REBUILD_WAIT, made).await {
+        let ready = match tokio::time::timeout(wait, made).await {
             Ok(Ok(result)) => result?,
             Ok(Err(error)) => return Err(ApiError::internal(format!("task failed: {error}"))),
             Err(_) => {
@@ -976,6 +988,22 @@ impl Templates {
             ready,
             rebuilt: Some(reason),
         })
+    }
+
+    /// Why the last build for rebuild key `key` failed, if that was within
+    /// `REBUILD_RETRY` and no build for it runs now.
+    fn recent_failure(&self, key: &str) -> Option<String> {
+        let gate = self
+            .rebuilds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()?;
+        let failed = gate.try_lock().ok()?;
+        failed
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < REBUILD_RETRY)
+            .map(|(_, why)| why.clone())
     }
 
     /// Build `id` if a sandbox can start from it here: its files are here,

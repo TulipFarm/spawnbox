@@ -750,12 +750,19 @@ it can lack its build, for example after a leader failover. So:
   `missing` (no host file and not in the store), `outdated` (made with
   another kernel, base disk or runtime) or `guest_too_old`.
 - Cold starts on one host that need the same spec wait for one build.
-  The call waits up to 60 seconds for it. After that, it gives
-  `503 rebuilding` and the build goes on; try again.
+  On the primary, the call waits up to 60 seconds for it. When the
+  sandbox starts on a worker, the call does not wait. In both cases, the
+  call gives `503 rebuilding` while the build goes on; try again.
 - If the spec cannot be built, the call gives `409 build_failed` with the
   error, and the sandbox stays `cold`. The same error is given for the
-  next 5 minutes, then the next call builds again. A sandbox from a
+  next 5 minutes, then the next call builds again. If a worker cannot
+  build the spec, the primary starts the sandbox itself, and does not ask
+  that worker to build the spec again for 5 minutes. A sandbox from a
   snapshot template cannot be built again on another host or version.
+- When a paused sandbox on a worker becomes `cold` this way, the worker
+  tells the primary at once, and the primary starts the sandbox again for
+  the same call. If that takes too long, the call gives
+  `503 sandbox_cold`; try again.
 
 ### Fork a sandbox or save it as a template
 
@@ -2186,6 +2193,7 @@ Type these commands on the host.
 | A request for a persistent sandbox gives `503 node_unreachable` for a long time | Its worker is `down`, and no proof says that its VM is stopped | Bring the worker back, or stop its machine and call `POST /v1/nodes/{id}:fenced`. Refer to [Fence lost hosts](#fence-lost-hosts). |
 | A request for a cold sandbox gives `503 volume_unavailable` | The only copy of its volume is on a host that is `down` | Bring the host back. |
 | A request for a cold sandbox gives `503 rebuilding` | This host is building the sandbox's template spec again, because it cannot use the recorded build | Try again in a minute. Refer to [Upgrades and old builds](#upgrades-and-old-builds). |
+| A request gives `503 sandbox_cold` | The sandbox's worker found it `cold`, and the primary did not learn it in time to start it again | Try again. Refer to [Upgrades and old builds](#upgrades-and-old-builds). |
 | A request for a cold sandbox gives `409 build_failed` | The sandbox's template spec cannot be built on this host now, for example a setup command fails | Read the error. Fix what the setup needs, such as network access, then try again after 5 minutes. |
 | A worker stops with `the join token is unknown, used or expired` | The token was used or is older than one hour | Make a new token on the primary. |
 | A worker log shows `not a node of this fleet` | The worker was removed | Remove `/var/lib/spawnbox/fleet/worker/` and add the worker again with a new token. |

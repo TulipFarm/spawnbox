@@ -89,6 +89,31 @@ pub struct Primary {
     /// Calls that may still put a sandbox on each node.
     pub busy: Busy,
     pub retirer: Retirer,
+    failed_builds: FailedBuilds,
+}
+
+/// When a node last failed to build a template spec, by node and spec hash;
+/// cold starts of that spec skip the node for `REBUILD_RETRY`.
+#[derive(Default)]
+struct FailedBuilds(Mutex<HashMap<(String, String), std::time::Instant>>);
+
+impl FailedBuilds {
+    fn note(&self, node: &str, spec: &str) {
+        let mut failed = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        failed.retain(|_, at| at.elapsed() < crate::templates::REBUILD_RETRY);
+        failed.insert(
+            (node.to_owned(), spec.to_owned()),
+            std::time::Instant::now(),
+        );
+    }
+
+    fn recent(&self, node: &str, spec: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(node.to_owned(), spec.to_owned()))
+            .is_some_and(|at| at.elapsed() < crate::templates::REBUILD_RETRY)
+    }
 }
 
 impl Primary {
@@ -111,6 +136,7 @@ impl Primary {
             autoscaler: OnceLock::new(),
             busy: Busy::default(),
             retirer: Retirer::default(),
+            failed_builds: FailedBuilds::default(),
         })
     }
 
@@ -899,7 +925,11 @@ pub async fn wake_cold(app: &App, id: &str, here: bool) -> Result<(), ApiError> 
                 };
                 candidates(app, p, &tenant, &key, network, need.as_ref())
                     .into_iter()
-                    .find(|c| c.node.as_ref().is_none_or(same_build))
+                    .find(|c| {
+                        c.node.as_ref().is_none_or(|n| {
+                            same_build(n) && !p.failed_builds.recent(&n.id, &wanted)
+                        })
+                    })
             })
             .and_then(|c| c.node)
     };
@@ -910,10 +940,22 @@ pub async fn wake_cold(app: &App, id: &str, here: bool) -> Result<(), ApiError> 
             Err(Failure::Unreachable(error)) => {
                 eprintln!("cold start {id} on node {}: {error:#}", node.id);
             }
-            Err(Failure::Broken(error)) => {
+            // It builds the sandbox's spec there: the next call takes it.
+            Err(Failure::Refused { error, .. }) if error.code == Code::Rebuilding => {
+                return Err(error);
+            }
+            Err(Failure::Refused { error, .. })
+                if matches!(error.code, Code::BuildFailed | Code::NoCapacity) =>
+            {
+                eprintln!("cold start {id} on node {}: {error}", node.id);
+                if error.code == Code::BuildFailed {
+                    p.failed_builds.note(&node.id, &wanted);
+                }
+            }
+            Err(other) => {
                 return Err(ApiError::new(
                     Code::NodeUnreachable,
-                    format!("node {}: {error:#}", node.id),
+                    format!("node {}: {:#}", node.id, other.error()),
                 ));
             }
         }
@@ -1039,16 +1081,30 @@ async fn start_on(
             ))),
             Err(error) => Err(Failure::Broken(error.into())),
         },
-        Err(Failure::Unreachable(error)) => {
+        // Refused before the worker claimed it: nothing started there.
+        Err(failure @ (Failure::Unreachable(_) | Failure::Refused { .. })) if certain(&failure) => {
             if let Err(e) = app
                 .db
                 .abandon_claim(&id, Some(&node.id), generation, &claim)
             {
                 eprintln!("record {id} as cold: {e}");
             }
-            Err(Failure::Unreachable(error))
+            Err(failure)
         }
-        Err(broken) => Err(broken),
+        Err(other) => Err(other.broken()),
+    }
+}
+
+/// Whether a failed cold-start call surely did not start the sandbox: it
+/// never reached the worker, or the worker refused it before its start.
+fn certain(failure: &Failure) -> bool {
+    match failure {
+        Failure::Unreachable(_) => true,
+        Failure::Refused { error, .. } => matches!(
+            error.code,
+            Code::Rebuilding | Code::BuildFailed | Code::NoCapacity
+        ),
+        Failure::Broken(_) => false,
     }
 }
 
@@ -1291,7 +1347,8 @@ async fn place(
     let resp = match sent {
         Ok(resp) => resp,
         Err(Failure::Unreachable(e)) => return Ok(Placed::Full(e)),
-        Err(Failure::Broken(e)) => {
+        Err(failure) => {
+            let e = failure.error();
             // It may exist there; the next heartbeat brings its copy.
             return Ok(Placed::Done(
                 ApiError::new(Code::Internal, format!("node {}: {e:#}", node.id))
@@ -1407,9 +1464,11 @@ pub async fn forward(
             eprintln!("forward to node {node}: {e:#}");
             gone(node)
         }
-        Err(Failure::Broken(e)) => {
-            ApiError::new(Code::Internal, format!("node {node}: {e:#}")).into_bad_gateway()
-        }
+        Err(failure) => ApiError::new(
+            Code::Internal,
+            format!("node {node}: {:#}", failure.error()),
+        )
+        .into_bad_gateway(),
     }
 }
 
@@ -1423,6 +1482,24 @@ fn gone(node: &str) -> Response {
 
 /// Forwards a call for a worker's sandbox and keeps the copy here up to
 /// date with deletes, pauses and resumes.
+/// Waits until the worker's report shows sandbox `id` cold and back with
+/// the primary, which the worker sends at once when a paused sandbox turns
+/// cold there. False if that did not happen within two heartbeats.
+pub async fn reported_cold(app: &App, id: &str) -> bool {
+    let until = tokio::time::Instant::now() + 2 * super::HEARTBEAT_EVERY;
+    loop {
+        match app.db.get_sandbox(id) {
+            Ok(Some(row)) if row.node.is_none() && row.state == state::COLD => return true,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
+        }
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 pub async fn forward_api(app: &App, node: &str, id: &str, req: Request) -> Response {
     // `/v1/sandboxes/{id}` and `/v1/sandboxes/{id}:verb`.
     let exact = req
@@ -1957,6 +2034,30 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_refusals_before_the_start_release_a_claim() {
+        let refused = |code| Failure::Refused {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: ApiError::new(code, "x"),
+        };
+        assert!(certain(&Failure::Unreachable(anyhow::anyhow!("down"))));
+        for code in [Code::Rebuilding, Code::BuildFailed, Code::NoCapacity] {
+            assert!(certain(&refused(code)), "{code:?}");
+        }
+        assert!(!certain(&refused(Code::Internal)));
+        assert!(!certain(&refused(Code::Conflict)));
+        assert!(!certain(&Failure::Broken(anyhow::anyhow!("cut off"))));
+    }
+
+    #[test]
+    fn a_failed_build_skips_only_that_node_and_spec() {
+        let failed = FailedBuilds::default();
+        failed.note("n1", "spec");
+        assert!(failed.recent("n1", "spec"));
+        assert!(!failed.recent("n2", "spec"));
+        assert!(!failed.recent("n1", "other"));
+    }
 
     #[test]
     fn only_proof_makes_a_lost_node_fenced() {

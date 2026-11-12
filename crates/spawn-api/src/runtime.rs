@@ -124,6 +124,17 @@ const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long a cold start may take before its claim is given up.
 pub const COLD_START_CLAIM: Duration = Duration::from_secs(120);
 
+/// A cold start with less time than this left does not boot.
+const MIN_BOOT: Duration = Duration::from_secs(10);
+
+/// How long a cold start that began `spent` ago may boot, so that all of
+/// it fits in `COLD_START_CLAIM`. `None` if too little is left.
+fn boot_budget(spent: Duration) -> Option<Duration> {
+    COLD_START_CLAIM
+        .checked_sub(spent)
+        .filter(|left| *left >= MIN_BOOT)
+}
+
 impl Record {
     fn is_moving(&self) -> bool {
         self.moving
@@ -393,6 +404,9 @@ pub struct Shared {
     /// Set while this host may not run persistent sandboxes: it lost the
     /// primary or the leader lease.
     fenced: AtomicBool,
+    /// Woken when a sandbox's state changed in a way the primary must learn
+    /// before its next heartbeat, such as a paused sandbox becoming cold.
+    pub report_now: tokio::sync::Notify,
 }
 
 impl Deref for Sandboxes {
@@ -454,6 +468,7 @@ impl Sandboxes {
             })),
             closing: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            report_now: tokio::sync::Notify::new(),
         }))
     }
 
@@ -1693,11 +1708,14 @@ impl Sandboxes {
         }
         if !self.settings.cold_starts {
             return Err(ApiError::new(
-                Code::Conflict,
-                format!("sandbox is {}; call it through the primary", sandbox.state),
+                Code::Cold,
+                format!(
+                    "sandbox is {} on this worker; the primary starts it again, try again",
+                    sandbox.state
+                ),
             ));
         }
-        self.start_cold_gated(id, origin).await
+        self.start_cold_gated(id, origin, None).await
     }
 
     /// Held while cold sandbox `id` is being started, here or elsewhere.
@@ -1706,7 +1724,15 @@ impl Sandboxes {
     }
 
     /// Starts cold sandbox `id` here, or waits for the start in progress.
-    pub async fn start_cold_gated(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
+    /// `fleet` is when the primary's call for it began: it then does not
+    /// wait for a build, and all of it ends within `COLD_START_CLAIM` of
+    /// then, inside the primary's claim.
+    pub async fn start_cold_gated(
+        &self,
+        id: &str,
+        origin: &Origin,
+        fleet: Option<Instant>,
+    ) -> Result<(), ApiError> {
         let gate = self.waking_gate(id);
         // In its own task: a client that disconnects must not stop a start
         // halfway.
@@ -1717,7 +1743,7 @@ impl Sandboxes {
             if this.inner().records.contains_key(&id) {
                 return Ok(());
             }
-            this.start_cold(&id, &origin).await
+            this.start_cold(&id, &origin, fleet).await
         })
         .await
         .map_err(|error| ApiError::internal(format!("task failed: {error}")))?
@@ -1725,7 +1751,18 @@ impl Sandboxes {
 
     /// Boots a new VM for cold sandbox `id` from its start record. Hold its
     /// waking lock.
-    async fn start_cold(&self, id: &str, origin: &Origin) -> Result<(), ApiError> {
+    async fn start_cold(
+        &self,
+        id: &str,
+        origin: &Origin,
+        fleet: Option<Instant>,
+    ) -> Result<(), ApiError> {
+        let begun = fleet.unwrap_or_else(Instant::now);
+        let rebuild_wait = if fleet.is_some() {
+            Duration::ZERO
+        } else {
+            crate::templates::REBUILD_WAIT
+        };
         if self.closing.load(Ordering::SeqCst) {
             return Err(Self::shutting_down());
         }
@@ -1751,14 +1788,20 @@ impl Sandboxes {
             vcpus: u8::try_from(start.vcpus).unwrap_or(u8::MAX),
             memory_mib: start.memory_mib,
         };
-        let root = self.templates.start_root(&start).await?;
+        let root = self.templates.start_root(&start, rebuild_wait).await?;
         let ready = root.ready;
         if let Some(reason) = root.rebuilt {
             self.adopt_root(id, origin, &mut start, &ready, reason)?;
         }
         let _admission = self.admit(&start.tenant, &quotas, id, limits, true)?;
+        let Some(budget) = boot_budget(begun.elapsed()) else {
+            return Err(ApiError::new(
+                Code::NoCapacity,
+                "the start ran out of time on this host; try again",
+            ));
+        };
         let claim = ids::base32(&ids::random::<10>().map_err(ApiError::internal)?);
-        let claim_ms = i64::try_from(COLD_START_CLAIM.as_millis()).unwrap_or(i64::MAX);
+        let claim_ms = i64::try_from(budget.as_millis()).unwrap_or(i64::MAX);
         let Some(generation) =
             self.db
                 .claim_cold(id, None, &claim, now_ms().saturating_add(claim_ms))?
@@ -1772,12 +1815,10 @@ impl Sandboxes {
             .chain([start.egress.clone()])
             .collect();
         let mut slot = None;
-        let booted = tokio::time::timeout(
-            COLD_START_CLAIM,
-            self.boot_cold(&start, &ready, policies, &mut slot),
-        )
-        .await
-        .unwrap_or_else(|_| Err(ApiError::internal("the start took too long")));
+        let booted =
+            tokio::time::timeout(budget, self.boot_cold(&start, &ready, policies, &mut slot))
+                .await
+                .unwrap_or_else(|_| Err(ApiError::internal("the start took too long")));
         drop(ready);
         let booted = match booted {
             Ok(booted) => booted,
@@ -2257,6 +2298,7 @@ impl Sandboxes {
         remove_dir(&self.paused_dir(id));
         self.db.set_cold(id, generation)?;
         self.cold_event(origin, tenant, id, why);
+        self.report_now.notify_one();
         Ok(())
     }
 
@@ -3343,6 +3385,16 @@ fn round(ms: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cold_start_boots_only_in_what_is_left_of_its_claim() {
+        let s = Duration::from_secs;
+        assert_eq!(boot_budget(s(0)), Some(COLD_START_CLAIM));
+        assert_eq!(boot_budget(s(60)), Some(COLD_START_CLAIM - s(60)));
+        assert_eq!(boot_budget(COLD_START_CLAIM - MIN_BOOT), Some(MIN_BOOT));
+        assert_eq!(boot_budget(COLD_START_CLAIM - s(5)), None);
+        assert_eq!(boot_budget(s(200)), None);
+    }
 
     const CANARY: &str = "svc-secret-env";
 

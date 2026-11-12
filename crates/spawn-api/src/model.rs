@@ -1200,10 +1200,34 @@ pub enum Code {
     BuildFailed,
     /// A build a sandbox needs is being made; the call can be repeated.
     Rebuilding,
+    /// A worker stopped the sandbox; the primary starts it again.
+    Cold,
     Internal,
 }
 
 impl Code {
+    const ALL: [Self; 14] = [
+        Self::InvalidRequest,
+        Self::Unauthorized,
+        Self::NotFound,
+        Self::Forbidden,
+        Self::Conflict,
+        Self::ProtectedEnv,
+        Self::QuotaExceeded,
+        Self::NoCapacity,
+        Self::NodeUnreachable,
+        Self::VolumeUnavailable,
+        Self::BuildFailed,
+        Self::Rebuilding,
+        Self::Cold,
+        Self::Internal,
+    ];
+
+    /// The code whose `as_str` is `text`.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == text)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
@@ -1218,6 +1242,7 @@ impl Code {
             Self::VolumeUnavailable => "volume_unavailable",
             Self::BuildFailed => "build_failed",
             Self::Rebuilding => "rebuilding",
+            Self::Cold => "sandbox_cold",
             Self::Internal => "internal",
         }
     }
@@ -1233,7 +1258,8 @@ impl Code {
             Self::NoCapacity
             | Self::NodeUnreachable
             | Self::VolumeUnavailable
-            | Self::Rebuilding => 503,
+            | Self::Rebuilding
+            | Self::Cold => 503,
             Self::Internal => 500,
         }
     }
@@ -1245,6 +1271,7 @@ impl Code {
                 | Self::NodeUnreachable
                 | Self::VolumeUnavailable
                 | Self::Rebuilding
+                | Self::Cold
                 | Self::Internal
                 | Self::QuotaExceeded
         )
@@ -1323,6 +1350,14 @@ impl From<crate::db::Error> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codes_read_back_from_their_names() {
+        for code in Code::ALL {
+            assert_eq!(Code::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(Code::parse("nope"), None);
+    }
 
     #[test]
     fn min_warm_is_not_part_of_the_build() {

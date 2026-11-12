@@ -35,14 +35,45 @@ pub enum Failure {
     Unreachable(anyhow::Error),
     /// The request may have reached the node.
     Broken(anyhow::Error),
+    /// The node answered with an API error.
+    Refused {
+        status: StatusCode,
+        error: crate::model::ApiError,
+    },
 }
 
 impl Failure {
     pub fn error(self) -> anyhow::Error {
         match self {
             Self::Unreachable(e) | Self::Broken(e) => e,
+            Self::Refused { status, error } => anyhow!("{status}: {error}"),
         }
     }
+
+    /// For callers that do not tell refusals apart: a refusal is then
+    /// taken as a call that may have done something.
+    pub fn broken(self) -> Self {
+        match self {
+            refused @ Self::Refused { .. } => Self::Broken(refused.error()),
+            other => other,
+        }
+    }
+}
+
+/// The API error in a reply that is not 2xx, if its body is one.
+pub fn refusal(bytes: &[u8]) -> Option<crate::model::ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        code: String,
+        message: String,
+    }
+    let body: Body = serde_json::from_slice(bytes).ok()?;
+    let code = crate::model::Code::parse(&body.error.code)?;
+    Some(crate::model::ApiError::new(code, body.error.message))
 }
 
 fn authority(url: &str) -> anyhow::Result<&str> {
@@ -166,6 +197,9 @@ pub async fn call<T: Serialize, R: DeserializeOwned>(
         .await
         .map_err(|e| Failure::Broken(anyhow!("read reply from {url}{path}: {e}")))?;
     if !status.is_success() {
+        if let Some(error) = refusal(&bytes) {
+            return Err(Failure::Refused { status, error });
+        }
         let text = String::from_utf8_lossy(&bytes);
         return Err(Failure::Broken(anyhow!(
             "{url}{path}: {status}: {}",
@@ -174,4 +208,19 @@ pub async fn call<T: Serialize, R: DeserializeOwned>(
     }
     serde_json::from_slice(&bytes)
         .map_err(|e| Failure::Broken(anyhow!("{url}{path}: bad reply: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Code;
+
+    #[test]
+    fn reads_an_api_error_reply() {
+        let found = refusal(br#"{"error":{"code":"rebuilding","message":"wait"}}"#).unwrap();
+        assert_eq!(found.code, Code::Rebuilding);
+        assert_eq!(found.message, "wait");
+        assert!(refusal(b"<html>bad gateway</html>").is_none());
+        assert!(refusal(br#"{"error":{"code":"made_up","message":"x"}}"#).is_none());
+    }
 }

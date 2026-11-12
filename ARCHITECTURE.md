@@ -408,9 +408,15 @@ major version and at most two minor versions apart.
   it. The event `sandbox.rebuilt` has `from_build`, `to_build` and
   `reason` (`missing`, `outdated` or `guest_too_old`), and
   `spawnbox_sandbox_rebuilds_total{reason}` counts it.
-- **Waiting.** The call waits up to 60 s, before it claims the row. After
-  that it gives `503 rebuilding` (retryable) and the build continues; the
-  next call takes it. A failed build gives `409 build_failed`, the row
+- **Waiting.** On the primary, the call waits up to 60 s, before it
+  claims the row. After that it gives `503 rebuilding` (retryable) and the
+  build continues; the next call takes it. A worker's cold-start route
+  does not wait at all: it gives `rebuilding` at once, so the primary's
+  claim covers only the boot. The primary passes that `503` on.
+- **Start budget.** A cold start's boot gets the claim's 120 s less the
+  time the start already spent, measured from when the call arrived. With
+  less than 10 s left it gives `503 no_capacity` before it claims the
+  row, so a start never runs past the claim that the primary holds. A failed build gives `409 build_failed`, the row
   stays `cold`, and the failure is returned for 5 minutes before another
   build is tried. Snapshot templates cannot be built again, so they fail
   at once.
@@ -971,9 +977,22 @@ flowchart TB
   as the start record, or on itself. It syncs config, pushes secrets and
   volumes, and sends the start record with the plain env over mutual TLS.
   The worker seals the env under its own key and starts the build. If the
-  worker was not reached, the primary starts it locally. If the call
-  broke, the claim stays: the next heartbeat after its deadline makes the
-  row `running` if the worker reports that generation, or `cold`.
+  worker was not reached, the primary starts it locally. If the worker
+  answered with an API error from before its own claim (`rebuilding`,
+  `build_failed` or `no_capacity`), nothing started there, so the
+  primary drops its claim at once. It passes `rebuilding` on; after
+  `build_failed` or `no_capacity` it starts the sandbox locally, and skips
+  that worker for that spec hash for 5 minutes after `build_failed`. If
+  the call broke, or the worker gave another error, the claim stays: the
+  next heartbeat after its deadline makes the row `running` if the
+  worker reports that generation, or `cold`.
+- **Paused on a worker.** A worker cannot cold-start. When a paused
+  persistent sandbox there becomes `cold` (for example `guest_too_old`),
+  the worker sends a heartbeat at once and answers `503 sandbox_cold`.
+  On that answer, the primary waits up to two heartbeats for the row to
+  show `cold` with no node, cold-starts it as above and forwards the call
+  once more. Only waking calls with a body of at most 1 MiB, not
+  upgrades, are kept to send again; others get the `503`.
 - **Volumes.** If a volume of the sandbox is on a node that is not
   ready, the cold start fails with `503 volume_unavailable`.
 - **Edges** resend a call to the primary only if the worker could not be

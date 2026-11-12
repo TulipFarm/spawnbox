@@ -362,7 +362,10 @@ pub fn spawn(app: AppState, w: Arc<Worker>) -> Vec<tokio::task::JoinHandle<()>> 
             let mut quiet = Quiet(None);
             loop {
                 quiet.see("heartbeat", heartbeat(&app, &w).await);
-                tokio::time::sleep(HEARTBEAT_EVERY).await;
+                tokio::select! {
+                    () = tokio::time::sleep(HEARTBEAT_EVERY) => {}
+                    () = app.sandboxes.report_now.notified() => {}
+                }
             }
         })
     };
@@ -508,6 +511,7 @@ async fn cold_start_here(
     State(app): State<AppState>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let begun = Instant::now();
     let ColdStart {
         mut sandbox,
         mut start,
@@ -549,7 +553,7 @@ async fn cold_start_here(
     sandbox.generation = generation - 1;
     app.db.replace_persistent(&sandbox, &start)?;
     app.sandboxes
-        .start_cold_gated(&id, &crate::events::Origin::system())
+        .start_cold_gated(&id, &crate::events::Origin::system(), Some(begun))
         .await?;
     let running = app.db.get_sandbox(&id)?.map(|s| s.generation);
     if running != Some(generation) {
