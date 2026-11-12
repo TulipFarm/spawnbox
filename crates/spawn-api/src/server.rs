@@ -969,8 +969,13 @@ async fn run(
         let routes = Router::new()
             .route("/metrics", get(metrics_text))
             .with_state(Arc::clone(&app));
-        let max_sandboxes = args.max_sandboxes;
-        let routes = routes.layer(axum::Extension(max_sandboxes));
+        let routes = routes.layer(axum::Extension(MetricsHost {
+            max_sandboxes: args.max_sandboxes,
+            data_dir: data.to_path_buf(),
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64()),
+        }));
         background.push(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, routes).await {
                 eprintln!("metrics listener: {error}");
@@ -1088,12 +1093,40 @@ fn inherit(
     })
 }
 
+/// What the metrics listener needs to know about this host.
+#[derive(Clone)]
+struct MetricsHost {
+    max_sandboxes: u32,
+    data_dir: PathBuf,
+    /// Seconds since the Unix epoch.
+    started: f64,
+}
+
 /// The registry plus gauges read now, in the Prometheus text format.
 async fn metrics_text(
     State(app): State<AppState>,
-    axum::Extension(max_sandboxes): axum::Extension<u32>,
+    axum::Extension(host): axum::Extension<MetricsHost>,
 ) -> Response {
-    let mut samples: Vec<(&'static str, metrics::Labels, f64)> = Vec::new();
+    let mut samples: Vec<(&'static str, metrics::Labels, f64)> =
+        vec![("spawnbox_start_time_seconds", vec![], host.started)];
+    match data_dir_bytes(&host.data_dir) {
+        Ok((available, size)) => {
+            samples.push((
+                "spawnbox_data_dir_available_bytes",
+                vec![],
+                available as f64,
+            ));
+            samples.push(("spawnbox_data_dir_size_bytes", vec![], size as f64));
+        }
+        Err(error) => eprintln!("metrics: data directory size: {error}"),
+    }
+    if let Some((term, holder)) = crate::leader::term() {
+        samples.push((
+            "spawnbox_leader_term",
+            vec![("holder", holder.to_owned())],
+            term as f64,
+        ));
+    }
     match app.db.count_local_sandboxes() {
         Ok(counts) => {
             for (state, count) in counts {
@@ -1103,7 +1136,7 @@ async fn metrics_text(
         Err(error) => eprintln!("metrics: count sandboxes: {error}"),
     }
     let free = app.sandboxes.free_slots() as f64;
-    let slots = f64::from(max_sandboxes);
+    let slots = f64::from(host.max_sandboxes);
     samples.push((
         "spawnbox_node_committed_ratio",
         vec![("resource", "slots".into())],
@@ -1178,6 +1211,17 @@ async fn metrics_text(
 fn host_memory_mib() -> Result<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
     parse_mem_total(&info).context("no MemTotal in /proc/meminfo")
+}
+
+/// Bytes free for an unprivileged user, and the size, of the file system
+/// that holds `dir`.
+fn data_dir_bytes(dir: &std::path::Path) -> nix::Result<(u64, u64)> {
+    let fs = nix::sys::statvfs::statvfs(dir)?;
+    let block = fs.fragment_size();
+    Ok((
+        fs.blocks_available().saturating_mul(block),
+        fs.blocks().saturating_mul(block),
+    ))
 }
 
 fn parse_mem_total(info: &str) -> Option<u64> {
@@ -1675,22 +1719,27 @@ async fn create(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let req: CreateSandbox = parse(&body)?;
-    let ns = namespace(&app, &caller, req.tenant.as_deref())?;
-    let tenant = app
-        .db
-        .get_tenant(ns.as_deref().unwrap_or(DEFAULT_TENANT))?
-        .ok_or_else(tenant_not_found)?;
-    if matches!(app.role, Role::Primary(_)) {
-        return primary::create(&app, tenant, req, &headers, body, origin).await;
+    let created = async {
+        let req: CreateSandbox = parse(&body)?;
+        let ns = namespace(&app, &caller, req.tenant.as_deref())?;
+        let tenant = app
+            .db
+            .get_tenant(ns.as_deref().unwrap_or(DEFAULT_TENANT))?
+            .ok_or_else(tenant_not_found)?;
+        if matches!(app.role, Role::Primary(_)) {
+            return primary::create(&app, tenant, req, &headers, body, origin).await;
+        }
+        if req.persistent && matches!(app.role, Role::Worker(_)) {
+            return Err(ApiError::new(
+                Code::Conflict,
+                "persistent sandboxes run on the primary only",
+            ));
+        }
+        create_here(app, tenant, req, origin).await
     }
-    if req.persistent && matches!(app.role, Role::Worker(_)) {
-        return Err(ApiError::new(
-            Code::Conflict,
-            "persistent sandboxes run on the primary only",
-        ));
-    }
-    create_here(app, tenant, req, origin).await
+    .await;
+    metrics::inc_result("spawnbox_creates_total", &created);
+    created
 }
 
 /// Creates a sandbox on this host.
@@ -2895,6 +2944,15 @@ fn totals_json(totals: &Totals) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_free_space_of_the_data_dir() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (available, size) = data_dir_bytes(dir).unwrap();
+        assert!(size > 0);
+        assert!(available <= size);
+        assert!(data_dir_bytes(&dir.join("missing")).is_err());
+    }
 
     #[tokio::test]
     async fn only_small_waking_calls_are_kept_to_send_again() {

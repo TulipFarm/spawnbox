@@ -84,6 +84,7 @@ workers, 10 Nov 2026.
 - [Use the CLI](#use-the-cli)
 - [How to use Spawnbox](#how-to-use-spawnbox)
 - [Use more than one host](#use-more-than-one-host)
+- [Back up and restore](#back-up-and-restore)
 - [API reference](#api-reference)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
@@ -140,7 +141,8 @@ These functions operate now:
 | Secrets | Keep secrets encrypted. Add them to HTTPS requests only for allowed hosts. |
 | Tenants | Give each customer its own API keys, quotas, templates, secrets and network rules. |
 | Events | Record each command, file change, connection and secret use. Stream events live. Send events and traces to OpenTelemetry. |
-| Metrics | Show Prometheus metrics for each host: create times, errors, connections, DNS queries, sandboxes, free space and warm pools. |
+| Metrics | Show Prometheus metrics for each host: create times, errors, connections, DNS queries, sandboxes, free space and warm pools. Alert rules are included. |
+| Backups | Back up the database and keys each day into one encrypted file, in a directory or S3, and restore them with a check that every secret decrypts. |
 | Usage | Measure vCPU, memory, disk and network use for each tenant and sandbox, each hour. |
 | CLI | Use the `spawnbox` command for sandboxes, commands, terminals, files, templates, volumes, secrets, tenants, events and usage. |
 | Operation | Install with one script as a systemd service. Use HTTPS. Recover after a crash. |
@@ -1004,6 +1006,17 @@ Prometheus adds the `instance` label.
 | `spawnbox_stale_copies_total` (counter) | None | Copies of persistent sandboxes from an older generation that a host deleted |
 | `spawnbox_sandbox_rebuilds_total` (counter) | `reason` (`missing`, `outdated`, `guest_too_old`) | Cold starts of persistent sandboxes that used a new build of their template spec, because the recorded build could not be used |
 | `spawnbox_fleet_retirements` (gauge) | `state` | Primary only: workers that retire, in each state (`draining`, `blocked`, `ready_to_terminate`) |
+| `spawnbox_creates_total` (counter) | `result` (`ok` or an error code) | Create calls, by result |
+| `spawnbox_cold_starts_total` (counter) | `result` (`ok` or an error code) | Cold starts of persistent sandboxes on this host, by result |
+| `spawnbox_cold_start_seconds` (histogram) | None | Time of each cold start that worked |
+| `spawnbox_leader_term` (gauge) | `holder` (this host's ID) | The term of the database lease this server holds as the primary. Only the leader shows it. It goes up each time a primary takes the lease: at a failover, and when the same primary restarts. A new `holder` means another host took over. |
+| `spawnbox_data_dir_available_bytes`, `spawnbox_data_dir_size_bytes` (gauges) | None | Free space and size of the file system of `--data-dir` |
+| `spawnbox_start_time_seconds` (gauge) | None | When this server process started, in seconds since the Unix epoch. It changes at each restart. |
+
+[`deploy/prometheus/spawnbox-alerts.yml`](deploy/prometheus/spawnbox-alerts.yml)
+has alert rules for these metrics. Each alert is described, with its likely
+cause and first response, in
+[`deploy/prometheus/README.md`](deploy/prometheus/README.md).
 
 ## Use more than one host
 
@@ -1629,11 +1642,210 @@ curl -s -H "$A" http://127.0.0.1:8080/v1/nodes/autoscale
 The events `autoscale.requested`, `autoscale.done`, `autoscale.failed`,
 `node.retiring` and `node.retired` show each request and retirement.
 
+## Back up and restore
+
+`install.sh` installs `/opt/spawnbox/backup.sh` and a systemd timer,
+`spawnbox-backup.timer`, that runs it each day on the primary. Workers
+are not backed up: their state comes from the primary.
+
+### What a backup contains
+
+Each backup is one file, `spawnbox-<UTC time>.tar.gpg`. It is a tar
+archive, encrypted with gpg (AES-256) under a passphrase. It contains:
+
+- The database: a copy of `spawnbox.db` made with `sqlite3 VACUUM INTO`, or,
+  with `--database-url`, a `pg_dump` of the Postgres database. This has
+  the tenants, keys, templates and their specs, sandbox records and start
+  records, events, volumes records, the fleet and the encrypted secrets
+  and env.
+- `secrets.key` (or the `--secrets-key-file`). Without it, the secrets,
+  the env of sandboxes and the CA keys in the database cannot be read.
+- `session.key`, the egress CA and, on a fleet, the fleet CA. With the
+  same fleet CA, the workers trust the restored primary.
+
+A backup does not contain:
+
+- Template builds. At the next start, the server builds the templates
+  again from their specs. A template made with `:snapshot` cannot be
+  built again; it works only if a [build store](#keep-builds-in-an-object-store)
+  has its build.
+- The memory and disk files of paused sandboxes. After a restore,
+  persistent sandboxes become `cold` and start again at the next call;
+  ephemeral paused sandboxes become `failed`.
+- Volumes. Copy them yourself if you need them.
+- `host-id`. A restored primary is a new host, so it fences the
+  persistent sandboxes of the old one, as at a failover.
+
+### The keys
+
+> [!WARNING]
+> `secrets.key` decrypts everything that Spawnbox encrypts in the
+> database. Never keep a plain copy of `secrets.key` in the same place as
+> a database dump. `backup.sh` puts both in one encrypted file, so that
+> they are never stored in plain.
+
+- `install.sh` makes a random passphrase in
+  `/etc/spawnbox/backup.passphrase` (mode `0600`). **Copy it now to a safe
+  place that is not this host and not the backup target**, such as a
+  password manager. Without the passphrase, the backups cannot be read.
+  If you lose the host, you need the passphrase and a backup.
+- The passphrase is used only to read and write backups. To change it,
+  write a new one into the file. Older backups still need the old one.
+- Keep `/etc/spawnbox/spawnbox.env` too, or know its flags. It is not in
+  the backup.
+
+### Settings
+
+Set these in `/etc/spawnbox/backup.env`. `install.sh` writes it once and
+keeps it on upgrade.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `SPAWNBOX_BACKUP_TARGET` | `/var/backups/spawnbox` | A directory, or `s3://bucket/prefix`. S3 needs the `aws` CLI and credentials, for example an instance role. |
+| `SPAWNBOX_BACKUP_KEEP` | `14` | How many backups to keep at the target. Older ones are deleted after each backup that works. |
+| `SPAWNBOX_BACKUP_PASSPHRASE_FILE` | `/etc/spawnbox/backup.passphrase` | The passphrase |
+| `SPAWNBOX_BACKUP_METRICS_FILE` | None | A node exporter textfile. After each backup that works, the script writes `spawnbox_backup_last_success_timestamp_seconds` to it, for the `SpawnboxBackupMissing` alert. |
+
+The script reads `--data-dir`, `--database-url`, `--database-ca-file` and
+`--secrets-key-file` from `SPAWNBOX_ARGS` in `/etc/spawnbox/spawnbox.env`.
+A backup to a local directory does not help if you lose the host's disk.
+Use S3, or copy the directory to another place.
+
+The server can run during a backup. A Postgres backup needs `pg_dump` of
+the server's major version or newer; `install.sh` installs
+`postgresql-client` when `--database-url` is set.
+
+```sh
+sudo systemctl start spawnbox-backup         # make a backup now
+sudo journalctl -u spawnbox-backup           # see the result
+sudo /opt/spawnbox/backup.sh --list          # list the backups
+systemctl list-timers spawnbox-backup.timer  # see when the next one runs
+```
+
+### Restore a backup
+
+1. Install Spawnbox on the host with the same flags as before, for
+   example the same `--database-url`. The new server makes an empty
+   database and a new `secrets.key`; the restore replaces them.
+2. Put the passphrase in `/etc/spawnbox/backup.passphrase` (mode `0600`).
+   If the backups are in S3, set `SPAWNBOX_BACKUP_TARGET` in
+   `/etc/spawnbox/backup.env`.
+3. Stop the server. With Postgres, stop every primary that shares the
+   database, standbys too, on every host. A standby that still runs takes
+   the lease and writes to the database while it is restored.
+
+   ```sh
+   sudo systemctl stop spawnbox
+   ```
+
+   With Postgres, the script refuses to restore while a primary holds the
+   leader lease. The lease ends 15 seconds after its primary stops.
+   `--ignore-lease` skips this check; use it only when you know that no
+   primary runs, for example when the lease is left by a host that is gone.
+
+4. Restore the newest backup, or a file or URL:
+
+   ```sh
+   sudo /opt/spawnbox/backup.sh --restore latest --force
+   sudo /opt/spawnbox/backup.sh --restore s3://my-bucket/spawnbox/spawnbox-20260101T030000Z.tar.gpg --force
+   ```
+
+   The script decrypts and checks the whole backup before it changes
+   anything. Without `--force`, it does not replace a SQLite database,
+   a Postgres database that has tables, or files that are different. With
+   `--force`, it keeps the old files as `<file>.pre-restore`. In Postgres,
+   it drops the database user's current schema (usually `public`), with
+   every table in it, makes it again and restores into it, all in one
+   transaction: if a step fails, the database is as it was. The database
+   user must own the schema. The Postgres database must exist.
+
+5. The script then runs `spawn-api check-data`. It counts the tenants,
+   keys, templates, secrets and sandboxes, and decrypts each secret, each
+   sandbox env and each CA key with the restored `secrets.key`. It fails
+   if one cannot be decrypted. You can run it yourself at any time:
+
+   ```sh
+   sudo /opt/spawnbox/bin/spawn-api check-data --data-dir /var/lib/spawnbox
+   ```
+
+   Add `--database-url` for Postgres. It changes nothing: it opens SQLite
+   read-only and Postgres in read-only transactions, and does not upgrade
+   the schema. It fails if the database's schema version is not the one
+   this `spawn-api` writes; check with the binary that wrote the data, or
+   start the matching server once to upgrade it.
+
+6. Start the server, and check it:
+
+   ```sh
+   sudo systemctl start spawnbox
+   spawnbox doctor
+   ```
+
+On a fleet, restore only the primary. The workers connect to it again,
+because the fleet CA is the same. Sandboxes and nodes that changed after
+the backup was made are as they were at the backup. Check
+`GET /v1/nodes` and the events after the restore.
+
 ## API reference
 
 Each `/v1` request must have the header `Authorization: Bearer <key>`.
 Spawnbox keeps only the SHA-256 hash of each key. An error response has
 this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
+
+### Errors
+
+| Code | HTTP status | Retryable | Meaning |
+| --- | --- | --- | --- |
+| `invalid_request` | 400 | No | A field is missing or wrong. |
+| `unauthorized` | 401 | No | The key is missing, wrong or revoked. |
+| `forbidden` | 403 | No | The key does not have the scope for this call. |
+| `not_found` | 404 | No | The sandbox, template or other resource does not exist. |
+| `conflict` | 409 | No | The resource is not in a state that allows this call, or the name is already used. |
+| `protected_env` | 409 | No | A snapshot would show env values of the sandbox. |
+| `build_failed` | 409 | No | A build that the sandbox needs could not be made. The same error is given for 5 minutes. |
+| `quota_exceeded` | 429 | Yes | A tenant quota is full. Try again after other sandboxes end. |
+| `no_capacity` | 503 | Yes | No host has room. The response has `Retry-After: 30`. |
+| `node_unreachable` | 503 | Yes | The host of the sandbox cannot be reached. |
+| `volume_unavailable` | 503 | Yes | The only copy of a volume is on a host that cannot be reached. |
+| `rebuilding` | 503 | Yes | A build that the sandbox needs is being made. |
+| `sandbox_cold` | 503 | Yes | A worker stopped the sandbox, and the primary starts it again. |
+| `internal` | 500 | Yes | An unexpected error. The server log has the cause with the `request_id`. |
+
+`retryable` in the response has the same value. Repeat a retryable call
+after a short wait, with backoff.
+
+### Sandbox states
+
+| State | Meaning | Next states |
+| --- | --- | --- |
+| `starting` | The VM starts, for a create, a fork or a cold start. | `running`; `failed` if the start fails; `deleted` if it is deleted meanwhile; `cold` for a persistent sandbox |
+| `running` | The VM runs. | `paused`, `deleted`; `cold` (persistent) or `failed`/`deleted` (ephemeral) when the VM is lost |
+| `paused` | Memory and disk are saved in `<data-dir>/paused/<id>`, and the VM is stopped. | `running` at a resume; `deleted`; `cold` (persistent) or `failed` (ephemeral) if the files cannot be used |
+| `cold` | Persistent only. No VM and no saved memory. The start record (template build, env, secrets, network rules, volumes, services, ports) is kept. | `starting` at the next exec, file, terminal, clone, preview or resume call; `deleted` |
+| `failed` | The sandbox could not start or lost its VM. It ends. | None |
+| `deleted` | The sandbox was deleted, expired or lost. It ends. | None |
+
+`failed` and `deleted` are final. These events show the changes:
+
+| Change | Event | Reason |
+| --- | --- | --- |
+| A create, fork or cold start ends | `sandbox.created`, `sandbox.forked`, `sandbox.cold_started` | |
+| Pause and resume | `sandbox.paused`, `sandbox.resumed` | `memory_pressure` for a pause to free memory |
+| An ephemeral sandbox loses its VM, or a server restart finds it running | `sandbox.lost` | The state is `failed` or `deleted`. |
+| The timeout ends | `sandbox.expired` | |
+| A persistent sandbox becomes `cold` | `sandbox.cold` | `server_restarted`, `shutdown` (the server stopped before it could pause), `vm_exited`, `pages_lost`, `pause_failed`, `froze_while_saving`, `resume_failed`, `guest_too_old`, `paused_files_missing`, `capacity` (no room for its idle pause), `start_unfinished`, `gone_from_node`, `node_reported` |
+| The primary fences a lost host, or a standby takes over | `node.fenced`, then `sandbox.cold` for each persistent sandbox of the host | `fenced` with `proof` (`operator`, `autoscaler`, `self_fence`), or `failover` |
+| A host stops its copy of a persistent sandbox | `sandbox.fenced` | `self_fenced` or `lease_lost` (the host fenced itself), `stale_generation` (a newer copy exists), `resume_fenced` |
+| A cold start uses a new build | `sandbox.rebuilt` | `missing`, `outdated`, `guest_too_old` |
+| A move to another host | `sandbox.migrated` | |
+
+Each cold start adds 1 to `generation`. A host stops a copy of a sandbox
+from an older generation. Refer to [Fence lost hosts](#fence-lost-hosts).
+
+A template build is `queued`, `building`, `ready` or `failed`. A ready
+build becomes `outdated` when the kernel, base disk or runtime of the host
+changes, and `removed` when a newer build replaces it or its template is
+deleted. The files of `outdated` and `removed` builds are deleted.
 
 ### Sandboxes
 
@@ -2076,8 +2288,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     `.cold` (with `reason`), `.cold_started` (with `generation`, `build`
     and `duration_ms`), `.rebuilt` (with `from_build`, `to_build` and
     `reason`), `.fenced` (with `reason` and `generation`: a host
-    stopped its copy)
-  - `node.fenced` (with `node` and `reason`, primary only)
+    stopped its copy), `.migrated`, `.session_token_created`
+  - `node.joined`, `.up`, `.down`, `.draining`, `.drained`, `.undrained`,
+    `.retiring`, `.retired`, `.removed`, `.fenced` (with `node` and
+    `reason`), primary only
   - `exec.started`, `exec.finished` (with the last 64 KiB of output)
   - `pty.opened`, `pty.closed`
   - `service.started` (with `pid`), `service.exited` (with `exit`),
@@ -2090,8 +2304,10 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   - `net.dns` (with `name`, `type`, `verdict`, `rcode`, `answers` and
     `duration_ms`)
   - `secret.injected` (without the value)
-  - changes to tenants, keys, secrets and templates
-  - `autoscale.requested`, `.done`, `.failed`, `.cancelled` (primary only)
+  - `volume.created`, `volume.deleted`
+  - changes to tenants, keys, secrets and templates, such as
+    `template.saved` and `template.deleted`
+  - `autoscale.requested`, `.done`, `.failed` (primary only)
 - `GET /v1/events` and `GET /v1/sandboxes/{id}/events` get events. These
   are the filters: `tenant`, `sandbox`, `step_id`, `type`, `since`,
   `until`. The type `exec.*` gets all the `exec` events.
@@ -2295,6 +2511,8 @@ Type these commands on the host.
 | A create request gives `409` | The template build is not ready | Wait until `latest_build.state` is `ready`. |
 | A snapshot gives `409 protected_env` | The sandbox was created with `env` values, which the template would show | Use secrets for the values, or create the sandbox without `env`. |
 | The server stops at start with `cannot read the stored env of ...` | `secrets.key` is not the key that encrypted them, or their rows are damaged | Put back the earlier `secrets.key`, or set `--secrets-key-file`, and restart. If the key is right, add `--allow-unreadable-env` to start without those sandboxes; they stay as they are. |
+| You are not sure that `secrets.key` reads the database, for example after you moved or restored it | | Stop the server and type `sudo /opt/spawnbox/bin/spawn-api check-data` (add `--database-url` for Postgres). It decrypts each secret, sandbox env and CA key, and tells which ones fail. |
+| `spawnbox-backup.service` fails | The passphrase file is missing, the target cannot be written, `pg_dump` is older than the database server, or the backup ran longer than its 4-hour limit (`TimeoutStartSec`) | Read `sudo journalctl -u spawnbox-backup`. Refer to [Back up and restore](#back-up-and-restore). |
 | The server stops at start with `downgrades are not supported` | An earlier release runs on a database that a newer release changed | Install the newer release again, or restore the backup from before the upgrade. |
 | A move gives `no host has the same backend, kernel, base disk, Firecracker or runsc, egress CA and CPU model` | The hosts have different backends, files or CPUs | Compare `fingerprint`, `backend` and `cpu` in `GET /v1/nodes`. Sandboxes cannot move between Firecracker and gVisor hosts. Copy `/opt/spawnbox/vmlinux` and `/opt/spawnbox/rootfs.ext4` from the primary to the worker, then restart the worker. |
 | A request gives `503 node_unreachable` | The worker that runs the sandbox does not answer | On the primary, look at the worker with `GET /v1/nodes`. On the worker, type `sudo systemctl status spawnbox`. |
@@ -2402,6 +2620,8 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
 | `templates/` | Ready-made template files for coding agent CLIs |
 | `install.sh` | The one-line installer: downloads a release (or the code) and runs `deploy/install.sh` |
 | `deploy/install.sh` | The installer for one server, from a release bundle or the code |
+| `deploy/backup.sh` | Encrypted backups and restores. Refer to [Back up and restore](#back-up-and-restore). |
+| `deploy/prometheus/` | Prometheus alert rules and what to do for each alert |
 | `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |
 | `scripts/` | Build scripts and end-to-end tests |
 

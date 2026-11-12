@@ -1,0 +1,296 @@
+# Prometheus alert rules for Spawnbox. Each alert is described, with its
+# likely cause and first response, in deploy/prometheus/README.md.
+#
+# The rules expect every Spawnbox host to be scraped with job="spawnbox".
+# Standby primaries do not listen on any port: scrape them, if at all,
+# under another job. Thresholds are starting points; tune them to your
+# fleet. Check this file with:  promtool check rules spawnbox-alerts.yml
+
+groups:
+  - name: spawnbox-availability
+    rules:
+      - alert: SpawnboxDown
+        expr: up{job="spawnbox"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} does not answer scrapes"
+          description: "The metrics listener of {{ $labels.instance }} has not answered for 2 minutes. The server may be stopped, crashing or unreachable."
+
+      - alert: SpawnboxMetricsMissing
+        expr: absent(up{job="spawnbox"} == 1)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Spawnbox host is reporting metrics"
+          description: "Prometheus has no Spawnbox target that answers. Every server is down, or the scrape configuration lost them."
+
+      - alert: SpawnboxRestartLoop
+        expr: changes(spawnbox_start_time_seconds{job="spawnbox"}[30m]) >= 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} restarted {{ $value }} times in 30 minutes"
+          description: "The server process keeps starting again. Running sandboxes are lost each time; persistent ones become cold."
+
+  - name: spawnbox-creates
+    rules:
+      - alert: SpawnboxCreateErrors
+        expr: |
+          sum by (instance) (rate(spawnbox_creates_total{job="spawnbox", result=~"internal|node_unreachable|volume_unavailable|build_failed"}[5m]))
+            / sum by (instance) (rate(spawnbox_creates_total{job="spawnbox"}[5m]))
+          > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of creates on {{ $labels.instance }} fail"
+          description: "More than 5% of create calls end with a server-side error (internal, node_unreachable, volume_unavailable or build_failed)."
+
+      - alert: SpawnboxInternalErrors
+        expr: sum by (instance) (rate(spawnbox_api_errors_total{job="spawnbox", code="internal"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} returns internal errors"
+          description: "Calls of any kind end with 500 internal at {{ $value }} per second. Each one is logged with its request ID."
+
+      - alert: SpawnboxCreateSlow
+        expr: |
+          histogram_quantile(0.95, sum by (instance, le) (rate(spawnbox_create_seconds_bucket{job="spawnbox"}[10m])))
+          > 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Creates on {{ $labels.instance }} are slow (p95 {{ $value | humanizeDuration }})"
+          description: "The 95th percentile of create time is above 2 seconds."
+
+  - name: spawnbox-cold-starts
+    rules:
+      - alert: SpawnboxColdStartFailures
+        expr: |
+          sum by (instance, result) (increase(spawnbox_cold_starts_total{job="spawnbox", result=~"internal|build_failed|no_capacity|volume_unavailable|node_unreachable"}[15m]))
+          > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cold starts on {{ $labels.instance }} fail with {{ $labels.result }}"
+          description: "Persistent sandboxes could not be started from their start records. They stay cold, and each call tries again."
+
+      - alert: SpawnboxColdStartSlow
+        expr: |
+          histogram_quantile(0.95, sum by (instance, le) (rate(spawnbox_cold_start_seconds_bucket{job="spawnbox"}[30m])))
+          > 60
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cold starts on {{ $labels.instance }} are slow (p95 {{ $value | humanizeDuration }})"
+          description: "The 95th percentile of cold start time is above 60 seconds, which usually means template builds are part of the start."
+
+      - alert: SpawnboxColdStartsHigh
+        expr: sum by (instance) (increase(spawnbox_cold_starts_total{job="spawnbox", result="ok"}[1h])) > 100
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} made {{ $value }} cold starts in the last hour"
+          description: "Many persistent sandboxes start from cold rather than resume. Paused files may be lost, or hosts fence or restart often."
+
+      - alert: SpawnboxSandboxRebuilds
+        expr: sum by (instance, reason) (increase(spawnbox_sandbox_rebuilds_total{job="spawnbox"}[1h])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Persistent sandboxes on {{ $labels.instance }} were rebuilt ({{ $labels.reason }})"
+          description: "Cold starts could not use their recorded build and built their template spec again. Expected once after an upgrade; not again and again."
+
+      - alert: SpawnboxBuildFailed
+        expr: sum by (instance) (increase(spawnbox_api_errors_total{job="spawnbox", code="build_failed"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Calls on {{ $labels.instance }} fail with build_failed"
+          description: "A build that a sandbox needs could not be made. The sandboxes stay cold until the template spec builds."
+
+  - name: spawnbox-services
+    rules:
+      - alert: SpawnboxServiceRestartsHigh
+        expr: sum by (instance, reason) (increase(spawnbox_service_restarts_total{job="spawnbox", reason=~"exit|unhealthy"}[10m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Services in sandboxes on {{ $labels.instance }} restart often ({{ $labels.reason }})"
+          description: "{{ $value }} service restarts in 10 minutes. A program in one or more sandboxes is in a crash loop or fails its health checks."
+
+  - name: spawnbox-fencing
+    rules:
+      - alert: SpawnboxSelfFenced
+        expr: sum by (instance, reason) (increase(spawnbox_self_fences_total{job="spawnbox"}[10m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} fenced itself ({{ $labels.reason }})"
+          description: "The host stopped its persistent sandboxes because it lost the primary (self_fenced) or the leader lease (lease_lost). They become cold and start again elsewhere."
+
+      - alert: SpawnboxSandboxesFencedCold
+        expr: sum by (instance, reason) (increase(spawnbox_fenced_cold_total{job="spawnbox"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Persistent sandboxes of a lost host became cold ({{ $labels.reason }})"
+          description: "{{ $value }} persistent sandboxes of a lost host or leader were made cold, with proof {{ $labels.reason }}."
+
+      - alert: SpawnboxStaleCopies
+        expr: sum by (instance) (increase(spawnbox_stale_copies_total{job="spawnbox"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} destroyed stale copies of persistent sandboxes"
+          description: "The host ran copies that a newer generation replaced. This follows a partition or a slow fence."
+
+      - alert: SpawnboxWorkerDown
+        expr: max by (instance) (spawnbox_fleet_nodes{job="spawnbox", state="down"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} workers are down"
+          description: "The primary has had no report from these workers for 30 seconds or more. Their persistent sandboxes become cold once fencing proves their copies stopped."
+
+      - alert: SpawnboxWorkerSuspect
+        expr: max by (instance) (spawnbox_fleet_nodes{job="spawnbox", state="suspect"}) > 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value }} workers miss reports"
+          description: "Workers are late with reports. No new sandboxes go to them."
+
+      - alert: SpawnboxLeaderChanged
+        expr: count(count by (holder) (max_over_time(spawnbox_leader_term{job="spawnbox"}[15m]))) > 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Another primary took the leader lease"
+          description: "More than one host held the leader lease in the last 15 minutes: a standby took over. A primary that restarts and takes the lease again does not count."
+
+      - alert: SpawnboxTwoLeaders
+        expr: count(spawnbox_leader_term{job="spawnbox"}) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} primaries report that they lead"
+          description: "More than one primary reports a leader term. Only one may hold the lease."
+
+  - name: spawnbox-capacity
+    rules:
+      - alert: SpawnboxNoCapacity
+        expr: sum by (instance) (increase(spawnbox_api_errors_total{job="spawnbox", code="no_capacity"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spawnbox on {{ $labels.instance }} refuses calls with no_capacity"
+          description: "Creates or cold starts find no host with room."
+
+      - alert: SpawnboxSlotsNearlyFull
+        expr: spawnbox_node_committed_ratio{job="spawnbox", resource="slots"} > 0.9
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of sandbox slots on {{ $labels.instance }} are in use"
+          description: "The host is near --max-sandboxes."
+
+      - alert: SpawnboxFleetLoadHigh
+        expr: spawnbox_fleet_load{job="spawnbox"} > 0.85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The fleet is {{ $value | humanizePercentage }} full"
+          description: "Slots or memory over the primary and its ready workers that are not draining are nearly used up."
+
+      - alert: SpawnboxWarmPoolEmpty
+        expr: sum by (instance, template, network) (spawnbox_warm_pool_ready{job="spawnbox"}) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The warm pool of {{ $labels.template }} on {{ $labels.instance }} is empty"
+          description: "Creates of this template boot from the build, not a warm VM, which is slower."
+
+      - alert: SpawnboxRetirementBlocked
+        expr: max by (instance) (spawnbox_fleet_retirements{job="spawnbox", state="blocked"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} worker retirements are blocked"
+          description: "Workers that are being retired hold sandboxes that cannot move."
+
+  - name: spawnbox-resources
+    rules:
+      - alert: SpawnboxDataDirFilling
+        expr: |
+          spawnbox_data_dir_available_bytes{job="spawnbox"} / spawnbox_data_dir_size_bytes{job="spawnbox"} < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The data directory of {{ $labels.instance }} has {{ $value | humanizePercentage }} free"
+          description: "Builds, paused sandboxes and volumes share this file system."
+
+      - alert: SpawnboxDataDirFull
+        expr: |
+          spawnbox_data_dir_available_bytes{job="spawnbox"} / spawnbox_data_dir_size_bytes{job="spawnbox"} < 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The data directory of {{ $labels.instance }} has {{ $value | humanizePercentage }} free"
+          description: "Pauses, builds, volume writes and database writes start to fail when the file system is full."
+
+      - alert: SpawnboxDataDirFillsSoon
+        expr: predict_linear(spawnbox_data_dir_available_bytes{job="spawnbox"}[1h], 6 * 3600) < 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The data directory of {{ $labels.instance }} fills within 6 hours at this rate"
+          description: "Free space falls fast enough to reach zero within 6 hours."
+
+      - alert: SpawnboxMemoryPressure
+        expr: spawnbox_node_committed_ratio{job="spawnbox", resource="memory"} > 0.90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of memory on {{ $labels.instance }} is in use"
+          description: "Little memory is left for new sandboxes and the host itself."
+
+      - alert: SpawnboxMemoryCritical
+        expr: spawnbox_node_committed_ratio{job="spawnbox", resource="memory"} > 0.97
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of memory on {{ $labels.instance }} is in use"
+          description: "The kernel may soon kill processes, including VMs or the server, to free memory."
+
+  - name: spawnbox-backups
+    rules:
+      - alert: SpawnboxBackupMissing
+        expr: time() - spawnbox_backup_last_success_timestamp_seconds > 2 * 86400
+        labels:
+          severity: warning
+        annotations:
+          summary: "No Spawnbox backup worked on {{ $labels.instance }} for {{ $value | humanizeDuration }}"
+          description: "deploy/backup.sh writes this metric through the node exporter's textfile collector after each backup that worked."

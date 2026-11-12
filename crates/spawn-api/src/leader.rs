@@ -6,6 +6,7 @@
 //! time.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -38,9 +39,23 @@ const EXIT_BY: Duration = CALL
     .saturating_add(EXIT_AFTER);
 const _: () = assert!(EXIT_BY.as_secs() < LEASE_S as u64);
 
+/// The term of the lease this process holds; 0 until it leads.
+static TERM: AtomicI64 = AtomicI64::new(0);
+
+/// This host's name in the lease, once it has led.
+static HOLDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The term of the lease this process holds, and its holder name, if it
+/// leads. The same holder takes a new term each time it takes the lease
+/// again, such as after a restart.
+pub fn term() -> Option<(i64, &'static str)> {
+    let term = TERM.load(Ordering::Relaxed);
+    (term > 0).then(|| (term, HOLDER.get().map_or("", String::as_str)))
+}
+
 /// Files under the data directory that every primary must have the same:
 /// the egress and fleet CAs and the browser session key.
-const SHARED: &[&str] = &[
+pub const SHARED: &[&str] = &[
     "egress-ca.crt",
     "egress-ca.key",
     "fleet/ca.crt",
@@ -60,6 +75,17 @@ pub fn open(data: &Path, url: Option<&str>, ca_file: Option<&Path>) -> Result<Db
     match url {
         Some(url) => Db::open_postgres(target(url, ca_file)?).context("open the Postgres database"),
         None => Db::open(&data.join(crate::DB_FILE)).context("open database"),
+    }
+}
+
+/// The database as it is, read-only and without migrations, for checks
+/// that must not change it.
+pub fn open_read_only(data: &Path, url: Option<&str>, ca_file: Option<&Path>) -> Result<Db> {
+    match url {
+        Some(url) => {
+            Db::open_postgres_read_only(target(url, ca_file)?).context("open the Postgres database")
+        }
+        None => Db::open_sqlite_read_only(&data.join(crate::DB_FILE)).context("open database"),
     }
 }
 
@@ -106,6 +132,7 @@ pub async fn lead(target: PgTarget, holder: String) -> Result<Leading> {
 /// Tells the server to stop and kills every VM here at once: the server
 /// may be stuck on the database. Exits `linger` later at most.
 async fn give_up(lost: tokio::sync::oneshot::Sender<()>, linger: Duration) -> ! {
+    TERM.store(0, Ordering::Relaxed);
     let _ = lost.send(());
     kill_vms();
     tokio::time::sleep(linger).await;
@@ -145,6 +172,8 @@ async fn hold(
         tokio::time::sleep(RENEW_EVERY).await;
     };
     let term = lease.0;
+    let _ = HOLDER.set(holder.to_owned());
+    TERM.store(term, Ordering::Relaxed);
     eprintln!("leading the database as {holder}, term {term}");
     if led.send(lease.1).is_err() {
         return;
@@ -225,7 +254,7 @@ async fn renew(
     Ok(n == 1)
 }
 
-fn label(name: &str) -> String {
+pub fn label(name: &str) -> String {
     format!("shared:{name}")
 }
 

@@ -1743,7 +1743,17 @@ impl Sandboxes {
             if this.inner().records.contains_key(&id) {
                 return Ok(());
             }
-            this.start_cold(&id, &origin, fleet).await
+            let begin = Instant::now();
+            let started = this.start_cold(&id, &origin, fleet).await;
+            metrics::inc_result("spawnbox_cold_starts_total", &started);
+            if started.is_ok() {
+                metrics::observe(
+                    "spawnbox_cold_start_seconds",
+                    Vec::new(),
+                    begin.elapsed().as_secs_f64(),
+                );
+            }
+            started
         })
         .await
         .map_err(|error| ApiError::internal(format!("task failed: {error}")))?
