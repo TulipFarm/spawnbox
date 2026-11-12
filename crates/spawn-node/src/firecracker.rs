@@ -199,6 +199,25 @@ impl Host {
         }
         eprintln!("warning: could not remove {}", cgroup.display());
     }
+
+    /// Kills every process of VM `id`. True once its cgroup is empty.
+    pub async fn kill_cgroup(&self, id: &str) -> bool {
+        kill_cgroup(&Path::new(CGROUP_ROOT).join(CGROUP_PARENT).join(id), 250).await
+    }
+}
+
+/// Kills every process in the cgroup at `dir`, then checks `tries` times,
+/// 20 ms apart, that it is empty. True if it is, or does not exist.
+pub async fn kill_cgroup(dir: &Path, tries: u32) -> bool {
+    let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+    for _ in 0..tries {
+        match std::fs::read_to_string(dir.join("cgroup.procs")) {
+            Ok(procs) if procs.trim().is_empty() => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    false
 }
 
 /// A jail directory being filled before Firecracker starts.
@@ -581,6 +600,22 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_cgroup_is_killed_once_it_is_empty() {
+        let dir = std::env::temp_dir().join(format!("spawnbox-cgroup-{}", std::process::id()));
+        assert!(kill_cgroup(&dir, 1).await);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), "42\n").unwrap();
+        assert!(!kill_cgroup(&dir, 2).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        std::fs::write(dir.join("cgroup.procs"), "").unwrap();
+        assert!(kill_cgroup(&dir, 1).await);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn pins(cpus: usize) -> Arc<CpuPins> {
         Arc::new(CpuPins {

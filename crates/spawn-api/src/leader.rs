@@ -1,7 +1,9 @@
 //! Several primaries can share one Postgres database. One leads and serves;
 //! the others wait as standbys and take over when it stops renewing its
 //! lease. A leader that cannot renew in time stops itself, before its lease
-//! runs out, so two never serve at once.
+//! runs out, so two never serve at once. Before it exits, it kills its
+//! persistent sandboxes, so a new leader can start them after the fence
+//! time.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,6 +22,9 @@ const CALL: Duration = Duration::from_secs(2);
 /// A leader stops when it has not renewed for this long: well before its
 /// lease runs out, even if the last call takes all of `CALL`.
 const GIVE_UP: Duration = Duration::from_secs(8);
+/// After losing the lease, how long the server has to stop its sandboxes
+/// before the process exits anyway: before the lease runs out.
+const EXIT_AFTER: Duration = Duration::from_secs(5);
 
 /// Files under the data directory that every primary must have the same:
 /// the egress and fleet CAs and the browser session key.
@@ -61,10 +66,18 @@ pub fn host_id(data: &Path) -> Result<String> {
     }
 }
 
+pub struct Leading {
+    /// Who held the lease before, if anyone did.
+    pub previous: Option<String>,
+    /// Fires when the lease is lost. The process exits `EXIT_AFTER` later.
+    pub lost: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// Waits until this host leads, then keeps the lease on a thread of its
-/// own. Returns the leader term. The process exits if the lease is lost.
-pub async fn lead(target: PgTarget, holder: String) -> Result<i64> {
+/// own. The process exits soon after the lease is lost.
+pub async fn lead(target: PgTarget, holder: String) -> Result<Leading> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let (lost_tx, lost) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("spawnbox-lease".into())
         .spawn(move || {
@@ -72,17 +85,31 @@ pub async fn lead(target: PgTarget, holder: String) -> Result<i64> {
                 .enable_all()
                 .build()
                 .expect("start the lease runtime");
-            rt.block_on(hold(&target, &holder, tx));
+            rt.block_on(hold(&target, &holder, tx, lost_tx));
         })?;
-    rx.await.context("the lease thread stopped")
+    let previous = rx.await.context("the lease thread stopped")?;
+    Ok(Leading { previous, lost })
 }
 
-async fn hold(target: &PgTarget, holder: &str, led: tokio::sync::oneshot::Sender<i64>) {
+/// Tells the server to stop, then exits if it has not.
+async fn give_up(lost: tokio::sync::oneshot::Sender<()>) -> ! {
+    let _ = lost.send(());
+    tokio::time::sleep(EXIT_AFTER).await;
+    eprintln!("exiting without the leader lease");
+    std::process::exit(1);
+}
+
+async fn hold(
+    target: &PgTarget,
+    holder: &str,
+    led: tokio::sync::oneshot::Sender<Option<String>>,
+    lost: tokio::sync::oneshot::Sender<()>,
+) {
     let mut client = None;
     let mut said = false;
-    let term = loop {
+    let lease = loop {
         match tokio::time::timeout(CALL, acquire(&mut client, target, holder)).await {
-            Ok(Ok(Some(term))) => break term,
+            Ok(Ok(Some(lease))) => break lease,
             Ok(Ok(None)) if !said => {
                 eprintln!("standby: another primary leads; waiting to take over");
                 said = true;
@@ -96,8 +123,9 @@ async fn hold(target: &PgTarget, holder: &str, led: tokio::sync::oneshot::Sender
         }
         tokio::time::sleep(RENEW_EVERY).await;
     };
+    let term = lease.0;
     eprintln!("leading the database as {holder}, term {term}");
-    if led.send(term).is_err() {
+    if led.send(lease.1).is_err() {
         return;
     }
     let mut renewed = Instant::now();
@@ -107,7 +135,7 @@ async fn hold(target: &PgTarget, holder: &str, led: tokio::sync::oneshot::Sender
             Ok(Ok(true)) => renewed = Instant::now(),
             Ok(Ok(false)) => {
                 eprintln!("another primary took the leader lease; stopping");
-                std::process::exit(1);
+                give_up(lost).await;
             }
             Ok(Err(_)) | Err(_) => client = None,
         }
@@ -116,7 +144,7 @@ async fn hold(target: &PgTarget, holder: &str, led: tokio::sync::oneshot::Sender
                 "cannot renew the leader lease for {} s; stopping so a standby can lead",
                 GIVE_UP.as_secs()
             );
-            std::process::exit(1);
+            give_up(lost).await;
         }
     }
 }
@@ -135,26 +163,27 @@ async fn connected<'c>(
 }
 
 /// Takes the lease if it is free, ran out, or is already ours. The term
-/// grows each time it is taken.
+/// grows each time it is taken. Returns the term and the previous holder.
 async fn acquire(
     slot: &mut Option<Client>,
     target: &PgTarget,
     holder: &str,
-) -> Result<Option<i64>, tokio_postgres::Error> {
+) -> Result<Option<(i64, Option<String>)>, tokio_postgres::Error> {
     let row = connected(slot, target)
         .await?
         .query_opt(
-            "INSERT INTO leader (id, holder, term, expires_at)
+            "WITH previous AS (SELECT holder FROM leader WHERE id = 1)
+             INSERT INTO leader (id, holder, term, expires_at)
              VALUES (1, $1, 1, now() + make_interval(secs => $2))
              ON CONFLICT (id) DO UPDATE SET
                  holder = excluded.holder, term = leader.term + 1,
                  expires_at = excluded.expires_at
              WHERE leader.expires_at < now() OR leader.holder = excluded.holder
-             RETURNING term",
+             RETURNING term, (SELECT holder FROM previous)",
             &[&holder, &(LEASE_S as f64)],
         )
         .await?;
-    Ok(row.map(|r| r.get(0)))
+    Ok(row.map(|r| (r.get(0), r.get(1))))
 }
 
 /// False if another host took the lease.
@@ -270,10 +299,15 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (mut a, mut b) = (None, None);
-            assert_eq!(acquire(&mut a, &t, "host_a").await.unwrap(), Some(1));
+            assert_eq!(
+                acquire(&mut a, &t, "host_a").await.unwrap(),
+                Some((1, None))
+            );
             assert_eq!(acquire(&mut b, &t, "host_b").await.unwrap(), None);
-            assert!(renew(&mut a, &t, "host_a", 1).await.unwrap());
-            assert!(!renew(&mut b, &t, "host_b", 1).await.unwrap());
+            let again = Some((2, Some("host_a".to_owned())));
+            assert_eq!(acquire(&mut a, &t, "host_a").await.unwrap(), again);
+            assert!(renew(&mut a, &t, "host_a", 2).await.unwrap());
+            assert!(!renew(&mut b, &t, "host_b", 2).await.unwrap());
             connected(&mut b, &t)
                 .await
                 .unwrap()
@@ -283,8 +317,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(acquire(&mut b, &t, "host_b").await.unwrap(), Some(2));
-            assert!(!renew(&mut a, &t, "host_a", 1).await.unwrap());
+            let taken = Some((3, Some("host_a".to_owned())));
+            assert_eq!(acquire(&mut b, &t, "host_b").await.unwrap(), taken);
+            assert!(!renew(&mut a, &t, "host_a", 2).await.unwrap());
         });
     }
 }
