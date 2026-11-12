@@ -33,7 +33,9 @@ Modes:
 
 Invariants:
   lost       every persistent sandbox answers (within --verify-wait while
-             its host restarts or its volume's host is away), with its volume marker
+             its host restarts or its volume's host is away, and within
+             --retry-wait, with backoff, while a wake or check fails with a
+             retryable error such as no_capacity), with its volume marker
              intact, and its disk marker ($HOME of the guest's default
              user) intact unless it was cold started
              since the marker was written; its env value is still there
@@ -152,6 +154,8 @@ def parse_args(argv):
     p.add_argument("--fence-margin-s", type=int, default=30)
     p.add_argument("--verify-wait", type=duration, default=duration("3m"),
                    help="time a restarting host or an away volume may take before a sandbox counts as lost")
+    p.add_argument("--retry-wait", type=duration, default=duration("90s"),
+                   help="time a wake or check that fails with a retryable error, such as no_capacity, is asked again")
     p.add_argument("--summary", default="soak-summary.json")
     p.add_argument("--keep", action="store_true", help="do not delete the soak's sandboxes and volumes at the end")
     p.add_argument("--dry-run", action="store_true", help="print the plan and run read-only probes only")
@@ -241,6 +245,15 @@ class Api:
             except (OSError, http.client.HTTPException):
                 pass
         return None
+
+
+def retryable(status, body):
+    """Whether a failed call may work if asked again soon."""
+    if status == 503:
+        return True
+    if isinstance(body, dict) and isinstance(body.get("error"), dict) and body["error"].get("retryable") is True:
+        return True
+    return code(body) in ("no_capacity", "conflict")
 
 
 def code(body):
@@ -482,18 +495,34 @@ class Soak:
     def verify(self, sid, why, wait=None):
         """The sandbox answers and still has its data. Answers that only mean
         "not yet", such as a host that is restarting or a volume whose host
-        is away, are asked again for up to `wait` seconds; a persistent
-        sandbox that still does not answer then is lost."""
+        is away, are asked again for up to `wait` seconds. Other retryable
+        answers, such as no room to wake it now, are asked again with
+        backoff for up to --retry-wait. A persistent sandbox that still does
+        not answer then, or answers with an error that is not retryable,
+        is lost."""
         rec = self.mine[sid]
-        deadline = time.time() + (self.args.verify_wait if wait is None else wait)
+        now = time.time()
+        deadline = now + (self.args.verify_wait if wait is None else wait)
+        busy_deadline = now + self.args.retry_wait
+        backoff = 2
         while True:
             stdout, exit_code, raw = self.exec(
                 sid, 'printf "%s|%s|%s" "$(cat /data/soak-marker 2>/dev/null)" "$(cat "$HOME/soak-marker" 2>/dev/null)" "$SOAK_TOKEN"'
             )
-            if stdout is not None or exit_code != 503 or code(raw) not in NOT_YET or time.time() >= deadline:
+            if stdout is not None:
                 break
-            self.count("verify_wait", code(raw))
-            time.sleep(5)
+            c = code(raw) or str(exit_code)
+            if exit_code == 503 and c in NOT_YET and time.time() < deadline:
+                self.count("verify_wait", c)
+                time.sleep(5)
+                continue
+            if retryable(exit_code, raw) and time.time() < busy_deadline:
+                key = "retried_" + c
+                self.summary["errors"][key] = self.summary["errors"].get(key, 0) + 1
+                time.sleep(min(backoff, max(0.0, busy_deadline - time.time())))
+                backoff = min(backoff * 2, 20)
+                continue
+            break
         if stdout is None:
             if rec["persistent"]:
                 self.violate("lost", f"{sid} ({why}) does not answer: {exit_code} {json.dumps(raw)[:300]}")

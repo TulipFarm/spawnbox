@@ -10,10 +10,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import soak  # noqa: E402
 
 
+class Clock:
+    """Time that moves only when the script sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 def make(argv=()):
+    clock = Clock()
+    soak.time.time, soak.time.sleep = clock.time, clock.sleep
     s = soak.Soak(soak.parse_args(["--api", "http://127.0.0.1:1", "--key", "k", *argv]))
     s.log = lambda msg: None
-    soak.time.sleep = lambda _: None
+    s.clock = clock
     return s
 
 
@@ -95,6 +110,53 @@ class Placement(unittest.TestCase):
             s.place(1, "nod_a", volume=False)
         self.assertEqual(fleet.deleted, ["sbx_000000000000"])
         self.assertEqual(s.summary["violations"], [])
+
+
+class Retries(unittest.TestCase):
+    NO_ROOM = (503, {"error": {"code": "no_capacity", "retryable": True,
+                               "message": "the memory of this host is reserved by other sandboxes"}})
+
+    def sandbox(self, answers):
+        """A persistent sandbox whose next checks get `answers`, then work."""
+        s = make()
+        Fleet(s, [])
+        sid = s.create(True, volume=False)
+        answers = list(answers)
+        works = s.exec
+
+        def exec_(sandbox, cmd, timeout=300):
+            if answers:
+                status, body = answers.pop(0)
+                return None, status, body
+            return works(sandbox, cmd, timeout)
+
+        s.exec = exec_
+        return s, sid
+
+    def test_a_wake_with_no_room_is_asked_again_with_backoff(self):
+        s, sid = self.sandbox([self.NO_ROOM] * 4)
+        start = s.clock.now
+        self.assertTrue(s.verify(sid, "wake"))
+        self.assertEqual(s.summary["violations"], [])
+        self.assertEqual(s.summary["errors"]["retried_no_capacity"], 4)
+        # 2 + 4 + 8 + 16 seconds of backoff.
+        self.assertEqual(s.clock.now - start, 30)
+
+    def test_a_wake_that_has_no_room_for_too_long_is_lost(self):
+        s, sid = self.sandbox([self.NO_ROOM] * 100)
+        start = s.clock.now
+        self.assertFalse(s.verify(sid, "wake"))
+        self.assertEqual([v["kind"] for v in s.summary["violations"]], ["lost"])
+        self.assertLessEqual(s.clock.now - start, 90)
+        self.assertGreater(s.summary["errors"]["retried_no_capacity"], 3)
+
+    def test_an_error_that_is_not_retryable_is_lost_at_once(self):
+        s, sid = self.sandbox([(404, {"error": {"code": "not_found", "retryable": False}})])
+        start = s.clock.now
+        self.assertFalse(s.verify(sid, "wake"))
+        self.assertEqual([v["kind"] for v in s.summary["violations"]], ["lost"])
+        self.assertEqual(s.clock.now, start)
+        self.assertNotIn("retried_not_found", s.summary["errors"])
 
 
 if __name__ == "__main__":

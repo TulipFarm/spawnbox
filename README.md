@@ -2786,7 +2786,11 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
 - A sandbox whose host is restarting or cut off, or whose volume's host
   is away, may answer 503 for a while. The script asks again for up to
   `--verify-wait` (default 3 minutes) before it counts the sandbox as
-  lost.
+  lost. A wake or check that fails with another retryable error, such as
+  `503 no_capacity` on a full host, is asked again with backoff for up to
+  `--retry-wait` (default 90 seconds). The summary counts these retries
+  under `errors` as `retried_<code>`. An error that is not retryable
+  counts as lost at once.
 - The script writes the summary (`--summary`) and exits with 1 if a check
   fails. It exits with 3 if it cannot set up what it tests, for example
   if it cannot write its markers or cannot get a sandbox onto the host of
