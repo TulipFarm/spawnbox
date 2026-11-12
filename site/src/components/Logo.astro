@@ -7,12 +7,23 @@ interface Props {
   x?: number;
   y?: number;
   mono?: boolean;
+  decorative?: boolean;
 }
-const { name, size = 14, x, y, mono = false } = Astro.props;
+const { name, size = 14, x, y, mono = false, decorative = false } = Astro.props;
 const l = logos[name] as { name: string; color: string; d: string; rule?: "evenodd" };
 ---
 
-<svg class="logo" viewBox="0 0 24 24" width={size} height={size} x={x} y={y} role="img" aria-label={l.name}>
-  <title>{l.name}</title>
+<svg
+  class="logo"
+  viewBox="0 0 24 24"
+  width={size}
+  height={size}
+  x={x}
+  y={y}
+  role={decorative ? undefined : "img"}
+  aria-label={decorative ? undefined : l.name}
+  aria-hidden={decorative ? "true" : undefined}
+>
+  {!decorative && <title>{l.name}</title>}
   <path d={l.d} fill={mono ? "currentColor" : l.color} fill-rule={l.rule} />
 </svg>

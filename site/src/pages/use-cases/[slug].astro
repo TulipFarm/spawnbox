@@ -1,0 +1,178 @@
+---
+import { Code } from "astro:components";
+import Box from "../../components/Box.astro";
+import Logo from "../../components/Logo.astro";
+import TraceDiagram from "../../components/TraceDiagram.astro";
+import Page from "../../layouts/Page.astro";
+import { laneName, runtimeNote, useCases, type UseCase } from "../../data/use-cases";
+import "../../styles/use-cases.css";
+
+export function getStaticPaths() {
+  return useCases.map((uc, n) => ({ params: { slug: uc.slug }, props: { uc, n } }));
+}
+
+const { uc, n } = Astro.props as { uc: UseCase; n: number };
+const repo = "https://github.com/TulipFarm/spawnbox";
+const pad = (x: number) => String(x).padStart(2, "0");
+const prev = useCases[(n + useCases.length - 1) % useCases.length];
+const next = useCases[(n + 1) % useCases.length];
+const soon = uc.status === "soon";
+const sections = 2 + (uc.extras ? 1 : 0);
+let sec = 0;
+---
+
+<Page
+  title={uc.title}
+  description={uc.description}
+  current="use-cases"
+  og={uc.slug}
+  ogAlt={`Spawnbox use case: ${uc.h1} ${uc.hl}`}
+  crumbs={[
+    ["Use cases", "/use-cases/"],
+    [uc.name, `/use-cases/${uc.slug}/`],
+  ]}
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/use-cases/">Use cases</a>
+    <span aria-hidden="true">/</span>
+    <span aria-current="page">UC-{pad(n + 1)} {uc.name}</span>
+  </nav>
+
+  <section class="hero uc-hero">
+    <div class="uc-copy">
+      <p class={`status ${uc.status}`}>
+        {soon ? "◐ Runs today on a plain sandbox · template coming" : "● Works today"}
+      </p>
+      <h1>
+        {uc.h1}
+        <span class="hl">{uc.hl}</span>
+      </h1>
+      <p class="lede">{uc.lede}</p>
+      <div class="cta">
+        <a class="btn" href="/#install">Install Spawnbox</a>
+        <a class="btn-line" href={repo}>Read the source</a>
+      </div>
+      <div class="runs">
+        <p class="runs-k">{uc.runs.title}</p>
+        <ul>
+          {
+            uc.runs.items.map(([logo, label]) => (
+              <li>
+                {logo ? (
+                  <Logo name={logo} size={18} decorative />
+                ) : (
+                  <svg viewBox="-17 -20 34 38" width="18" height="18" aria-hidden="true">
+                    <Box i={-0.5} j={-0.5} s={16} tone="wire" />
+                  </svg>
+                )}
+                <span>{label}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </div>
+    <figure class="scene uc-scene">
+      <TraceDiagram actor={uc.actor} inside={uc.inside} logos={uc.logos} planned={soon} />
+      <figcaption>FIG. {pad(n + 1)} · ONE REQUEST, THERE AND BACK</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="trace-h">
+    <header class="sec-head">
+      <span class="sec-no" aria-label={`Section ${++sec}`}><b>{pad(sec)}</b><small>{pad(sections)}</small></span>
+      <h2 id="trace-h">Follow one request.</h2>
+      <p class="sec-sub">
+        Each step shows the call, the reply and the lines it adds to the activity log. You can read the whole log with
+        <code>GET /v1/sandboxes/$S/events</code>.
+      </p>
+    </header>
+    {uc.note && <p class="soon-note">{uc.note}</p>}
+    <ol class="trace">
+      {
+        uc.stops.map((s, i) => (
+          <li class={`stop lane-${s.lane}${s.planned ? " planned" : ""}`}>
+            <span class="stop-no" aria-hidden="true">
+              {pad(i + 1)}
+            </span>
+            <div class="stop-text">
+              <p class="lane">
+                {laneName[s.lane]}
+                {s.planned && <span class="tag-planned">PLANNED</span>}
+              </p>
+              <h3>{s.title}</h3>
+              <p>{s.body}</p>
+            </div>
+            {(s.call || s.reply || s.events) && (
+              <div class="stop-io">
+                {[s.call, s.reply].filter(Boolean).map((c) => (
+                  <div class="snip">
+                    <span class="snip-k">{c!.label ?? (c!.lang === "http" ? "REQUEST" : c!.lang === "bash" ? "SHELL" : "JSON")}</span>
+                    <Code code={c!.code} lang={c!.lang} theme="github-light" />
+                  </div>
+                ))}
+                {s.events && (
+                  <ul class="log" aria-label="Activity log lines">
+                    {s.events.map(([type, detail]) => (
+                      <li>
+                        <b>{type}</b>
+                        <span>{detail}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  {
+    uc.extras && (
+      <section aria-labelledby="extras-h">
+        <header class="sec-head">
+          <span class="sec-no" aria-label={`Section ${++sec}`}>
+            <b>{pad(sec)}</b>
+            <small>{pad(sections)}</small>
+          </span>
+          <h2 id="extras-h">{uc.extrasTitle}</h2>
+        </header>
+        <div class="extras">
+          {uc.extras.map((e) => (
+            <article class="extra">
+              <h3>{e.title}</h3>
+              <p>{e.body}</p>
+              <Code code={e.call.code} lang={e.call.lang} theme="github-light" />
+            </article>
+          ))}
+        </div>
+      </section>
+    )
+  }
+
+  <section aria-labelledby="limits-h">
+    <header class="sec-head">
+      <span class="sec-no" aria-label={`Section ${++sec}`}><b>{pad(sec)}</b><small>{pad(sections)}</small></span>
+      <h2 id="limits-h">Good to know.</h2>
+    </header>
+    <ul class="limits">
+      {[...uc.limits, runtimeNote].map((l) => <li>{l}</li>)}
+    </ul>
+    <nav class="pager" aria-label="More use cases">
+      <a href={`/use-cases/${prev.slug}/`}>
+        <span class="k">← PREVIOUS</span>
+        <span>{prev.name}</span>
+      </a>
+      <a href="/use-cases/" class="all">
+        <span class="k">INDEX</span>
+        <span>All use cases</span>
+      </a>
+      <a href={`/use-cases/${next.slug}/`} class="nx">
+        <span class="k">NEXT →</span>
+        <span>{next.name}</span>
+      </a>
+    </nav>
+  </section>
+</Page>

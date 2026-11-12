@@ -2,7 +2,7 @@
 import { Code } from "astro:components";
 import Box from "../components/Box.astro";
 import Logo from "../components/Logo.astro";
-import "../styles/base.css";
+import Page from "../layouts/Page.astro";
 
 const repo = "https://github.com/TulipFarm/spawnbox";
 const install = "curl -fsSL https://spawnbox.tulipfarm.ai/install.sh | sh";
@@ -84,7 +84,7 @@ const scale = [
   { v: "2×", unit: "", label: "Double the servers, double the agents" },
 ];
 
-const groups = [
+const groups: { name: string; shape: string; items: [string, string, boolean?][] }[] = [
   {
     name: "Run code",
     shape: "cube",
@@ -93,8 +93,8 @@ const groups = [
       ["Commands", "Run any command. Get the result at the end, or watch it live. Type input into it."],
       ["Files", "Read, write, list and delete files and folders."],
       ["Terminals", "Open a live terminal into the sandbox."],
-      ["Browser sessions", "Share a short-lived link to one sandbox's terminal and web apps. No API key needed."],
       ["Git", "Download code from Git. Private repos work with a saved secret."],
+      ["Services", "Keep a program, like a web server, running. It restarts when it stops or fails a health check, and keeps its recent output.", true],
     ],
   },
   {
@@ -113,6 +113,7 @@ const groups = [
     items: [
       ["Pause and resume", "Pause a sandbox and save everything to disk. Wake it up in about 65 ms. Idle sandboxes pause by themselves."],
       ["Copy and save", "Make up to 16 copies of a running sandbox in under 1 s. Save it as a template without stopping it."],
+      ["Persistent sandboxes", "Keep a sandbox until you delete it. If its VM is lost, the next call starts it again with the same ID, settings, volumes and ports. Primary only for now.", true],
     ],
   },
   {
@@ -120,8 +121,10 @@ const groups = [
     shape: "gate",
     items: [
       ["Preview links", "Open a web app that runs in a sandbox from a link. The link can be public, need a token, or be private."],
+      ["Browser sessions", "Share a short-lived link to one sandbox's terminal and web apps. No API key needed."],
       ["Site rules", "Choose which websites a sandbox can reach: all, some or none. Limit its speed. Log every connection."],
       ["Secrets", "Your API keys stay locked outside the sandbox. They are added to requests only for sites you allow."],
+      ["Encrypted settings", "Sandbox and service settings are encrypted on disk and tied to one sandbox. A copied value can't be read anywhere else.", true],
     ],
   },
   {
@@ -131,6 +134,9 @@ const groups = [
       ["More servers", "Add servers when you need room. Each new sandbox goes to the server with the most space. Empty a server before you remove it."],
       ["Two backends", "Uses Firecracker on servers with KVM, and gVisor on servers without it. You can require Firecracker for a customer."],
       ["Many customers", "Serve many customers from one install. Each gets its own keys, limits, templates, secrets and site rules."],
+      ["Failover", "Run two or more primaries on one Postgres database. If the leader stops, another takes over in about 15 s. Sandboxes on workers keep running.", true],
+      ["Autoscaling", "When it's busy, Spawnbox asks your script or webhook for another server, and gives it back when idle. Use AWS, Terraform or any tool.", true],
+      ["Memory guard", "When a server runs short of memory, the least recently used idle sandbox pauses to disk. Memory a sandbox frees goes back to the server.", true],
     ],
   },
   {
@@ -146,6 +152,36 @@ const groups = [
   },
 ];
 let fid = 0;
+
+const site = Astro.site!.href;
+const software = [
+  {
+    "@type": "SoftwareApplication",
+    "@id": `${site}#software`,
+    name: "Spawnbox",
+    url: site,
+    description:
+      "Open-source sandbox server for AI agent platforms. Runs Firecracker microVMs on your own Linux servers, with a gVisor fallback.",
+    applicationCategory: "DeveloperApplication",
+    operatingSystem: "Linux",
+    license: "https://www.apache.org/licenses/LICENSE-2.0",
+    isAccessibleForFree: true,
+    offers: { "@type": "Offer", price: 0, priceCurrency: "USD" },
+    featureList: groups.flatMap((g) => g.items.map(([name]) => name)),
+    downloadUrl: `${repo}/releases`,
+    installUrl: `${site}install.sh`,
+    sameAs: [repo],
+  },
+  {
+    "@type": "SoftwareSourceCode",
+    "@id": `${site}#source`,
+    name: "spawnbox",
+    codeRepository: repo,
+    programmingLanguage: "Rust",
+    license: "https://www.apache.org/licenses/LICENSE-2.0",
+    targetProduct: { "@id": `${site}#software` },
+  },
+];
 
 type Mark = "yes" | "part" | "no" | "unk";
 const providers = ["Spawnbox", "E2B", "Daytona", "microsandbox", "CubeSandbox", "InstaVM"];
@@ -317,43 +353,13 @@ const events = [
 ];
 ---
 
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>Spawnbox — self-hosted sandboxes for AI agents</title>
-    <meta
-      name="description"
-      content="Spawnbox is an open-source sandbox server for AI agent platforms. Firecracker microVMs on your own Linux servers, with a gVisor fallback."
-    />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
-  </head>
-  <body>
-    <div class="sheet">
-      <header class="topbar">
-        <a class="mark" href="/" aria-label="Spawnbox home">
-          <svg viewBox="-22 -26 44 48" width="30" height="30" aria-hidden="true">
-            <Box i={-0.5} j={-0.5} s={20} />
-          </svg>
-          <span>SPAWNBOX</span>
-        </a>
-        <nav>
-          <a href="#uses">Use cases</a>
-          <a href="#features">Features</a>
-          <a href="#how">How it works</a>
-          <a href="#compare">Compare</a>
-          <a href="#install">Install</a>
-          <a class="btn-line" href={repo}>GitHub ↗</a>
-        </nav>
-      </header>
-
+<Page
+  title="Spawnbox — self-hosted sandboxes for AI agents"
+  description="Spawnbox is an open-source sandbox server for AI agent platforms. Firecracker microVMs on your own Linux servers, with a gVisor fallback."
+  og="home"
+  ogAlt="Spawnbox: sandboxes for AI agents, on your own servers. Firecracker microVMs with a gVisor fallback."
+  schema={software}
+>
       <section class="hero">
         <div class="hero-copy">
                     <h1 class="reveal">
@@ -591,7 +597,7 @@ const events = [
         <header class="sec-head reveal">
           <span class="sec-no" aria-label="Section 2"><b>02</b><small>06</small></span>
           <h2>What you can run</h2>
-          <p class="sec-sub">A sandbox is a full Linux computer. If it runs on Linux, it runs in Spawnbox.</p>
+          <p class="sec-sub">A sandbox is a full Linux computer. If it runs on Linux, it runs in Spawnbox. <a href="/use-cases/">See all six use cases</a>, including code from tool calls and MCP servers.</p>
         </header>
         <div class="uses">
           <article class="use reveal">
@@ -606,6 +612,7 @@ const events = [
             </div>
             <h3>Coding agents</h3>
             <p>Run Claude Code, Codex or Copilot CLI on a real repo. Let them install packages and run tests. If they break something, only the sandbox breaks. Your API keys stay outside.</p>
+            <a class="use-more" href="/use-cases/coding-agents/">How coding agents run →</a>
           </article>
 
           <article class="use reveal">
@@ -623,6 +630,7 @@ const events = [
             </div>
             <h3>Browser and computer use</h3>
             <p>Give an agent its own browser, or a whole desktop you add to its template. It clicks, types, fills forms and uses apps. It can only reach the sites you allow, and every visit is logged.</p>
+            <p class="use-links"><a class="use-more" href="/use-cases/browser-use/">Browser use →</a><a class="use-more" href="/use-cases/computer-use/">Computer use →</a></p>
           </article>
 
           <article class="use reveal">
@@ -636,6 +644,7 @@ const events = [
             </div>
             <h3>Real web apps</h3>
             <p>Run the Next.js or Vite app you ship to Vercel, or one you made in Lovable. Start it with <Code code="npm run dev" lang="bash" theme="github-light" inline />, publish port 3000, and open the link.</p>
+            <a class="use-more" href="/use-cases/web-apps/">How web apps run →</a>
           </article>
         </div>
       </section>
@@ -644,7 +653,7 @@ const events = [
         <header class="sec-head reveal">
           <span class="sec-no" aria-label="Section 3"><b>03</b><small>06</small></span>
           <h2>Everything it can do today</h2>
-          <p class="sec-sub">23 features in six groups. Coming later: TypeScript and Python SDKs, an MCP server and disk speed limits.</p>
+          <p class="sec-sub">29 features in six groups, 6 of them new. Coming later: TypeScript and Python SDKs, an MCP server and disk speed limits.</p>
         </header>
         {
           groups.map((g) => (
@@ -653,7 +662,7 @@ const events = [
                 <span>{g.name}</span>
               </h3>
               <div class="cards">
-                {g.items.map(([name, desc]) => {
+                {g.items.map(([name, desc, isNew]) => {
                   fid += 1;
                   return (
                     <article class="card reveal">
@@ -693,7 +702,10 @@ const events = [
                           </>
                         )}
                       </svg>
-                      <p class="fid">SB-{String(fid).padStart(2, "0")}</p>
+                      <p class="fid">
+                        SB-{String(fid).padStart(2, "0")}
+                        {isNew && <span class="new">New</span>}
+                      </p>
                       <h4>{name}</h4>
                       <p>{desc}</p>
                     </article>
@@ -946,14 +958,6 @@ const events = [
         </p>
       </section>
 
-      <footer class="title-block">
-        <div class="tb-cell tb-name"><span class="k">PROJECT</span><span class="v big">SPAWNBOX</span></div>
-        <div class="tb-cell"><span class="k">RUNTIME</span><span class="v">FIRECRACKER · gVISOR</span></div>
-        <div class="tb-cell"><span class="k">LICENSE</span><span class="v">APACHE-2.0</span></div>
-        <div class="tb-cell"><span class="k">SOURCE</span><a class="v" href={repo}>TulipFarm/spawnbox ↗</a></div>
-      </footer>
-    </div>
-
     <script>
       const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -1117,8 +1121,7 @@ const events = [
         step();
       }
     </script>
-  </body>
-</html>
+</Page>
 
 <style is:global>
 
@@ -1150,28 +1153,6 @@ const events = [
     to {
       visibility: hidden;
     }
-  }
-  h1 {
-    font-size: clamp(42px, 5.6vw, 70px);
-    line-height: 1.02;
-    margin: 0 0 22px;
-    font-weight: 700;
-    letter-spacing: -0.015em;
-  }
-  .hl {
-    display: block;
-    color: var(--blue);
-  }
-  .lede {
-    color: var(--muted);
-    font-size: 19px;
-    max-width: 52ch;
-    margin: 0 0 28px;
-  }
-  .cta {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
   }
   .typer {
     position: relative;
@@ -1294,19 +1275,6 @@ const events = [
     animation: blink 1s steps(2, start) infinite;
   }
 
-  .scene {
-    margin: 0;
-    border: 1px solid var(--line);
-    background: #fff;
-    padding: 14px;
-    min-width: 0;
-  }
-  .scene svg {
-    width: 100%;
-    height: auto;
-    display: block;
-    overflow: visible;
-  }
   .scene figcaption {
     font-size: 15px;
     color: var(--muted);
@@ -1324,22 +1292,6 @@ const events = [
     font-family: var(--mono);
     font-size: 11px;
     letter-spacing: 0.14em;
-  }
-  .lbl {
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    fill: var(--ink);
-    font-weight: 500;
-  }
-  .end {
-    text-anchor: end;
-  }
-  .mid {
-    text-anchor: middle;
-  }
-  .lbl.mut {
-    fill: var(--muted);
   }
   .code {
     font-family: var(--mono);
@@ -1360,29 +1312,6 @@ const events = [
       opacity: 1;
     }
   }
-  .leader {
-    fill: none;
-    stroke: var(--ink);
-    stroke-width: 0.8;
-  }
-  .wire-path {
-    fill: none;
-    stroke: var(--blue-2);
-    stroke-width: 1.2;
-    stroke-dasharray: 3 4;
-    animation: march 1s linear infinite;
-  }
-  @keyframes march {
-    to {
-      stroke-dashoffset: -14;
-    }
-  }
-  .packet {
-    fill: var(--blue);
-    stroke: #fff;
-    stroke-width: 1.5;
-  }
-
   .drop {
     animation: drop 0.8s cubic-bezier(0.2, 1.4, 0.4, 1) var(--d, 0s) both;
   }
@@ -1591,10 +1520,6 @@ const events = [
     color: var(--muted);
   }
 
-  section:not(.hero):not(.metrics) {
-    padding: 88px 0 16px;
-  }
-
   .scale-head {
     max-width: 760px;
     margin-bottom: 32px;
@@ -1611,50 +1536,6 @@ const events = [
     color: var(--muted);
     max-width: 110ch;
   }
-  .sec-head {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    column-gap: 18px;
-    align-items: baseline;
-    margin-bottom: 36px;
-  }
-  .sec-no {
-    font-family: var(--mono);
-    width: 46px;
-    height: 46px;
-    border: 1.5px solid var(--ink);
-    border-radius: 50%;
-    display: grid;
-    grid-template-rows: 1fr 1fr;
-    place-items: center;
-    background: linear-gradient(transparent calc(50% - 0.75px), var(--ink) 0 calc(50% + 0.75px), transparent 0);
-    align-self: center;
-  }
-  .sec-no b {
-    font-size: 13px;
-    color: var(--blue);
-    align-self: end;
-    padding-bottom: 1px;
-  }
-  .sec-no small {
-    font-size: 9px;
-    color: var(--muted);
-    align-self: start;
-    padding-top: 2px;
-  }
-  h2 {
-    margin: 0;
-    font-size: clamp(28px, 3.4vw, 38px);
-    font-weight: 700;
-    line-height: 1.1;
-  }
-  .sec-sub {
-    grid-column: 2;
-    margin: 8px 0 0;
-    color: var(--muted);
-    max-width: 70ch;
-  }
-
   .group {
     display: grid;
     grid-template-columns: 140px 1fr;
@@ -1717,6 +1598,12 @@ const events = [
     color: var(--blue);
     margin: 0 0 4px;
     letter-spacing: 0.08em;
+  }
+  .fid .new {
+    margin-left: 8px;
+    padding: 1px 6px;
+    border: 1px solid currentColor;
+    text-transform: uppercase;
   }
   h4 {
     margin: 0 0 6px;
@@ -2356,6 +2243,27 @@ const events = [
     font-size: 13px;
     color: var(--ink);
   }
+  .use-links {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin: 0;
+  }
+  .use-more {
+    display: inline-block;
+    margin-top: 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--blue);
+    text-underline-offset: 0.2em;
+  }
+  .use-more:hover {
+    color: var(--ink);
+  }
+  .sec-sub a {
+    color: var(--blue);
+    text-underline-offset: 0.15em;
+  }
   .win {
     border: 1px solid var(--ink);
     font-family: var(--mono);
@@ -2711,29 +2619,9 @@ const events = [
     .c4 {
       grid-column: span 3;
     }
-    .title-block {
-      grid-template-columns: 1fr 1fr;
-    }
-    .tb-name {
-      grid-column: 1 / -1;
-    }
-    .tb-cell {
-      border-top: 1px solid var(--line);
-    }
-    .tb-cell:nth-child(2n) {
-      border-left: 0;
-    }
   }
 
   @media (max-width: 640px) {
-    .sheet {
-      margin: 12px;
-      padding: 0 16px;
-      outline: 0;
-    }
-    nav a:not(.btn-line) {
-      display: none;
-    }
     .cards,
     .metrics {
       grid-template-columns: 1fr;
@@ -2749,16 +2637,6 @@ const events = [
       position: static;
       padding: 10px 0;
     }
-    .sec-head {
-      grid-template-columns: 1fr;
-      row-gap: 8px;
-    }
-    .sec-no {
-      justify-self: start;
-    }
-    .sec-sub {
-      grid-column: 1;
-    }
     tbody th {
       width: 140px;
     }
@@ -2766,9 +2644,6 @@ const events = [
     .c3,
     .c4 {
       grid-column: span 6;
-    }
-    .title-block {
-      margin: 64px -16px 0;
     }
   }
 </style>

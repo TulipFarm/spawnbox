@@ -1,0 +1,88 @@
+---
+// Hero drawing for a use case: the caller, the Spawnbox API (keys and site rules), and the sandbox on your server.
+import Box from "./Box.astro";
+import Logo from "./Logo.astro";
+import type { LogoName } from "../data/use-cases";
+
+interface Props {
+  actor: string;
+  inside: string;
+  logos: LogoName[];
+  planned?: boolean;
+}
+const { actor, inside, logos, planned = false } = Astro.props;
+
+const S = 24;
+const C = Math.cos(Math.PI / 6);
+const pt = (i: number, j: number, k: number) => [(i - j) * C * S, (i + j) * 0.5 * S - k * S];
+const xy = (i: number, j: number, k: number) => pt(i, j, k).map((n) => n.toFixed(1)).join(",");
+
+// Points on the line i = -j sit at the same height, so the request reads left to right.
+const route = `M${xy(0, 0, 3)} L${xy(3.3, -3.3, 1.6)} L${xy(5.6, -5.6, 1.2)}`;
+const back = `M${xy(5.6, -5.6, 1.2)} L${xy(3.3, -3.3, 1.6)} L${xy(0, 0, 3)}`;
+const [ax, ay] = pt(0, 0, 3.6);
+const [gx, gy] = pt(3.9, -2.7, 0.4);
+const [bx, by] = pt(5.2, -6.8, 2);
+const [lx, ly] = pt(6, -6, 2);
+const [sx, sy] = pt(2.5, -2, 0);
+const [tx, ty] = pt(7.4, -4.6, 0.4);
+---
+
+<svg viewBox="-70 -150 430 290" role="img" aria-label={`Drawing: ${actor.toLowerCase()} sends a request through Spawnbox to a sandbox on your server, and gets the result back`}>
+  <Box i={2} j={-7.8} w={5.8} d={5.8} h={0.4} s={S} tone="deep" />
+  <Box i={2.7} j={-3.9} w={1.2} d={1.2} h={1} k={0.4} s={S} tone="pale" />
+  <Box i={5.2} j={-6.8} w={1.6} d={1.6} h={1.6} k={0.4} s={S} />
+  {planned && <Box i={6.6} j={-4.6} w={0.8} d={0.8} h={0.8} k={0.4} s={S} tone="wire" />}
+  {logos.slice(0, 3).map((l, n, all) => <Logo name={l} size={14} x={lx - 7 + (n - (all.length - 1) / 2) * 17} y={ly - 7} />)}
+  <Box i={-0.6} j={-0.6} w={1.2} d={1.2} h={1.2} k={2.4} s={S} tone="pale" />
+
+  <path d={route} class="wire-path"></path>
+  <circle r="3.5" class="packet">
+    <animateMotion dur="2.4s" repeatCount="2" fill="freeze" path={route} />
+  </circle>
+  <circle r="3.5" class="packet ret">
+    <animateMotion dur="2.4s" begin="1.2s" repeatCount="1" fill="freeze" path={back} />
+  </circle>
+
+  <path d={`M${ax},${ay} V${ay - 22}`} class="leader"></path>
+  <text x={ax} y={ay - 28} class="lbl mid">{actor}</text>
+
+  <path d={`M${bx},${by} V-112`} class="leader"></path>
+  <text x={bx} y={-132} class="lbl mid">SANDBOX</text>
+  <text x={bx} y={-118} class="lbl mid mut">{inside}</text>
+
+  <path d={`M${gx},${gy} V96`} class="leader"></path>
+  <text x={gx} y={110} class="lbl mid">SPAWNBOX API</text>
+  <text x={gx} y={124} class="lbl mid mut">KEYS · SITE RULES</text>
+
+  <path d={`M${sx},${sy} l-22 32 h-8`} class="leader"></path>
+  <text x={sx - 34} y={sy + 36} class="lbl end">YOUR SERVER</text>
+
+  {
+    planned && (
+      <>
+        <path d={`M${tx},${ty} l20 30 h8`} class="leader"></path>
+        <text x={tx + 32} y={ty + 26} class="lbl">TEMPLATE</text>
+        <text x={tx + 32} y={ty + 40} class="lbl mut">COMING</text>
+      </>
+    )
+  }
+</svg>
+
+<style>
+  .wire-path {
+    animation-iteration-count: 4;
+  }
+  .ret {
+    fill: #fff;
+    stroke: var(--blue);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .packet {
+      display: none;
+    }
+    .wire-path {
+      animation: none;
+    }
+  }
+</style>

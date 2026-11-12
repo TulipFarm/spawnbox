@@ -1,0 +1,142 @@
+---
+import Box from "../components/Box.astro";
+import "../styles/base.css";
+
+interface Props {
+  title: string;
+  description: string;
+  current?: "use-cases";
+  /** Key of the card in lib/og.ts that becomes /og/<key>.png. */
+  og: string;
+  ogAlt: string;
+  /** Breadcrumb trail after Home, as [name, path]. */
+  crumbs?: [string, string][];
+  /** Extra schema.org nodes for this page. */
+  schema?: Record<string, unknown>[];
+  pageType?: "WebPage" | "CollectionPage";
+}
+const { title, description, current, og, ogAlt, crumbs = [], schema = [], pageType = "WebPage" } = Astro.props;
+const repo = "https://github.com/TulipFarm/spawnbox";
+const site = Astro.site!;
+const url = new URL(Astro.url.pathname, site).href;
+const image = new URL(`/og/${og}.png`, site).href;
+const home = new URL("/", site).href;
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": `${home}#website`,
+      url: home,
+      name: "Spawnbox",
+      description: "Open-source, self-hosted sandboxes for AI agents.",
+      inLanguage: "en",
+    },
+    {
+      "@type": pageType,
+      "@id": `${url}#webpage`,
+      url,
+      name: title,
+      description,
+      isPartOf: { "@id": `${home}#website` },
+      about: { "@id": `${home}#software` },
+      primaryImageOfPage: { "@type": "ImageObject", url: image, width: 1200, height: 630 },
+      ...(crumbs.length ? { breadcrumb: { "@id": `${url}#breadcrumb` } } : {}),
+      inLanguage: "en",
+    },
+    ...(crumbs.length
+      ? [
+          {
+            "@type": "BreadcrumbList",
+            "@id": `${url}#breadcrumb`,
+            itemListElement: [["Home", "/"] as [string, string], ...crumbs].map(([name, path], i) => ({
+              "@type": "ListItem",
+              position: i + 1,
+              name,
+              item: new URL(path, site).href,
+            })),
+          },
+        ]
+      : []),
+    ...schema,
+  ],
+};
+// Escape "<" so page text can never close the script tag.
+const jsonLdText = JSON.stringify(jsonLd).replace(/</g, "\\u003c");
+const links = [
+  ["/use-cases/", "Use cases", "use-cases"],
+  ["/#features", "Features", ""],
+  ["/#how", "How it works", ""],
+  ["/#compare", "Compare", ""],
+  ["/#install", "Install", ""],
+] as const;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={url} />
+    <link rel="sitemap" href="/sitemap.xml" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <meta name="theme-color" content="#fbfcfe" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Spawnbox" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:url" content={url} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={image} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={ogAlt} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={image} />
+    <meta name="twitter:image:alt" content={ogAlt} />
+    <script type="application/ld+json" set:html={jsonLdText} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="sheet">
+      <header class="topbar">
+        <a class="mark" href="/" aria-label="Spawnbox home">
+          <svg viewBox="-22 -26 44 48" width="30" height="30" aria-hidden="true">
+            <Box i={-0.5} j={-0.5} s={20} />
+          </svg>
+          <span>SPAWNBOX</span>
+        </a>
+        <nav>
+          {
+            links.map(([href, label, key]) => (
+              <a href={href} class={key ? "keep" : undefined} aria-current={key && key === current ? "page" : undefined}>
+                {label}
+              </a>
+            ))
+          }
+          <a class="btn-line" href={repo}>GitHub ↗</a>
+        </nav>
+      </header>
+
+      <slot />
+
+      <footer class="title-block">
+        <div class="tb-cell tb-name"><span class="k">PROJECT</span><span class="v big">SPAWNBOX</span></div>
+        <div class="tb-cell"><span class="k">RUNTIME</span><span class="v">FIRECRACKER · gVISOR</span></div>
+        <div class="tb-cell"><span class="k">LICENSE</span><span class="v">APACHE-2.0</span></div>
+        <div class="tb-cell"><span class="k">SOURCE</span><a class="v" href={repo}>TulipFarm/spawnbox ↗</a></div>
+      </footer>
+    </div>
+  </body>
+</html>
