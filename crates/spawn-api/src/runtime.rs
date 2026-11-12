@@ -1791,8 +1791,12 @@ impl Sandboxes {
                 protected,
             },
         );
+        // `fence_all` sets the flag before it lists records, so it either
+        // finds this one or the check below sees the flag.
         let finished = if self.closing.load(Ordering::SeqCst) {
             Err(Self::shutting_down())
+        } else if let Err(error) = self.check_fenced() {
+            Err(error)
         } else {
             match self
                 .db
@@ -2292,6 +2296,26 @@ impl Sandboxes {
                 )));
             }
         };
+        // As in `start_cold`: a fence that began during the restore either
+        // killed this VM's cgroup or is seen here.
+        if persistent && let Err(error) = self.check_fenced() {
+            restored.vm.stop().await;
+            self.node.remove_failed(&name, index).await;
+            self.release(index);
+            if let Some(mut record) = self.inner().records.remove(id) {
+                self.settle(id, &mut record, now_ms());
+            }
+            remove_dir(&dir);
+            self.db.set_cold(id, generation)?;
+            self.event(
+                "sandbox.fenced",
+                origin,
+                &tenant,
+                id,
+                json!({ "reason": "resume_fenced", "generation": generation }),
+            );
+            return Err(error);
+        }
         let expires_at = if persistent {
             i64::MAX
         } else {
@@ -2823,6 +2847,10 @@ impl Sandboxes {
     /// sandboxes fail.
     pub fn set_fenced(&self, fenced: bool) {
         self.fenced.store(fenced, Ordering::SeqCst);
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 
     /// Destroys this host's copy of persistent sandbox `id`: kills every

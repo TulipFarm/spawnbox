@@ -1021,20 +1021,24 @@ async fn start_on(
     .unwrap_or_else(|_| Err(Failure::Broken(anyhow::anyhow!("the start took too long"))));
     drop(busy);
     match sent {
-        Ok(_) => {
-            let now = now_ms();
-            if app
-                .db
-                .finish_cold_start(&id, Some(&node.id), generation, &claim, now)
-                .map_err(|e| fail(e.into()))?
-            {
+        // It runs there now. If its claim was lost meanwhile, it must not
+        // start here too: that copy is dropped as stale first.
+        Ok(_) => match app
+            .db
+            .finish_cold_start(&id, Some(&node.id), generation, &claim, now_ms())
+        {
+            Ok(true) => {
                 eprintln!(
                     "{id} started on node {} at generation {generation}",
                     node.id
                 );
+                Ok(())
             }
-            Ok(())
-        }
+            Ok(false) => Err(Failure::Broken(anyhow::anyhow!(
+                "the start of {id} was claimed again while it started"
+            ))),
+            Err(error) => Err(Failure::Broken(error.into())),
+        },
         Err(Failure::Unreachable(error)) => {
             if let Err(e) = app
                 .db
