@@ -1,0 +1,7 @@
+{
+  "name": "claude-code",
+  "setup": ["npm install -g --no-fund --no-audit @anthropic-ai/claude-code@2.1.322"],
+  "warmup": ["claude --version"],
+  "env": {"DISABLE_AUTOUPDATER": "1"},
+  "resources": {"vcpus": 2, "memory_mib": 4096, "disk_gib": 20}
+}

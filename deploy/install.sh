@@ -9,6 +9,10 @@
 #   deploy/install.sh --purge      also remove settings and data: the
 #                                  database, templates and secrets
 #
+# A first install also starts builds of the coding agent templates in
+# templates/ (Claude Code, Codex, Copilot CLI). Set
+# SPAWNBOX_AGENT_TEMPLATES=0 to skip them.
+#
 # Needs Ubuntu 22.04+ or Debian 12+ on x86_64, and root or sudo. With
 # /dev/kvm, sandboxes are Firecracker microVMs; without it, gVisor
 # containers. From source, run it as the user who owns the checkout: it
@@ -16,7 +20,8 @@
 #
 # Layout:
 #   /opt/spawnbox/                 spawn-api, the spawnbox CLI, Firecracker,
-#                                  gVisor, kernel, base disk, this script
+#                                  gVisor, kernel, base disk, template
+#                                  files, this script
 #   /usr/local/bin/spawnbox        link to the CLI
 #   /etc/spawnbox/spawnbox.env     server flags (SPAWNBOX_ARGS); kept on upgrade
 #   /var/lib/spawnbox/             database, templates, secrets key, logs
@@ -72,7 +77,7 @@ case "${1:-}" in
   "") ;;
   --uninstall) uninstall no; exit 0 ;;
   --purge) uninstall yes; exit 0 ;;
-  -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "unknown option $1 (see --help)" ;;
 esac
 
@@ -138,6 +143,11 @@ if [[ ! -e "$cli_link" || -L "$cli_link" ]]; then
 fi
 $sudo install -m 0644 "$artifacts/vmlinux" "$artifacts/rootfs.ext4" "$prefix/"
 $sudo install -m 0755 "$repo/deploy/install.sh" "$prefix/install.sh"
+$sudo rm -rf "$prefix/templates"
+if [[ -d "$repo/templates" ]]; then
+  $sudo install -d -m 0755 "$prefix/templates"
+  $sudo install -m 0644 "$repo"/templates/*.json "$prefix/templates/"
+fi
 # A release bundle names its tag; a source build has none.
 version=""
 if [[ -f "$repo/VERSION" ]]; then
@@ -224,6 +234,23 @@ for _ in $(seq 300); do
 done
 curl -fs "$url/healthz" >/dev/null || die "spawnbox did not answer on $url; see: journalctl -u spawnbox"
 
+agent_templates=no
+if [[ -n "$key" && "${SPAWNBOX_AGENT_TEMPLATES:-1}" != 0 && -d "$prefix/templates" ]]; then
+  # The server builds these in the background; sandboxes can start meanwhile.
+  say "starting the coding agent template builds"
+  for file in "$prefix"/templates/*.json; do
+    name="$(basename "$file" .json)"
+    if curl -fsS -o /dev/null -H "Authorization: Bearer $key" \
+      -H "Content-Type: application/json" --data-binary "@$file" "$url/v1/templates"; then
+      echo "$name: build started"
+      agent_templates=yes
+    else
+      echo "$name: could not start the build; try again with:"
+      echo "  spawnbox templates build $file"
+    fi
+  done
+fi
+
 say "Spawnbox ${version:-from source} is running at $url"
 if [[ -n "$key" ]]; then
   cat <<EOF
@@ -240,6 +267,16 @@ Log in to the CLI once (it asks for the key), then try it:
 
 Or with curl:
   curl -s -X POST $url/v1/sandboxes -H "Authorization: Bearer $key"
+EOF
+  if [[ "$agent_templates" == yes ]]; then
+    cat <<EOF
+
+The coding agent templates build in the background, in a few minutes.
+See their state with: spawnbox templates ls
+Then: spawnbox create --template claude-code
+EOF
+  fi
+  cat <<EOF
 
 !!! Back up $data/secrets.key now. Stored secrets cannot be read
 !!! without it.

@@ -1,0 +1,6 @@
+{
+  "name": "codex",
+  "setup": ["npm install -g --no-fund --no-audit @openai/codex@0.167.2"],
+  "warmup": ["codex --version"],
+  "resources": {"vcpus": 2, "memory_mib": 4096, "disk_gib": 20}
+}

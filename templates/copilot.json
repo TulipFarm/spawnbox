@@ -1,0 +1,6 @@
+{
+  "name": "copilot",
+  "setup": ["npm install -g --no-fund --no-audit @github/copilot@1.0.109"],
+  "warmup": ["copilot --version"],
+  "resources": {"vcpus": 2, "memory_mib": 4096, "disk_gib": 20}
+}
