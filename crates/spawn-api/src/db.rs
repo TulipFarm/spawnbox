@@ -221,6 +221,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sandboxes RENAME COLUMN saved TO saved_state;
     CREATE TABLE upkeep (task TEXT PRIMARY KEY);
     INSERT INTO upkeep (task) VALUES ('vacuum');",
+    "ALTER TABLE nodes ADD COLUMN fenced_at INTEGER;
+    ALTER TABLE nodes ADD COLUMN fenced_by TEXT;",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -452,6 +454,9 @@ const PG_MIGRATIONS: &[&str] = &[
     $$ LANGUAGE plpgsql;
     CREATE TRIGGER schema_version_floor BEFORE INSERT OR UPDATE ON schema_version
         FOR EACH ROW EXECUTE FUNCTION refuse_older_schema_version();"#,
+    r#"
+    ALTER TABLE nodes ADD COLUMN fenced_at BIGINT;
+    ALTER TABLE nodes ADD COLUMN fenced_by TEXT COLLATE "C";"#,
 ];
 
 pub mod state {
@@ -1180,18 +1185,24 @@ impl Db {
         stmt.query_map((), |r| r.get(0))?.collect()
     }
 
-    /// Claims a cold sandbox of this host to start it: it becomes
-    /// `starting` with the next generation, which is returned. `None` if it
-    /// is not cold.
-    pub fn claim_cold(&self, id: &str, claim: &str, deadline: i64) -> Result<Option<i64>> {
+    /// Claims a cold sandbox of this host to start it on `node`, or here
+    /// if `None`: it becomes `starting` with the next generation, which is
+    /// returned. `None` if it is not cold.
+    pub fn claim_cold(
+        &self,
+        id: &str,
+        node: Option<&str>,
+        claim: &str,
+        deadline: i64,
+    ) -> Result<Option<i64>> {
         self.conn()
             .query_row(
                 "UPDATE sandboxes
                  SET state = 'starting', generation = generation + 1, claim = ?2,
-                     claim_deadline = ?3
+                     claim_deadline = ?3, node = ?4
                  WHERE id = ?1 AND node IS NULL AND persistent = 1 AND state = 'cold'
                  RETURNING generation",
-                params![id, claim, deadline],
+                params![id, claim, deadline, node],
                 |r| r.get(0),
             )
             .optional()
@@ -1202,6 +1213,7 @@ impl Db {
     pub fn finish_cold_start(
         &self,
         id: &str,
+        node: Option<&str>,
         generation: i64,
         claim: &str,
         now: i64,
@@ -1212,21 +1224,56 @@ impl Db {
                  cold_starts = cold_starts + 1, last_cold_start_at = ?4, paused_at = NULL,
                  saved_state = NULL
              WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
-               AND node IS NULL",
-            params![id, generation, claim, now],
+               AND node IS NOT DISTINCT FROM ?5",
+            params![id, generation, claim, now, node],
         )?;
         Ok(changed > 0)
     }
 
-    /// Gives up a claim: the sandbox is cold again.
-    pub fn abandon_claim(&self, id: &str, generation: i64, claim: &str) -> Result<bool> {
+    /// Gives up a claim: the sandbox is cold again, and this host's.
+    pub fn abandon_claim(
+        &self,
+        id: &str,
+        node: Option<&str>,
+        generation: i64,
+        claim: &str,
+    ) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE sandboxes SET state = 'cold', claim = NULL, claim_deadline = NULL
+            "UPDATE sandboxes SET state = 'cold', claim = NULL, claim_deadline = NULL, node = NULL
              WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
-               AND node IS NULL",
-            params![id, generation, claim],
+               AND node IS NOT DISTINCT FROM ?4",
+            params![id, generation, claim, node],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Adds or replaces this host's copy of a persistent sandbox that the
+    /// primary starts here, as cold at `sandbox.generation`.
+    pub fn replace_persistent(&self, sandbox: &Sandbox, start: &StartRecord) -> Result<()> {
+        {
+            let conn = self.conn();
+            conn.execute("DELETE FROM sandboxes WHERE id = ?1", [&sandbox.id])?;
+            conn.execute(
+                "DELETE FROM start_records WHERE sandbox = ?1",
+                [&sandbox.id],
+            )?;
+        }
+        self.insert(sandbox, Some((start, None)))?
+            .map_err(|_| Error::Connection(format!("{}: a volume is taken", sandbox.id)))
+    }
+
+    /// Stops reporting this host's copy of a sandbox and drops its start
+    /// record: the primary runs a newer copy, or none.
+    pub fn drop_copy(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE sandboxes SET node = 'primary', saved_state = NULL
+             WHERE id = ?1 AND node IS NULL",
+            [id],
+        )?;
+        tx.execute("DELETE FROM start_records WHERE sandbox = ?1", [id])?;
+        tx.commit()
     }
 
     /// Makes a persistent sandbox of this host cold, unless it ended or a
@@ -2101,6 +2148,20 @@ fn retirement_from_row(row: &Row) -> Result<Retirement> {
     })
 }
 
+/// Whether a node's copy of a persistent sandbox, at `generation`, must be
+/// destroyed, given the primary's row: its node, state and generation.
+pub fn is_stale(row: Option<&(Option<String>, String, i64)>, node: &str, generation: i64) -> bool {
+    let Some((owner, state, current)) = row else {
+        return true;
+    };
+    if owner.as_deref() != Some(node) || matches!(state.as_str(), state::DELETED | state::FAILED) {
+        return true;
+    }
+    // A start here at a newer generation is under way; the old copy is
+    // what it replaces.
+    generation > *current || (generation < *current && state != state::STARTING)
+}
+
 pub mod node_state {
     pub const READY: &str = "ready";
     /// No heartbeat for a while: no new sandboxes go there.
@@ -2316,7 +2377,7 @@ impl Db {
     pub fn node_seen(&self, seen: &NodeRow) -> Result<bool> {
         let changed = self.conn().execute(
             "UPDATE nodes SET url = ?2, boot = ?3, seq = ?4, report = ?5, last_seen = ?6,
-                 state = 'ready'
+                 state = 'ready', fenced_at = NULL, fenced_by = NULL
              WHERE id = ?1 AND state != 'removed'",
             params![
                 seen.id,
@@ -2484,7 +2545,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.node FROM sandboxes s JOIN nodes n ON n.id = s.node
-             WHERE s.state IN ('starting', 'running', 'paused')
+             WHERE (s.state IN ('running', 'paused') OR (s.state = 'starting' AND s.persistent = 0))
                  AND n.kind = 'worker' AND n.state IN ('ready', 'suspect')
              ORDER BY s.id",
         )?;
@@ -2505,16 +2566,21 @@ impl Db {
     }
 
     /// Writes what `node` reports about one of its sandboxes. A row that
-    /// ended or that belongs to another host is never changed.
-    pub fn put_mirror(&self, node: &str, sandbox: &Sandbox, now: i64) -> Result<()> {
+    /// ended or that belongs to another host is never changed. A persistent
+    /// one changes only for its current generation, and never out of
+    /// `cold` or `starting`; reported cold, it is this host's again.
+    /// Returns whether the row changed.
+    pub fn put_mirror(&self, node: &str, sandbox: &Sandbox, now: i64) -> Result<bool> {
         let ended = matches!(sandbox.state.as_str(), state::FAILED | state::DELETED).then_some(now);
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
               idle_pause_s, tenant, node, vcpus, memory_mib, paused_at, ended_at, volumes,
-              generation)
+              generation, persistent)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18)
+                     ?18, ?19)
              ON CONFLICT (id) DO UPDATE SET
                  state = excluded.state, build = excluded.build, labels = excluded.labels,
                  generation = excluded.generation,
@@ -2523,9 +2589,13 @@ impl Db {
                  egress = excluded.egress, idle_pause_s = excluded.idle_pause_s,
                  vcpus = excluded.vcpus, memory_mib = excluded.memory_mib,
                  paused_at = excluded.paused_at,
-                 ended_at = COALESCE(excluded.ended_at, sandboxes.ended_at)
+                 ended_at = COALESCE(excluded.ended_at, sandboxes.ended_at),
+                 node = CASE WHEN excluded.state = 'cold' THEN NULL ELSE sandboxes.node END
              WHERE sandboxes.node = excluded.node
-               AND sandboxes.state NOT IN ('deleted', 'failed')",
+               AND sandboxes.state NOT IN ('deleted', 'failed')
+               AND (sandboxes.persistent = 0
+                    OR (sandboxes.state NOT IN ('cold', 'starting')
+                        AND sandboxes.generation = excluded.generation))",
             params![
                 sandbox.id,
                 sandbox.state,
@@ -2545,9 +2615,118 @@ impl Db {
                 ended,
                 volumes_json(&sandbox.volumes),
                 sandbox.generation,
+                sandbox.persistent,
             ],
         )?;
-        Ok(())
+        if changed > 0 && ended.is_some() && sandbox.persistent {
+            tx.execute(
+                "DELETE FROM start_records WHERE sandbox = ?1",
+                [&sandbox.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Of the persistent sandboxes `node` reports with their generations,
+    /// those whose copy there must be destroyed.
+    pub fn stale_copies(&self, node: &str, reported: &[(&str, i64)]) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT node, state, generation FROM sandboxes WHERE id = ?1 AND persistent = 1",
+        )?;
+        let mut out = Vec::new();
+        for (id, generation) in reported {
+            let row: Option<(Option<String>, String, i64)> = stmt
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .next()
+                .transpose()?;
+            if is_stale(row.as_ref(), node, *generation) {
+                out.push((*id).to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Makes cold the persistent sandboxes that `node` runs, is starting
+    /// or has paused: their copies there are known to be gone. Returns
+    /// their IDs and tenants.
+    pub fn cool_node(&self, node: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "UPDATE sandboxes
+             SET state = 'cold', node = NULL, claim = NULL, claim_deadline = NULL,
+                 paused_at = NULL, saved_state = NULL
+             WHERE node = ?1 AND persistent = 1 AND state IN ('starting', 'running', 'paused')
+             RETURNING id, tenant",
+        )?;
+        stmt.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    /// Makes cold the persistent sandboxes that `node`, which reports all
+    /// it runs, no longer has. Ones started there since `started_before`
+    /// may not be in its report yet.
+    pub fn cool_missing(
+        &self,
+        node: &str,
+        keep: &std::collections::HashSet<String>,
+        started_before: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let live: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, tenant FROM sandboxes
+                 WHERE node = ?1 AND persistent = 1 AND state IN ('running', 'paused')
+                   AND COALESCE(last_cold_start_at, created_at) < ?2",
+            )?;
+            stmt.query_map(params![node, started_before], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<_>>()?
+        };
+        let gone: Vec<_> = live
+            .into_iter()
+            .filter(|(id, _)| !keep.contains(id))
+            .collect();
+        for (id, _) in &gone {
+            tx.execute(
+                "UPDATE sandboxes SET state = 'cold', node = NULL, paused_at = NULL
+                 WHERE id = ?1 AND node = ?2",
+                params![id, node],
+            )?;
+        }
+        tx.commit()?;
+        Ok(gone)
+    }
+
+    /// Records that `node`, down or removed, is known to run nothing: by
+    /// `by`, an operator or the autoscaler. `false` if it is not down or
+    /// removed.
+    pub fn set_node_fenced(&self, node: &str, by: &str, now: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE nodes SET fenced_at = ?3, fenced_by = ?2
+             WHERE id = ?1 AND state IN ('down', 'removed')",
+            params![node, by, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Down or removed workers that still hold persistent sandboxes, and
+    /// who said each is fenced, if anyone did.
+    pub fn unfenced_nodes(&self) -> Result<Vec<(NodeRow, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_COLUMNS}, fenced_by FROM nodes n
+             WHERE n.state IN ('down', 'removed')
+               AND EXISTS (SELECT 1 FROM sandboxes s
+                           WHERE s.node = n.id AND s.persistent = 1
+                             AND s.state IN ('starting', 'running', 'paused'))
+             ORDER BY n.id"
+        ))?;
+        stmt.query_map((), |r| Ok((node_from_row(r)?, r.get(11)?)))?
+            .collect()
     }
 
     /// Moves `node`'s sandbox to `state`, unless it has ended.
@@ -2562,7 +2741,8 @@ impl Db {
     }
 
     /// Marks deleted `node`'s sandboxes that have not ended, except those
-    /// in `keep` and those created at or after `created_before`. Returns
+    /// in `keep`, persistent ones and those created at or after
+    /// `created_before`. Returns
     /// their IDs and tenants.
     pub fn end_mirrors(
         &self,
@@ -2576,7 +2756,8 @@ impl Db {
         let live: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, tenant FROM sandboxes
-                 WHERE node = ?1 AND state NOT IN ('deleted', 'failed') AND created_at < ?2",
+                 WHERE node = ?1 AND state NOT IN ('deleted', 'failed') AND created_at < ?2
+                   AND persistent = 0",
             )?;
             stmt.query_map(params![node, created_before], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -3370,23 +3551,23 @@ mod tests {
             .unwrap()
             .unwrap();
         // Only a cold, persistent sandbox can be claimed.
-        assert_eq!(db.claim_cold("a", "c1", 100).unwrap(), None);
+        assert_eq!(db.claim_cold("a", None, "c1", 100).unwrap(), None);
         assert!(db.set_cold("a", 1).unwrap());
         assert!(!db.set_cold("n", 1).unwrap());
         assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::COLD);
 
-        assert_eq!(db.claim_cold("a", "c1", 100).unwrap(), Some(2));
-        assert_eq!(db.claim_cold("a", "c2", 100).unwrap(), None);
+        assert_eq!(db.claim_cold("a", None, "c1", 100).unwrap(), Some(2));
+        assert_eq!(db.claim_cold("a", None, "c2", 100).unwrap(), None);
         // Updates for the older VM do nothing.
         db.set_state("a", 1, state::FAILED, 5).unwrap();
         assert!(!db.set_cold("a", 1).unwrap());
-        assert!(!db.finish_cold_start("a", 2, "c2", 5).unwrap());
-        assert!(db.abandon_claim("a", 2, "c1").unwrap());
+        assert!(!db.finish_cold_start("a", None, 2, "c2", 5).unwrap());
+        assert!(db.abandon_claim("a", None, 2, "c1").unwrap());
         assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::COLD);
 
-        assert_eq!(db.claim_cold("a", "c3", 100).unwrap(), Some(3));
-        assert!(db.finish_cold_start("a", 3, "c3", 50).unwrap());
-        assert!(!db.abandon_claim("a", 3, "c3").unwrap());
+        assert_eq!(db.claim_cold("a", None, "c3", 100).unwrap(), Some(3));
+        assert!(db.finish_cold_start("a", None, 3, "c3", 50).unwrap());
+        assert!(!db.abandon_claim("a", None, 3, "c3").unwrap());
         let a = db.get_sandbox("a").unwrap().unwrap();
         assert_eq!(
             (
@@ -3400,9 +3581,9 @@ mod tests {
 
         // A delete during a start wins over the start.
         assert!(db.set_cold("a", 3).unwrap());
-        assert_eq!(db.claim_cold("a", "c4", 100).unwrap(), Some(4));
+        assert_eq!(db.claim_cold("a", None, "c4", 100).unwrap(), Some(4));
         assert!(db.delete_cold("a", 60).unwrap());
-        assert!(!db.finish_cold_start("a", 4, "c4", 61).unwrap());
+        assert!(!db.finish_cold_start("a", None, 4, "c4", 61).unwrap());
         assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::DELETED);
         assert_eq!(db.get_start_record("a").unwrap(), None);
         assert!(!db.delete_cold("a", 62).unwrap());
@@ -3458,7 +3639,7 @@ mod tests {
         .unwrap();
         db.set_paused("p", 1, 7, "{}").unwrap();
         db.set_cold("b", 1).unwrap();
-        assert_eq!(db.claim_cold("b", "c", 100).unwrap(), Some(2));
+        assert_eq!(db.claim_cold("b", None, "c", 100).unwrap(), Some(2));
         db.insert_sandbox(&sandbox("n", state::RUNNING))
             .unwrap()
             .unwrap();
@@ -4285,6 +4466,185 @@ mod tests {
         );
         assert_eq!(db.mirror_usage("other").unwrap(), Usage::default());
         assert!(db.end_mirrors("nod_a", &keep, 10, 61).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persistent_mirrors_change_only_for_their_generation() {
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("sbx_p", state::COLD),
+            &start_record("sbx_p", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            db.claim_cold("sbx_p", Some("nod_a"), "c1", 100).unwrap(),
+            Some(2)
+        );
+        let row = db.get_sandbox("sbx_p").unwrap().unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.node.as_deref()),
+            (state::STARTING, Some("nod_a"))
+        );
+        let mut report = persistent("sbx_p", state::RUNNING);
+        report.generation = 2;
+        // A heartbeat never ends a start.
+        assert!(!db.put_mirror("nod_a", &report, 5).unwrap());
+        assert!(
+            db.finish_cold_start("sbx_p", Some("nod_a"), 2, "c1", 6)
+                .unwrap()
+        );
+        // Nor applies an older or newer copy.
+        for generation in [1, 3] {
+            let mut other = persistent("sbx_p", state::PAUSED);
+            other.generation = generation;
+            assert!(!db.put_mirror("nod_a", &other, 7).unwrap());
+        }
+        report.state = state::PAUSED.into();
+        assert!(db.put_mirror("nod_a", &report, 8).unwrap());
+        assert_eq!(
+            db.get_sandbox("sbx_p").unwrap().unwrap().state,
+            state::PAUSED
+        );
+        // Reported cold, the row is the primary's again, and stays cold.
+        report.state = state::COLD.into();
+        assert!(db.put_mirror("nod_a", &report, 9).unwrap());
+        report.state = state::RUNNING.into();
+        assert!(!db.put_mirror("nod_a", &report, 10).unwrap());
+        let row = db.get_sandbox("sbx_p").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+
+        // A start that failed leaves it cold and here.
+        assert_eq!(
+            db.claim_cold("sbx_p", Some("nod_b"), "c2", 100).unwrap(),
+            Some(3)
+        );
+        assert!(!db.abandon_claim("sbx_p", None, 3, "c2").unwrap());
+        assert!(db.abandon_claim("sbx_p", Some("nod_b"), 3, "c2").unwrap());
+        let row = db.get_sandbox("sbx_p").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+
+        // A delete on the worker ends the start record too.
+        db.claim_cold("sbx_p", Some("nod_b"), "c3", 100).unwrap();
+        db.finish_cold_start("sbx_p", Some("nod_b"), 4, "c3", 11)
+            .unwrap();
+        let mut deleted = persistent("sbx_p", state::DELETED);
+        deleted.generation = 4;
+        assert!(db.put_mirror("nod_b", &deleted, 12).unwrap());
+        assert_eq!(db.get_start_record("sbx_p").unwrap(), None);
+    }
+
+    #[test]
+    fn stale_copies_are_older_newer_or_elsewhere() {
+        let row = |node: Option<&str>, state: &str, generation| {
+            Some((node.map(str::to_owned), state.to_owned(), generation))
+        };
+        assert!(is_stale(None, "nod_a", 1));
+        assert!(!is_stale(
+            row(Some("nod_a"), state::RUNNING, 2).as_ref(),
+            "nod_a",
+            2
+        ));
+        assert!(is_stale(
+            row(Some("nod_a"), state::RUNNING, 2).as_ref(),
+            "nod_a",
+            1
+        ));
+        assert!(is_stale(
+            row(Some("nod_a"), state::RUNNING, 2).as_ref(),
+            "nod_a",
+            3
+        ));
+        assert!(is_stale(
+            row(Some("nod_b"), state::RUNNING, 2).as_ref(),
+            "nod_a",
+            2
+        ));
+        assert!(is_stale(row(None, state::COLD, 2).as_ref(), "nod_a", 2));
+        assert!(is_stale(
+            row(Some("nod_a"), state::DELETED, 2).as_ref(),
+            "nod_a",
+            2
+        ));
+        // The copy that a start here replaces.
+        assert!(!is_stale(
+            row(Some("nod_a"), state::STARTING, 3).as_ref(),
+            "nod_a",
+            2
+        ));
+
+        let db = Db::memory().unwrap();
+        db.insert_persistent(
+            &persistent("sbx_p", state::COLD),
+            &start_record("sbx_p", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        db.claim_cold("sbx_p", Some("nod_a"), "c", 100).unwrap();
+        db.finish_cold_start("sbx_p", Some("nod_a"), 2, "c", 5)
+            .unwrap();
+        let stale = db
+            .stale_copies("nod_a", &[("sbx_p", 2), ("sbx_q", 1)])
+            .unwrap();
+        assert_eq!(stale, ["sbx_q"]);
+        assert_eq!(
+            db.stale_copies("nod_b", &[("sbx_p", 2)]).unwrap(),
+            ["sbx_p"]
+        );
+    }
+
+    #[test]
+    fn lost_nodes_keep_persistent_sandboxes_until_fenced() {
+        let db = Db::memory().unwrap();
+        db.insert_join_token(b"t", 0, 100).unwrap();
+        db.join_node(b"t", &node("nod_a", 1)).unwrap();
+        for id in ["sbx_p", "sbx_q"] {
+            db.insert_persistent(&persistent(id, state::COLD), &start_record(id, "b1"), None)
+                .unwrap()
+                .unwrap();
+            db.claim_cold(id, Some("nod_a"), "c", 100).unwrap();
+            db.finish_cold_start(id, Some("nod_a"), 2, "c", 5).unwrap();
+        }
+        db.put_mirror("nod_a", &sandbox("sbx_t", state::RUNNING), 0)
+            .unwrap();
+        // Only the plain sandbox ends when it is no longer reported.
+        let none = std::collections::HashSet::new();
+        let gone = db.end_mirrors("nod_a", &none, 10, 60).unwrap();
+        assert_eq!(gone, [("sbx_t".to_owned(), "default".to_owned())]);
+        // A persistent one started since the report was made stays.
+        let keep = std::collections::HashSet::from(["sbx_q".to_owned()]);
+        assert!(db.cool_missing("nod_a", &keep, 5).unwrap().is_empty());
+        let cooled = db.cool_missing("nod_a", &keep, 6).unwrap();
+        assert_eq!(cooled, [("sbx_p".to_owned(), "default".to_owned())]);
+        let row = db.get_sandbox("sbx_p").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+
+        assert!(!db.set_node_fenced("nod_a", "operator", 20).unwrap());
+        assert!(db.unfenced_nodes().unwrap().is_empty());
+        db.set_node_state("nod_a", node_state::DOWN).unwrap();
+        let unfenced = db.unfenced_nodes().unwrap();
+        assert_eq!(unfenced.len(), 1);
+        assert_eq!(
+            (unfenced[0].0.id.as_str(), unfenced[0].1.as_deref()),
+            ("nod_a", None)
+        );
+        assert!(db.set_node_fenced("nod_a", "operator", 20).unwrap());
+        assert_eq!(
+            db.unfenced_nodes().unwrap()[0].1.as_deref(),
+            Some("operator")
+        );
+        // A heartbeat proves it is back, so the proof no longer holds.
+        db.node_seen(&node("nod_a", 21)).unwrap();
+        db.set_node_state("nod_a", node_state::DOWN).unwrap();
+        assert_eq!(db.unfenced_nodes().unwrap()[0].1, None);
+
+        let cooled = db.cool_node("nod_a").unwrap();
+        assert_eq!(cooled, [("sbx_q".to_owned(), "default".to_owned())]);
+        let row = db.get_sandbox("sbx_q").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.node), (state::COLD, None));
+        assert!(db.unfenced_nodes().unwrap().is_empty());
     }
 
     #[test]

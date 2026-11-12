@@ -1667,9 +1667,9 @@ impl Sandboxes {
         let ready = self.templates.root(&start.build)?;
         let claim = ids::base32(&ids::random::<10>().map_err(ApiError::internal)?);
         let claim_ms = i64::try_from(COLD_START_CLAIM.as_millis()).unwrap_or(i64::MAX);
-        let Some(generation) = self
-            .db
-            .claim_cold(id, &claim, now_ms().saturating_add(claim_ms))?
+        let Some(generation) =
+            self.db
+                .claim_cold(id, None, &claim, now_ms().saturating_add(claim_ms))?
         else {
             return Err(self.not_running(id));
         };
@@ -1696,7 +1696,7 @@ impl Sandboxes {
                     self.node.remove_failed(&ids::host_name(id), index).await;
                     self.release(index);
                 }
-                if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+                if let Err(error) = self.db.abandon_claim(id, None, generation, &claim) {
                     eprintln!("record {id} as cold: {error}");
                 }
                 return Err(match error.code {
@@ -1760,7 +1760,10 @@ impl Sandboxes {
         let finished = if self.closing.load(Ordering::SeqCst) {
             Err(Self::shutting_down())
         } else {
-            match self.db.finish_cold_start(id, generation, &claim, now_ms()) {
+            match self
+                .db
+                .finish_cold_start(id, None, generation, &claim, now_ms())
+            {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(ApiError::new(
                     Code::Conflict,
@@ -1783,7 +1786,7 @@ impl Sandboxes {
                 vm.stop().await;
                 self.release(index);
             }
-            if let Err(error) = self.db.abandon_claim(id, generation, &claim) {
+            if let Err(error) = self.db.abandon_claim(id, None, generation, &claim) {
                 eprintln!("record {id} as cold: {error}");
             }
             return Err(error);
