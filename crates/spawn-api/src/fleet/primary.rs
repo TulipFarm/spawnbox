@@ -592,7 +592,7 @@ async fn config(
     }
     let held = app
         .secrets
-        .shareable(&req.held, &p.pushed_to(&node.id), &refs)?;
+        .shareable(&req.held, &p.pushed_to(&node.id), &refs);
     let templates = names
         .into_iter()
         .map(|t| TemplateCopy {
@@ -607,6 +607,7 @@ async fn config(
         keys,
         templates,
         secrets: app.secrets.export(&held)?,
+        gone: app.secrets.gone(&req.held)?,
         session_key: app.sessions.key_hex(),
         edges: app.db.edge_ids()?,
     }))

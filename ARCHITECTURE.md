@@ -821,8 +821,13 @@ specs (each worker builds them itself), and the current values of the
 secrets that it holds. Before a create, the primary pushes the secrets
 that the sandbox attaches. A config sync returns values only for held
 secrets that the primary pushed to that worker, or that the worker's
-sandboxes or the templates' `registry_secrets` attach; it leaves out any
-other key that a worker names, and the worker then removes it.
+sandboxes or the templates' `registry_secrets` attach. A tenant's name
+counts for both its own and the org-wide secret, since a sandbox keeps the
+one it started with when the tenant later adds or removes its own. The
+sync leaves out any other key that a worker names, and that worker keeps
+its copy. A worker removes a secret only when the sync lists it as
+deleted on the primary, so a restart of the primary never takes a secret
+from a running sandbox.
 
 **Placing a sandbox.** The primary checks the tenant's quota against its
 own sandboxes, the worker sandboxes it knows, and creates in flight. Then

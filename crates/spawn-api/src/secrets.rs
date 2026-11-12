@@ -228,29 +228,37 @@ impl Secrets {
     }
 
     /// Fleet: of the storage keys in `held`, those a worker may get values
-    /// for: keys in `pushed`, and keys that `refs` (namespace and name of
-    /// each secret its sandboxes and templates attach) resolve to.
+    /// for: keys in `pushed`, and the keys that `refs` (namespace and name of
+    /// each secret its sandboxes and templates attach) may stand for. A
+    /// tenant's name may stand for the tenant's own secret or the org-wide
+    /// one, and a sandbox keeps the one it was started with even after the
+    /// tenant adds or removes its own, so both are allowed.
     pub fn shareable(
         &self,
         held: &[String],
         pushed: &HashSet<String>,
         refs: &[(Option<String>, String)],
-    ) -> Result<Vec<String>, ApiError> {
+    ) -> Vec<String> {
         let mut allowed = pushed.clone();
-        for (ns, name) in refs {
-            match self.resolve(ns.as_deref(), name) {
-                Ok(row) => {
-                    allowed.insert(row.name);
-                }
-                Err(error) if error.code == Code::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        for (ns, name) in refs.iter().filter(|(_, name)| is_secret_name(name)) {
+            allowed.insert(scoped(ns.as_deref(), name));
+            allowed.insert(name.clone());
         }
-        Ok(held
-            .iter()
+        held.iter()
             .filter(|key| allowed.contains(*key))
             .cloned()
-            .collect())
+            .collect()
+    }
+
+    /// Fleet: the keys in `held` that no longer exist here.
+    pub fn gone(&self, held: &[String]) -> Result<Vec<String>, ApiError> {
+        let mut gone = Vec::new();
+        for key in held {
+            if self.db.get_secret(key)?.is_none() {
+                gone.push(key.clone());
+            }
+        }
+        Ok(gone)
     }
 
     /// Fleet: the current values of the secrets with these storage keys.
@@ -278,10 +286,10 @@ impl Secrets {
         Ok(copies)
     }
 
-    /// Fleet workers: stores the primary's copies. With `held`, removes the
-    /// secrets in it that are not among the copies, as the primary has
-    /// deleted them.
-    pub fn import(&self, copies: &[SecretCopy], held: Option<&[String]>) -> Result<(), ApiError> {
+    /// Fleet workers: stores the primary's copies and removes the `gone`
+    /// keys, which the primary has deleted. Other keys stay, so a sandbox
+    /// never loses a secret because the primary left it out.
+    pub fn import(&self, copies: &[SecretCopy], gone: &[String]) -> Result<(), ApiError> {
         let _writing = self.writing();
         for copy in copies {
             let spec: SecretSpec = serde_json::from_str(&copy.spec).map_err(ApiError::internal)?;
@@ -300,7 +308,7 @@ impl Secrets {
             self.store
                 .set(spec.to_secret(&copy.key, copy.value.clone(), copy.version));
         }
-        for key in held.unwrap_or_default() {
+        for key in gone {
             if !copies.iter().any(|c| &c.key == key) && self.db.delete_secret(key)? {
                 self.store.remove(key);
             }
@@ -411,6 +419,28 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    fn memory() -> Secrets {
+        let db = Db::memory().unwrap();
+        Secrets::load(
+            db,
+            SecretBox::new(&[1; 32]).unwrap(),
+            SecretStore::default(),
+        )
+        .unwrap()
+    }
+
+    fn create(secrets: &Secrets, ns: Option<&str>, name: &str) {
+        secrets
+            .create(
+                ns,
+                input(&format!(
+                    r#"{{"name":"{name}","type":"http_header","value":"v","allowed_hosts":["a.com"]}}"#
+                )),
+                1,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn keeps_the_store_in_step_and_hides_values() {
         let db = Db::memory().unwrap();
@@ -481,23 +511,9 @@ mod tests {
 
     #[test]
     fn workers_get_only_the_secrets_they_use() {
-        let db = Db::memory().unwrap();
-        let secrets = Secrets::load(
-            db,
-            SecretBox::new(&[1; 32]).unwrap(),
-            SecretStore::default(),
-        )
-        .unwrap();
+        let secrets = memory();
         for (ns, name) in [(None, "org"), (Some("t1"), "own"), (Some("t2"), "other")] {
-            secrets
-                .create(
-                    ns,
-                    input(&format!(
-                        r#"{{"name":"{name}","type":"http_header","value":"v","allowed_hosts":["a.com"]}}"#
-                    )),
-                    1,
-                )
-                .unwrap();
+            create(&secrets, ns, name);
         }
         let held: Vec<String> = ["org", "t1/own", "t2/other", "t2/pushed"]
             .map(String::from)
@@ -509,15 +525,41 @@ mod tests {
             (Some("t1".to_owned()), "gone".to_owned()),
         ];
         assert_eq!(
-            secrets.shareable(&held, &pushed, &refs).unwrap(),
+            secrets.shareable(&held, &pushed, &refs),
             ["org", "t1/own", "t2/pushed"]
         );
-        assert!(
-            secrets
-                .shareable(&held, &HashSet::new(), &[])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(secrets.shareable(&held, &HashSet::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_worker_keeps_a_secret_a_tenant_later_shadows() {
+        // A t1 sandbox started on a worker with the org-wide `gh`.
+        let primary = memory();
+        let worker = memory();
+        create(&primary, None, "gh");
+        worker
+            .import(&primary.export(&["gh".to_owned()]).unwrap(), &[])
+            .unwrap();
+        // Then t1 adds its own `gh`, and the primary restarts, so it no
+        // longer remembers what it pushed.
+        create(&primary, Some("t1"), "gh");
+        let held = worker.keys().unwrap();
+        let refs = [(Some("t1".to_owned()), "gh".to_owned())];
+        let shared = primary.shareable(&held, &HashSet::new(), &refs);
+        assert_eq!(shared, ["gh"]);
+        worker
+            .import(
+                &primary.export(&shared).unwrap(),
+                &primary.gone(&held).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(worker.keys().unwrap(), ["gh"]);
+        // A key the primary leaves out stays; one it deleted goes.
+        worker.import(&[], &[]).unwrap();
+        assert_eq!(worker.keys().unwrap(), ["gh"]);
+        primary.delete(None, "gh").unwrap();
+        worker.import(&[], &primary.gone(&held).unwrap()).unwrap();
+        assert!(worker.keys().unwrap().is_empty());
     }
 
     #[test]
