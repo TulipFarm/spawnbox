@@ -677,10 +677,13 @@ Type `exit` to close the terminal.
 ### Open a terminal or a private preview in a browser
 
 Do not give your API key to a browser. Get a session token for one
-sandbox from your server, and give the token to the browser:
+sandbox from your server, and give the token to the browser. A token
+opens one thing: the terminal, or the `private` preview of one port.
 
 ```sh
-curl -s -H "$A" -d '{"ttl_s": 900}' $B/sandboxes/$S/session-tokens
+curl -s -H "$A" -d '{"ttl_s": 900, "audience": "terminal"}' $B/sandboxes/$S/session-tokens
+curl -s -H "$A" -d '{"ttl_s": 900, "audience": "preview", "port": 3000}' \
+  $B/sandboxes/$S/session-tokens
 ```
 
 - For the terminal, the browser opens
@@ -1778,20 +1781,28 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 - At the end, the server sends
   `{"type":"exit","exit_code","signal","duration_ms"}`.
 - If you close the WebSocket, Spawnbox stops the shell.
-- A browser can use a session token instead of an API key: add
-  `session_token=<token>` to the query.
+- A browser can use a session token with the `terminal` audience
+  instead of an API key: add `session_token=<token>` to the query.
 
 ### Browser session tokens
 
 - `POST /v1/sandboxes/{id}/session-tokens` makes a token for one
-  sandbox. Field: `ttl_s` (1 to 900, default 900). The response has
-  `token` and `expires_at`. The key must have `sandboxes:write`.
-- The token is a JWT (HS256). It opens only the terminal and the
-  `private` preview URLs of that sandbox. It does not work on other API
-  calls.
+  sandbox. Fields:
+  - `audience` (required): `terminal` or `preview`.
+  - `port`: the published port that a `preview` token opens. It is
+    required for `preview`, and not allowed for `terminal`.
+  - `ttl_s`: 1 to 900, default 900.
+- The response has `token` and `expires_at`. The key must have
+  `sandboxes:write`. A missing or bad `audience` or `port` gives
+  `400 invalid_request`.
+- The token is a JWT (HS256) with an `aud` claim. A `terminal` token
+  opens only the terminal of that sandbox. A `preview` token opens only
+  the `private` preview URL of that port. A token does not work on other
+  API calls.
 - The token stops at `expires_at`, or when the key that made it is
   revoked.
-- Each new token records a `sandbox.session_token_created` event.
+- Each new token records a `sandbox.session_token_created` event, with
+  its `audience`.
 - Spawnbox signs tokens with `<data-dir>/session.key`. The primary sends
   this key to the workers. If you delete the file, all tokens stop.
 
@@ -1889,7 +1900,7 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     `ttl_s` (default 24 hours). At the first visit, it becomes a cookie.
   - `public`: all persons with the URL can open it.
   - `private`: the request must have the API key in `Authorization`, or
-    a session token for the sandbox. Add the token to the URL as
+    a `preview` session token for the port. Add the token to the URL as
     `?spawnbox_session=<token>`. At the first visit, it becomes a cookie.
     Spawnbox removes this cookie before the request goes to the app.
 - For each `access`, Spawnbox removes these from a request before it goes

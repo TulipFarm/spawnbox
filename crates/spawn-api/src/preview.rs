@@ -112,7 +112,8 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
     match published.access {
         Access::Public => {}
         Access::Private => {
-            if let Some(response) = private_access(&app, &mut req, &id, session_cookie, https) {
+            if let Some(response) = private_access(&app, &mut req, &id, port, session_cookie, https)
+            {
                 return response;
             }
         }
@@ -169,21 +170,23 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
 }
 
 /// A private port takes an API key with `sandboxes:read`, or a browser
-/// session token for this sandbox: first as a `?spawnbox_session=` link,
+/// session token for this sandbox's port: first as a `?spawnbox_session=` link,
 /// which is traded for a cookie, then as that cookie. Returns the response
 /// to send instead of forwarding, if any.
 fn private_access(
     app: &App,
     req: &mut Request,
     id: &str,
+    port: u16,
     session_cookie: Option<String>,
     https: bool,
 ) -> Option<Response> {
     let now = now_ms();
+    let aud = session::preview(port);
     if let Some(query) = req.uri().query()
         && let (Some(given), rest) = ports::take_param(query, session::PREVIEW_PARAM)
     {
-        let (caller, claims) = match app.sessions.caller(&app.db, &given, id, now) {
+        let (caller, claims) = match app.sessions.caller(&app.db, &given, id, &aud, now) {
             Ok(Some(found)) => found,
             Ok(None) => {
                 return Some(plain(
@@ -207,7 +210,7 @@ fn private_access(
         Ok(None) => match &session_cookie {
             Some(token) => app
                 .sessions
-                .caller(&app.db, token, id, now)
+                .caller(&app.db, token, id, &aud, now)
                 .map(|found| found.map(|(caller, _)| caller)),
             None => Ok(None),
         },

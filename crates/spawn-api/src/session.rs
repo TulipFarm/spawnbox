@@ -1,5 +1,6 @@
 //! Browser session tokens: short-lived JWTs (HS256) that let a browser open
-//! one sandbox's terminal or private previews without holding an API key.
+//! one sandbox's terminal, or the private preview of one of its ports,
+//! without holding an API key. The `aud` claim says which.
 //!
 //! A token names its sandbox and the key that made it, so revoking the key
 //! ends its tokens too. Every host of a fleet checks tokens with the same
@@ -26,6 +27,13 @@ pub const PTY_PARAM: &str = "session_token";
 /// Query parameter of a private preview link, traded for the cookie.
 pub const PREVIEW_PARAM: &str = "spawnbox_session";
 pub const COOKIE: &str = "spawnbox_session";
+/// The audience of a token for the terminal.
+pub const TERMINAL: &str = "terminal";
+
+/// The audience of a token for the private preview on `port`.
+pub fn preview(port: u16) -> String {
+    format!("preview:{port}")
+}
 
 /// `{"alg":"HS256","typ":"JWT"}`. Tokens with any other header are refused,
 /// so the algorithm cannot be chosen by the token.
@@ -36,6 +44,8 @@ pub struct Claims {
     /// The sandbox.
     pub sub: String,
     pub tenant: String,
+    /// What the token opens: [`TERMINAL`] or [`preview`] of one port.
+    pub aud: String,
     /// The API key that made it.
     pub kid: String,
     pub iat: i64,
@@ -113,20 +123,21 @@ impl Sessions {
         serde_json::from_slice(&B64.decode(body).ok()?).ok()
     }
 
-    /// The caller behind a token for sandbox `id` (its key, if still
-    /// active) and the token's claims. `None` for a bad, expired or revoked
-    /// token, or one for another sandbox.
+    /// The caller behind a token for audience `aud` of sandbox `id` (its
+    /// key, if still active) and the token's claims. `None` for a bad,
+    /// expired or revoked token, or one for another sandbox or audience.
     pub fn caller(
         &self,
         db: &Db,
         token: &str,
         id: &str,
+        aud: &str,
         now_ms: i64,
     ) -> Result<Option<(Caller, Claims)>, ApiError> {
         let Some(claims) = self.verify(token, now_ms) else {
             return Ok(None);
         };
-        if claims.sub != id {
+        if claims.sub != id || claims.aud != aud {
             return Ok(None);
         }
         let Some(key) = db.active_key(&claims.kid)? else {
@@ -136,12 +147,21 @@ impl Sessions {
     }
 }
 
-/// New claims for `caller` on sandbox `id`, valid `ttl_s` from `now_ms`.
-pub fn claims(caller: &Caller, tenant: &str, id: &str, ttl_s: u64, now_ms: i64) -> Result<Claims> {
+/// New claims for `caller` on audience `aud` of sandbox `id`, valid `ttl_s`
+/// from `now_ms`.
+pub fn claims(
+    caller: &Caller,
+    tenant: &str,
+    id: &str,
+    aud: &str,
+    ttl_s: u64,
+    now_ms: i64,
+) -> Result<Claims> {
     let iat = now_ms / 1000;
     Ok(Claims {
         sub: id.to_owned(),
         tenant: tenant.to_owned(),
+        aud: aud.to_owned(),
         kid: caller.key.clone(),
         iat,
         exp: iat + i64::try_from(ttl_s)?,
@@ -163,6 +183,7 @@ mod tests {
         Claims {
             sub: "sbx_a".into(),
             tenant: "default".into(),
+            aud: TERMINAL.into(),
             kid: "key_a".into(),
             iat: 100,
             exp: 200,
@@ -202,5 +223,29 @@ mod tests {
             keyed(1).verify(&format!("{none}.{}.", parts[1]), 150_000),
             None
         );
+    }
+
+    #[test]
+    fn a_token_opens_only_its_audience() {
+        let db = Db::memory().unwrap();
+        let key = crate::ids::new_key(false).unwrap();
+        let stored = db.insert_key(&key, None, None, None, 1).unwrap();
+        let caller = Caller::from_key(&stored).unwrap();
+        let s = keyed(1);
+        let made = |aud: &str| {
+            let claims = claims(&caller, "default", "sbx_a", aud, 900, 1_000).unwrap();
+            s.issue(&claims).unwrap()
+        };
+        let opens =
+            |token: &str, aud: &str| s.caller(&db, token, "sbx_a", aud, 2_000).unwrap().is_some();
+
+        let terminal = made(TERMINAL);
+        assert!(opens(&terminal, TERMINAL));
+        assert!(!opens(&terminal, &preview(3000)));
+
+        let web = made(&preview(3000));
+        assert!(opens(&web, &preview(3000)));
+        assert!(!opens(&web, &preview(3001)));
+        assert!(!opens(&web, TERMINAL));
     }
 }

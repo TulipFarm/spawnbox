@@ -683,12 +683,12 @@ POST /v1/sandboxes/$S/exec
       {
         lane: "app",
         title: "You watch it live",
-        body: "Make a short-lived session token for this sandbox, and open the private viewer link with it. The token works for 15 minutes at most. It opens only this sandbox's terminal and private links, and no other API calls.",
+        body: "Make a short-lived session token for this sandbox, and open the private viewer link with it. The token works for 15 minutes at most. It opens only the viewer port of this sandbox, and no other API calls.",
         call: {
           lang: "http",
           code: `POST /v1/sandboxes/$S/session-tokens
 
-{"ttl_s": 900}`,
+{"ttl_s": 900, "audience": "preview", "port": 6080}`,
         },
         reply: { lang: "bash", label: "OPEN", code: `<viewer url>/vnc.html?spawnbox_session=<token>` },
         events: [["sandbox.session_token_created", ""]],
