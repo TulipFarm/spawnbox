@@ -6,6 +6,7 @@
 //! sees the tenant's own secrets and, read-only, the org-wide ones; `None`
 //! works on org-wide ones.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -224,6 +225,32 @@ impl Secrets {
             ));
         }
         Ok(row.name)
+    }
+
+    /// Fleet: of the storage keys in `held`, those a worker may get values
+    /// for: keys in `pushed`, and keys that `refs` (namespace and name of
+    /// each secret its sandboxes and templates attach) resolve to.
+    pub fn shareable(
+        &self,
+        held: &[String],
+        pushed: &HashSet<String>,
+        refs: &[(Option<String>, String)],
+    ) -> Result<Vec<String>, ApiError> {
+        let mut allowed = pushed.clone();
+        for (ns, name) in refs {
+            match self.resolve(ns.as_deref(), name) {
+                Ok(row) => {
+                    allowed.insert(row.name);
+                }
+                Err(error) if error.code == Code::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(held
+            .iter()
+            .filter(|key| allowed.contains(*key))
+            .cloned()
+            .collect())
     }
 
     /// Fleet: the current values of the secrets with these storage keys.
@@ -450,6 +477,47 @@ mod tests {
         secrets.delete(None, "gh").unwrap();
         assert!(store.get("gh").is_none());
         assert_eq!(secrets.get(None, "gh").unwrap_err().code, Code::NotFound);
+    }
+
+    #[test]
+    fn workers_get_only_the_secrets_they_use() {
+        let db = Db::memory().unwrap();
+        let secrets = Secrets::load(
+            db,
+            SecretBox::new(&[1; 32]).unwrap(),
+            SecretStore::default(),
+        )
+        .unwrap();
+        for (ns, name) in [(None, "org"), (Some("t1"), "own"), (Some("t2"), "other")] {
+            secrets
+                .create(
+                    ns,
+                    input(&format!(
+                        r#"{{"name":"{name}","type":"http_header","value":"v","allowed_hosts":["a.com"]}}"#
+                    )),
+                    1,
+                )
+                .unwrap();
+        }
+        let held: Vec<String> = ["org", "t1/own", "t2/other", "t2/pushed"]
+            .map(String::from)
+            .into();
+        let pushed = HashSet::from(["t2/pushed".to_owned()]);
+        let refs = [
+            (Some("t1".to_owned()), "own".to_owned()),
+            (Some("t1".to_owned()), "org".to_owned()),
+            (Some("t1".to_owned()), "gone".to_owned()),
+        ];
+        assert_eq!(
+            secrets.shareable(&held, &pushed, &refs).unwrap(),
+            ["org", "t1/own", "t2/pushed"]
+        );
+        assert!(
+            secrets
+                .shareable(&held, &HashSet::new(), &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

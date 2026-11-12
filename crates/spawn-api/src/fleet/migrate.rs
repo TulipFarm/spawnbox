@@ -769,6 +769,7 @@ async fn prepare(
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        p.note_pushed(&node.id, &keys);
         let push = SecretPush {
             secrets: app.secrets.export(&keys)?,
         };

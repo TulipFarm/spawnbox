@@ -37,3 +37,9 @@ These are in scope:
 
 Problems in Firecracker, gVisor, the Linux kernel or other dependencies
 go to those projects. Tell us too if Spawnbox makes the problem worse.
+
+## Deploy safely
+
+- Protect a worker as you protect the primary. A worker holds every API
+  key hash and the key that signs browser session tokens, so root on a
+  worker can make session tokens for any sandbox of the fleet.

@@ -815,7 +815,10 @@ config version. A worker with an old version asks the primary for the
 full set and applies it in one transaction: tenants, key hashes, template
 specs (each worker builds them itself), and the current values of the
 secrets that it holds. Before a create, the primary pushes the secrets
-that the sandbox attaches.
+that the sandbox attaches. A config sync returns values only for held
+secrets that the primary pushed to that worker, or that the worker's
+sandboxes or the templates' `registry_secrets` attach; it leaves out any
+other key that a worker names, and the worker then removes it.
 
 **Placing a sandbox.** The primary checks the tenant's quota against its
 own sandboxes, the worker sandboxes it knows, and creates in flight. Then
@@ -1086,6 +1089,7 @@ The installer adds `/opt/spawnbox` (binaries, kernel, base disk) and
 | Volume to sandbox | A sandbox gets only the volume files named in its create, looked up in its tenant; the host attaches them, the guest cannot ask for others |
 | API to the world | Hashed API keys with scopes; listens on localhost by default; optional TLS |
 | Primary to worker | Mutual TLS from the fleet CA; one-time join tokens; workers take calls only from the primary's certificate; removed nodes are refused at once |
+| Worker to fleet | A worker gets only the secret values that its sandboxes and template pulls use. It does get every API key hash, as it checks API keys itself, and the browser session key, as it makes and checks session tokens. Thus, someone with root on a worker can make session tokens for any sandbox in the fleet that an active key may open, for up to 15 minutes each. Treat a worker host as you treat the primary |
 
 The guest agent runs as root inside the VM and is **not trusted** by the
 host: the VM boundary is the security boundary. Spawnbox has not had an
