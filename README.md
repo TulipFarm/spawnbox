@@ -2718,6 +2718,59 @@ sudo target/release/spawn-api serve --data-dir /var/lib/spawnbox \
   --kernel $a/vmlinux --rootfs $a/rootfs.ext4
 ```
 
+### Soak and failover tests
+
+`scripts/soak.py` runs against an installed server or fleet for a long
+time and checks that nothing is lost, run twice or left behind. It uses
+only the Python standard library. It reaches the API with an org key, and
+each host with `ssh` as root, or as a user with `sudo` if you add
+`--sudo`. Name each host with `--host NAME=TARGET`. For `NAME`, use
+`primary`, `standby` or a worker's node ID from `spawnbox nodes ls`.
+
+```sh
+# 72 hours at about 30 live sandboxes, with a server killed every 6 hours.
+scripts/soak.py --api http://10.0.0.5:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5 --host nod_1=root@10.0.0.6 \
+  --ssh-opt=-i --ssh-opt="$HOME/.ssh/fleet" \
+  --density 30 --duration 72h --chaos-every 6h --summary soak.json
+
+# Kill a worker, cut a worker off from the primary, and kill the leader.
+scripts/soak.py --mode failover \
+  --api http://10.0.0.5:8080 --api http://10.0.0.7:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5 --host standby=root@10.0.0.7 \
+  --host nod_1=root@10.0.0.6 --primary-ip 10.0.0.5 \
+  --fence-after-s 60 --fence-margin-s 30 --summary failover.json
+
+# Show the plan and probe the API and hosts without changing anything.
+scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
+  --host primary=root@10.0.0.5
+```
+
+- The soak creates ephemeral and persistent sandboxes in the tenant
+  `soak` (`--tenant`). Each has a service and an env value, and each
+  persistent sandbox has a volume. It pauses, wakes, cold starts (it
+  kills the VM's `firecracker` process), kills services in the guest and
+  deletes sandboxes at random.
+- Every `--check-every` (default 5 minutes) it checks these points:
+  - Each persistent sandbox answers with its volume file, its env value
+    and, unless it was cold started, its disk file.
+  - No VM runs on two hosts, and each VM runs on the host that the API
+    names.
+  - No jail, network namespace or cgroup stays behind for a sandbox that
+    was deleted, is cold or moved.
+  - A killed service runs again.
+  - The memory and open files of `spawn-api` do not grow beyond
+    `--max-rss-growth-mib` and `--max-fd-growth`.
+- The failover mode checks that a worker that is cut off stops its VMs
+  before the primary makes them cold. It also checks that a stale copy
+  does not run again, and that each sandbox starts again with its data.
+- The script writes the summary (`--summary`) and exits with 1 if a check
+  fails. `scripts/soak.py --help` lists every option.
+
+> **CAUTION:** The failover mode kills servers and adds `iptables` rules
+> on the hosts. Use it only on a test fleet. Do not run the soak on a fleet
+> with real users.
+
 ### Repository layout
 
 | Path | Contents |
