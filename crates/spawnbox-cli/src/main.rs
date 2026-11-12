@@ -134,6 +134,9 @@ pub enum Command {
     /// Tenants (org key only)
     #[command(subcommand, alias = "tenant")]
     Tenants(TenantsCommand),
+    /// Fleet nodes: list, drain and undrain workers (org key only)
+    #[command(subcommand, alias = "node")]
+    Nodes(NodesCommand),
     /// API keys (org key only)
     #[command(subcommand, alias = "key")]
     Keys(KeysCommand),
@@ -384,6 +387,32 @@ pub enum VolumesCommand {
         name: String,
         #[arg(long)]
         tenant: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NodesCommand {
+    Ls,
+    Get {
+        id: String,
+    },
+    /// Stop placing sandboxes on a node and move its sandboxes and volumes
+    /// to other hosts
+    Drain {
+        id: String,
+        /// Only stop placing new sandboxes; move nothing
+        #[arg(long)]
+        no_move: bool,
+        /// Wait until the node holds no sandboxes and no volumes
+        #[arg(long)]
+        wait: bool,
+        /// With --wait, give up after this many seconds (exit code 1)
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Let a node take new sandboxes again
+    Undrain {
+        id: String,
     },
 }
 
