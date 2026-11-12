@@ -422,10 +422,17 @@ async fn serve(
         conn.deny("allowlist allows only ports 80 and 443");
         return Ok(());
     }
-    let (head, sniffed) = if web {
-        let wait = match mode {
-            Mode::AllowAll => SNIFF_TIMEOUT_OPEN,
-            _ => SNIFF_TIMEOUT,
+    // A name the policy checked must be the name connected to, or a client
+    // could send an allowed name to another server. With a deny list, every
+    // port needs a name, since an unnamed connection could reach a denied
+    // host.
+    let checked_name =
+        mode == Mode::Allowlist || !inner.policy.deny.is_empty() || registration.denies_any();
+    let (head, sniffed) = if web || checked_name {
+        let wait = if checked_name {
+            SNIFF_TIMEOUT
+        } else {
+            SNIFF_TIMEOUT_OPEN
         };
         read_head(&mut stream, wait).await
     } else {
@@ -460,10 +467,6 @@ async fn serve(
         };
         return intercept(inner, registration, stream, host, dst.port()).await;
     }
-    // A name the policy checked must be the name connected to, or a client
-    // could send an allowed name to another server.
-    let checked_name =
-        mode == Mode::Allowlist || !inner.policy.deny.is_empty() || registration.denies_any();
     let mut upstream = match (&host, checked_name) {
         (Some(host), true) => connect_name(host, dst.port(), inner.mark).await?,
         _ => connect(SocketAddr::V4(dst), inner.mark).await?,

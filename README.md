@@ -1912,6 +1912,15 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
   A pattern is a host name or `*.example.com`.
   - `allowlist` checks the TLS SNI or the HTTP `Host` name. It allows only
     ports 80 and 443.
+  - `deny` is checked by name too: the TLS SNI, the HTTP `Host` name or
+    the DNS query. Thus, when any policy has a `deny` list, `allow_all`
+    refuses a TCP connection without a name on any port, for example to a
+    bare address or TLS without SNI. It also drops UDP (except DNS) and
+    ICMP. Without a `deny` list, `allow_all` allows these.
+  - A name check sees only the name that the client sends in clear text.
+    A server that hosts many names, such as a CDN, can serve a denied
+    name behind an allowed one (domain fronting or TLS Encrypted Client
+    Hello). Use `allowlist` when that matters.
   - `deny_all` also blocks DNS.
 - Each DNS query from a sandbox goes to the DNS forwarder of Spawnbox,
   for all DNS server addresses. The forwarder sends the query to `--dns`

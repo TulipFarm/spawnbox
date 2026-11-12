@@ -28,14 +28,7 @@ const BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 impl Network {
     /// What the namespace of a VM with `policies` forwards.
     pub fn mode(&self, policies: &[Policy]) -> NetMode {
-        let mode = policies.iter().fold(self.policy.mode, |mode, policy| {
-            strictest(mode, policy.mode)
-        });
-        match mode {
-            Mode::AllowAll => NetMode::Open,
-            Mode::Allowlist => NetMode::Restricted,
-            Mode::DenyAll => NetMode::Closed,
-        }
+        net_mode(&self.policy, policies)
     }
 
     /// The send and receive limits, in megabits per second, of a VM with
@@ -74,7 +67,51 @@ impl Network {
     }
 }
 
+/// What the namespace of a VM with `policies` forwards, under the server's
+/// `server` policy. A deny list is checked by name, so `allow_all` with one
+/// forwards only TCP, which the proxy checks, and DNS: UDP and ICMP carry no
+/// name.
+fn net_mode(server: &Policy, policies: &[Policy]) -> NetMode {
+    let all = || std::iter::once(server).chain(policies);
+    let mode = all().fold(server.mode, |mode, policy| strictest(mode, policy.mode));
+    match mode {
+        Mode::AllowAll if all().any(|p| !p.deny.is_empty()) => NetMode::Restricted,
+        Mode::AllowAll => NetMode::Open,
+        Mode::Allowlist => NetMode::Restricted,
+        Mode::DenyAll => NetMode::Closed,
+    }
+}
+
 /// The address the proxy sees connections from slot `index` come from.
 fn source(index: u32) -> Option<Ipv4Addr> {
     link_addresses(index).map(|(_, ns)| ns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(json: &str) -> Policy {
+        let mut p: Policy = serde_json::from_str(json).unwrap();
+        p.check().unwrap();
+        p
+    }
+
+    #[test]
+    fn a_deny_list_forwards_only_tcp_and_dns() {
+        let open = Policy::allow_all();
+        let deny = policy(r#"{"mode":"allow_all","deny":["example.com"]}"#);
+        assert_eq!(net_mode(&open, &[]), NetMode::Open);
+        assert_eq!(net_mode(&open, std::slice::from_ref(&open)), NetMode::Open);
+        assert_eq!(
+            net_mode(&open, std::slice::from_ref(&deny)),
+            NetMode::Restricted
+        );
+        assert_eq!(
+            net_mode(&deny, std::slice::from_ref(&open)),
+            NetMode::Restricted
+        );
+        let closed = policy(r#"{"mode":"deny_all"}"#);
+        assert_eq!(net_mode(&deny, &[closed]), NetMode::Closed);
+    }
 }

@@ -626,7 +626,9 @@ flowchart LR
   by its source address, and decides.
 - **Policy.** The server, tenant and sandbox policies all apply; the
   strictest wins.
-  - `allow_all` allows any public address.
+  - `allow_all` allows any public address. With a `deny` list it needs a
+    name (TLS SNI or HTTP `Host`) on every TCP port, since `deny` is
+    checked by name, and the namespace forwards only TCP and DNS.
   - `allowlist` reads the TLS SNI or HTTP `Host` name and allows only
     listed names on ports 80 and 443.
   - `deny_all` blocks everything, including DNS.
