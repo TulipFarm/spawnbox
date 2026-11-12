@@ -162,6 +162,7 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
         );
     }
     let proto = if https { "https" } else { "http" };
+    scrub(&mut req, |token| app.sessions.signed(token));
     forward(opened.channel, opened.busy, port, req, &host, proto)
         .await
         .unwrap_or_else(|message| plain(StatusCode::BAD_GATEWAY, &message))
@@ -304,6 +305,50 @@ fn with_cookie(
     Some(response)
 }
 
+/// Removes Spawnbox credentials from a request for any port, so the app
+/// never sees them: the `spawnbox_session` link parameter, the
+/// `spawnbox_preview` cookie, and an `Authorization` header that holds an
+/// API key or a session token that `is_session` accepts. Other
+/// `Authorization` values belong to the app.
+fn scrub(req: &mut Request, is_session: impl Fn(&str) -> bool) {
+    take_cookie(req, COOKIE);
+    if let Some(query) = req.uri().query()
+        && let (Some(_), rest) = ports::take_param(query, session::PREVIEW_PARAM)
+    {
+        let path = req.uri().path();
+        let path = if rest.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}?{rest}")
+        };
+        if let Ok(path) = PathAndQuery::try_from(path) {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(path);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    let ours = |value: &HeaderValue| {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        crate::ids::bearer(text).is_some()
+            || text
+                .split_once(' ')
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .is_some_and(|(_, token)| is_session(token.trim()))
+    };
+    if req
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .any(ours)
+    {
+        req.headers_mut().remove(header::AUTHORIZATION);
+    }
+}
+
 /// Removes cookie `name`, so the app never sees it, and returns its value.
 fn take_cookie(req: &mut Request, name: &str) -> Option<String> {
     let mut found = None;
@@ -437,5 +482,40 @@ async fn pump(io: DuplexStream, input: mpsc::Sender<PortInput>, mut output: Stre
     tokio::select! {
         () = up => {}
         () = down => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(uri: &str, auth: Option<&str>) -> Request {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header(header::COOKIE, "spawnbox_preview=t; theme=dark");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn apps_never_see_spawnbox_credentials() {
+        let session = |token: &str| token == "eyJ.session.sig";
+        for auth in ["Bearer sbx_org_abc", "bearer eyJ.session.sig"] {
+            let mut req = request("/page?a=1&spawnbox_session=eyJ.session.sig&b=2", Some(auth));
+            scrub(&mut req, session);
+            assert_eq!(req.uri(), "/page?a=1&b=2");
+            assert_eq!(req.headers().get(header::AUTHORIZATION), None, "{auth}");
+            assert_eq!(req.headers()[header::COOKIE], "theme=dark");
+        }
+        let mut req = request("/?spawnbox_session=x", Some("Bearer app-own-jwt"));
+        scrub(&mut req, session);
+        assert_eq!(req.uri(), "/");
+        assert_eq!(req.headers()[header::AUTHORIZATION], "Bearer app-own-jwt");
+        let mut req = request("/x?q=1", Some("Basic dTpw"));
+        scrub(&mut req, session);
+        assert_eq!(req.uri(), "/x?q=1");
+        assert_eq!(req.headers()[header::AUTHORIZATION], "Basic dTpw");
     }
 }

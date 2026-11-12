@@ -1892,6 +1892,13 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
     a session token for the sandbox. Add the token to the URL as
     `?spawnbox_session=<token>`. At the first visit, it becomes a cookie.
     Spawnbox removes this cookie before the request goes to the app.
+- For each `access`, Spawnbox removes these from a request before it goes
+  to the app: the `spawnbox_session` and `spawnbox_preview` cookies, the
+  `spawnbox_session` query parameter, and an `Authorization` header with a
+  Spawnbox API key (`Bearer sbx_...`) or a session token that this
+  install made. On `public` and `token` ports, other `Authorization`
+  values go to the app, so an app can use its own logins. On `private`
+  ports, Spawnbox removes all `Authorization` values.
 - Spawnbox serves previews on `--preview-listen` at `--preview-url`. It
   finds the sandbox from the host name.
 - HTTP/1.1 and WebSockets are supported.

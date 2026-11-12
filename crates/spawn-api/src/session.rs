@@ -86,6 +86,17 @@ impl Sessions {
 
     /// The claims of a well-signed token that has not expired at `now_ms`.
     pub fn verify(&self, token: &str, now_ms: i64) -> Option<Claims> {
+        let claims = self.claims(token)?;
+        (now_ms < claims.exp.saturating_mul(1000)).then_some(claims)
+    }
+
+    /// Whether this host signed `token`, expired or not.
+    pub fn signed(&self, token: &str) -> bool {
+        self.claims(token).is_some()
+    }
+
+    /// The claims of a well-signed token.
+    fn claims(&self, token: &str) -> Option<Claims> {
         let key = self.key()?;
         let (signed, tag) = token.rsplit_once('.')?;
         let (header, body) = signed.split_once('.')?;
@@ -99,8 +110,7 @@ impl Sessions {
             &tag,
         )
         .ok()?;
-        let claims: Claims = serde_json::from_slice(&B64.decode(body).ok()?).ok()?;
-        (now_ms < claims.exp.saturating_mul(1000)).then_some(claims)
+        serde_json::from_slice(&B64.decode(body).ok()?).ok()
     }
 
     /// The caller behind a token for sandbox `id` (its key, if still
