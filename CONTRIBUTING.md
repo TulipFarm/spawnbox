@@ -19,6 +19,21 @@ The guest agent ships as a static musl binary. If you change it, also run:
 cargo clippy -p spawn-guest --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
 ```
 
+If you change the database, `deploy/backup.sh` or `spawn-api check-data`,
+also run the `spawn-api` tests on Linux against Postgres, with a backup and
+restore round trip, as the CI `postgres` job does. They need
+`postgresql-client` of the server's major version or newer, `gnupg` and
+`sqlite3`:
+
+```sh
+cargo build -p spawn-api --locked
+SPAWNBOX_TEST_DATABASE_URL=postgres://postgres:password@localhost:5432/postgres \
+SPAWNBOX_TEST_BACKUP=1 SPAWNBOX_TEST_API_BIN="$PWD/target/debug/spawn-api" \
+  cargo test -p spawn-api --locked
+```
+
+Each test uses its own schema, and the round trip its own database.
+
 `spawn-api`, `spawn-node` and the `spawn-egress` proxy only build their VM
 and network code on Linux, so lint them on Linux too. If you change them,
 run `scripts/m1-smoke.sh` on a KVM host with internet access (its egress
