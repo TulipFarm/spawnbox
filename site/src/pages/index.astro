@@ -105,6 +105,7 @@ const groups: { name: string; shape: string; items: [string, string, boolean?][]
       ["Spare sandboxes", "Keep spares ready and waiting. A new sandbox starts in about 8 ms. The number of spares grows and shrinks with use."],
       ["Build store", "Store templates in S3-compatible storage. Build each one only once. A sandbox can start before the whole template has downloaded."],
       ["Volumes", "Keep files after a sandbox ends. Share one read-only folder with many sandboxes."],
+      ["Coding agent templates", "Claude Code, Codex and Copilot CLI templates come with Spawnbox. A new install builds them for you, so each agent sandbox starts in about 0.1 s.", true],
     ],
   },
   {
@@ -152,6 +153,8 @@ const groups: { name: string; shape: string; items: [string, string, boolean?][]
   },
 ];
 let fid = 0;
+const features = groups.flatMap((g) => g.items);
+const newCount = features.filter(([, , isNew]) => isNew).length;
 
 const site = Astro.site!.href;
 const software = [
@@ -653,7 +656,7 @@ const events = [
         <header class="sec-head reveal">
           <span class="sec-no" aria-label="Section 3"><b>03</b><small>06</small></span>
           <h2>Everything it can do today</h2>
-          <p class="sec-sub">29 features in six groups, 6 of them new. Coming later: TypeScript and Python SDKs, an MCP server and disk speed limits.</p>
+          <p class="sec-sub">{features.length} features in six groups, {newCount} of them new. Coming later: TypeScript and Python SDKs, an MCP server and disk speed limits.</p>
         </header>
         {
           groups.map((g) => (
