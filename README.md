@@ -2822,6 +2822,7 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
 | `deploy/prometheus/` | Prometheus alert rules and what to do for each alert |
 | `.github/workflows/release.yml` | Builds the release bundle for each `v*` tag |
 | `scripts/` | Build scripts and end-to-end tests |
+| `docs/design/` | Design proposals. They describe planned work, not what Spawnbox does today. |
 
 ## Contributing
 
