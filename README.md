@@ -2799,6 +2799,43 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
 - `python3 scripts/soak_test.py` tests the script's own logic against a
   stubbed API, without a server. `scripts/soak.py --help` lists every option.
 
+### Wake benchmark
+
+`scripts/wake_bench.py` times how fast a small web app in a sandbox
+answers its first request. It uses only the Python standard library and a
+tenant key. It builds a template with a tiny Node HTTP server, then sends
+requests through the preview listener, as a browser would.
+
+```sh
+# Cold and resumed starts, 30 samples each after 3 warm-up runs.
+scripts/wake_bench.py --api http://10.0.0.5:8080 --preview-addr 10.0.0.5:8081 \
+  --key "$KEY" --phases cold --samples 30 --summary cold.json
+
+# On the host: fill it with idle sandboxes, then wake them all at once.
+scripts/wake_bench.py --api http://10.0.0.5:8080 --preview-addr 10.0.0.5:8081 \
+  --key "$KEY" --phases density,wake --mem-stop-pct 80 \
+  --data-dir /var/lib/spawnbox --summary wake.json
+```
+
+- The phases are `cold`, `resume` (run with `cold`), `burst`, `density`
+  and `wake`. `scripts/wake_bench.py --help` lists every option.
+- `cold` creates a sandbox with the app as a service and times it to the
+  first 200. `resume` pauses that sandbox and times the request that
+  resumes it. The two alternate, so drift touches both.
+- `burst` creates `--burst` sandboxes at once. `wake` pauses every
+  `density` sandbox and wakes them all at once.
+- `density` stops before host memory would pass `--mem-stop-pct`, when
+  the server refuses a sandbox, or at `--density-max`. It reads host
+  memory and `firecracker` memory from `/proc`, so run it on the host.
+- Without `--health`, the server sends requests to the app as soon as it
+  starts, so the script asks again every `--poll-ms` until the app
+  answers. Many quick retries load a busy host, so a small `--poll-ms`
+  slows a `burst`. With `--health`, the server holds each request until
+  the app passes its check.
+- The script deletes every sandbox it made, checks the listing, and exits
+  with 1 if one is still there. `python3 scripts/wake_bench_test.py`
+  tests its own logic.
+
 > **CAUTION:** The failover mode kills servers and adds `iptables` rules
 > on the hosts. Use it only on a test fleet. Do not run the soak on a fleet
 > with real users.
