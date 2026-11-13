@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use spawn_node::firecracker::{Host, Limits};
+use spawn_node::firecracker::{Host, IoEngine, Limits};
 use spawn_node::net::{self, HostNet, NetMode};
 use spawn_node::{
     Build, Node, Recipe, Restored, Slot, TEMPLATE_INDEX, Vm, absolute, guest, new_identity,
@@ -76,6 +76,7 @@ pub async fn run(args: Args) -> Result<()> {
         logs: work.join("logs"),
         ksm: false,
         pins: None,
+        io_engine: IoEngine::Sync,
     };
     net::remove_stale_namespaces().await?;
     host.remove_all().await;

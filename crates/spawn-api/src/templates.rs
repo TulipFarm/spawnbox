@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use spawn_egress::Attached;
-use spawn_node::firecracker::Limits;
+use spawn_node::firecracker::{IoEngine, Limits};
 use spawn_node::{Backend, Build, HOT_FILE, Log, Node, Recipe, Slot};
 use tokio::sync::{Notify, Semaphore};
 
@@ -392,6 +392,11 @@ impl Templates {
             };
             let mut extra = BUILD_FORMAT.to_vec();
             extra.extend_from_slice(network.ca_pem.as_bytes());
+            // Snapshots keep their drives' IO engine. Sync adds nothing, so
+            // builds made before the setting existed stay current.
+            if node.backend() == Backend::Firecracker && node.host.io_engine == IoEngine::Async {
+                extra.extend_from_slice(b"\0io-engine-async");
+            }
             tokio::task::spawn_blocking(move || fingerprint(&files, &extra)).await??
         };
         let this = Arc::new(Self {
@@ -2310,6 +2315,7 @@ mod tests {
                 logs: dir.join("logs"),
                 ksm: false,
                 pins: None,
+                io_engine: IoEngine::Sync,
             },
             runsc: None,
             dns: std::net::Ipv4Addr::LOCALHOST,
