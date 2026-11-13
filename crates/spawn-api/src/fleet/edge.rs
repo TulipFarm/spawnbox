@@ -310,7 +310,11 @@ async fn forward(State(edge): State<EdgeState>, req: Request) -> Response {
         .get(gateway::TARGET)
         .and_then(|v| v.to_str().ok())
         .and_then(|text| gateway::Target::parse(text).ok())
-        .map(|gateway::Target::Port { sandbox, .. }| sandbox);
+        .and_then(|target| match target {
+            gateway::Target::Port { sandbox, .. } => Some(sandbox),
+            // Only the primary has endpoints.
+            gateway::Target::Endpoint { .. } => None,
+        });
     let (req, again) = match gateway::replayable(req).await {
         Ok(split) => split,
         Err(error) => return gateway::refusal(error),

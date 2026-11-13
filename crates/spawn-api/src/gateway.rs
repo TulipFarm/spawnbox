@@ -7,6 +7,9 @@
 //! per-sandbox in-flight limit, and forwards the request to the port
 //! through the same vsock tunnel as previews. Every `X-Spawnbox-*` header
 //! is removed before the app sees the request, and replaced on the way back.
+//!
+//! It also keeps the drains of this host's sandboxes, and answers whether a
+//! port is ready for traffic.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -17,15 +20,17 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db::{Db, state};
 use crate::events::Origin;
 use crate::fleet::Role;
-use crate::model::{ApiError, Code};
-use crate::runtime::Published;
+use crate::model::{ApiError, Code, DrainView, rfc3339_ms};
+use crate::runtime::{Published, now_ms};
 use crate::server::{App, AppState};
-use crate::tenancy::{Caller, Scope};
+use crate::tenancy::{Caller, DEFAULT_TENANT, Scope};
 use crate::{ids, metrics};
 
 pub const KEY: &str = "x-spawnbox-key";
@@ -38,6 +43,7 @@ pub const EXPECT_GENERATION: &str = "x-spawnbox-expect-generation";
 pub const ERROR: &str = "x-spawnbox-error";
 pub const SANDBOX: &str = "x-spawnbox-sandbox";
 pub const GENERATION: &str = "x-spawnbox-generation";
+pub const ENDPOINT_GENERATION: &str = "x-spawnbox-endpoint-generation";
 const PREFIX: &str = "x-spawnbox-";
 
 /// A revoked key stops working within this time.
@@ -49,6 +55,9 @@ const DEFAULT_RESPONSE: Duration = Duration::from_secs(60);
 /// Largest request body kept to send a request a second time after
 /// `stale_route`.
 const REPLAY_BODY: usize = 1 << 20;
+/// How long a forwarded request waits for a port to be ready after a wake.
+const READY_AFTER_WAKE: Duration = Duration::from_secs(30);
+const READY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -76,12 +85,27 @@ impl Default for Settings {
 /// What `X-Spawnbox-Target` names.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
-    Port { sandbox: String, port: u16 },
+    Port {
+        sandbox: String,
+        port: u16,
+    },
+    /// The current target of an endpoint of the key's tenant.
+    Endpoint {
+        name: String,
+    },
 }
 
 impl Target {
     pub fn parse(text: &str) -> Result<Self, ApiError> {
-        let bad = || ApiError::invalid("X-Spawnbox-Target must be sbx_ID:PORT");
+        let bad = || ApiError::invalid("X-Spawnbox-Target must be sbx_ID:PORT or endpoint:NAME");
+        if let Some(name) = text.strip_prefix("endpoint:") {
+            if !crate::endpoints::valid_name(name) {
+                return Err(bad());
+            }
+            return Ok(Self::Endpoint {
+                name: name.to_owned(),
+            });
+        }
         let (sandbox, port) = text.rsplit_once(':').ok_or_else(bad)?;
         let port = port
             .parse::<u16>()
@@ -173,12 +197,62 @@ pub fn strip(headers: &mut HeaderMap) {
     }
 }
 
-/// Wake slots, in-flight counts and verified keys of one host.
+/// Wake slots, in-flight counts, drains and verified keys of one host.
 pub struct Gateway {
     pub settings: Settings,
     wakes: Arc<Semaphore>,
     in_flight: Arc<Mutex<HashMap<String, u32>>>,
     keys: Mutex<HashMap<Vec<u8>, (Instant, Caller)>>,
+    drains: Mutex<HashMap<String, Drain>>,
+    drain_serial: std::sync::atomic::AtomicU64,
+}
+
+/// What a drain does once no request is in flight or its time is up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Then {
+    #[default]
+    None,
+    Pause,
+    Delete,
+}
+
+impl Then {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pause => "pause",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// A drain of one sandbox on this host. It stays until `:undrain` or the
+/// sandbox is deleted, so a drained sandbox takes no traffic after `then`.
+#[derive(Clone, Copy, Debug)]
+struct Drain {
+    serial: u64,
+    started_at: i64,
+    deadline: i64,
+    then: Then,
+}
+
+/// `POST /v1/sandboxes/{id}:drain`
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainRequest {
+    pub timeout_s: Option<u64>,
+    #[serde(default)]
+    pub then: Then,
+}
+
+impl DrainRequest {
+    pub fn timeout(&self) -> Result<Duration, ApiError> {
+        match self.timeout_s.unwrap_or(30) {
+            s @ 1..=3600 => Ok(Duration::from_secs(s)),
+            _ => Err(ApiError::invalid("timeout_s must be 1 to 3600")),
+        }
+    }
 }
 
 /// One forwarded request or upgraded connection in a sandbox.
@@ -207,7 +281,97 @@ impl Gateway {
             wakes: Arc::new(Semaphore::new(settings.max_wakes)),
             in_flight: Arc::default(),
             keys: Mutex::default(),
+            drains: Mutex::default(),
+            drain_serial: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Forwarded and preview requests and upgraded connections in sandbox
+    /// `id` now.
+    pub fn in_flight(&self, id: &str) -> u32 {
+        let counts = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        counts.get(id).copied().unwrap_or(0)
+    }
+
+    pub fn draining(&self, id: &str) -> bool {
+        self.drains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+    }
+
+    /// Refuses new traffic for sandbox `id` from now. Returns the drain's
+    /// serial, which the task that finishes it checks.
+    fn begin_drain(
+        &self,
+        id: &str,
+        timeout: Duration,
+        then: Then,
+        now: i64,
+    ) -> Result<u64, ApiError> {
+        let mut drains = self.drains.lock().unwrap_or_else(|e| e.into_inner());
+        if drains.contains_key(id) {
+            return Err(ApiError::new(
+                Code::Conflict,
+                "the sandbox is already draining; call :undrain first",
+            ));
+        }
+        let serial = 1 + self
+            .drain_serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timeout_ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
+        drains.insert(
+            id.to_owned(),
+            Drain {
+                serial,
+                started_at: now,
+                deadline: now.saturating_add(timeout_ms),
+                then,
+            },
+        );
+        Ok(serial)
+    }
+
+    /// Ends the drain of `id`. Returns whether there was one.
+    pub fn undrain(&self, id: &str) -> bool {
+        self.drains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+            .is_some()
+    }
+
+    fn drain_is(&self, id: &str, serial: u64) -> bool {
+        self.drains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .is_some_and(|drain| drain.serial == serial)
+    }
+
+    pub fn drain_view(&self, id: &str) -> Option<DrainView> {
+        let drain = *self
+            .drains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)?;
+        Some(DrainView {
+            started_at: rfc3339_ms(drain.started_at),
+            deadline: rfc3339_ms(drain.deadline),
+            in_flight: self.in_flight(id),
+            then: drain.then.as_str(),
+        })
+    }
+
+    /// Counts a request in sandbox `id`, unless it is draining.
+    pub fn admit(&self, id: &str) -> Result<InFlight, ApiError> {
+        if self.draining(id) {
+            return Err(ApiError::new(
+                Code::Draining,
+                "the sandbox is draining and takes no new requests",
+            ));
+        }
+        self.enter(id)
     }
 
     /// The caller behind `X-Spawnbox-Key`, which must hold
@@ -328,8 +492,7 @@ pub fn refusal(error: ApiError) -> Response {
 /// What the gateway asked for.
 struct Ask {
     caller: Caller,
-    sandbox: String,
-    port: u16,
+    target: Target,
     wake: Wake,
     timeout: Duration,
     expect: Option<i64>,
@@ -350,7 +513,7 @@ impl Ask {
         };
         let target =
             text(TARGET)?.ok_or_else(|| ApiError::invalid("X-Spawnbox-Target is required"))?;
-        let Target::Port { sandbox, port } = Target::parse(target)?;
+        let target = Target::parse(target)?;
         let expect = text(EXPECT_GENERATION)?
             .map(|n| {
                 n.parse::<i64>()
@@ -359,8 +522,7 @@ impl Ask {
             .transpose()?;
         Ok(Self {
             caller,
-            sandbox,
-            port,
+            target,
             wake: Wake::parse(text(WAKE)?)?,
             timeout: response_timeout(text(TIMEOUT_MS)?, app.gateway.settings.max_response)?,
             expect,
@@ -371,18 +533,55 @@ impl Ask {
 async fn serve(app: &App, req: Request) -> Result<Response, ApiError> {
     let ask = Ask::read(app, req.headers())?;
     let (req, again) = replayable(req).await?;
-    let first = route(app, &ask, req).await?;
+    let first = resolve(app, &ask, req).await;
+    // An endpoint may have switched away from a draining target since it
+    // was read; no byte reached the app, so the request is sent again.
+    let retry = is_stale(&first)
+        || (matches!(ask.target, Target::Endpoint { .. }) && is_code(&first, Code::Draining));
     match again {
-        Some(again) if is_stale(&first) => route(app, &ask, again).await,
+        Some(again) if retry => Ok(resolve(app, &ask, again).await),
         _ => Ok(first),
     }
 }
 
+/// Finds the sandbox port the request is for, and sends it there.
+async fn resolve(app: &App, ask: &Ask, req: Request) -> Response {
+    match &ask.target {
+        Target::Port { sandbox, port } => route(app, ask, sandbox, *port, req)
+            .await
+            .unwrap_or_else(refusal),
+        Target::Endpoint { name } => {
+            let tenant = ask.caller.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
+            let endpoint = match app.db.get_endpoint(tenant, name) {
+                Ok(Some(endpoint)) => endpoint,
+                Ok(None) => {
+                    return refusal(ApiError::new(
+                        Code::NotFound,
+                        format!("no endpoint {name:?}"),
+                    ));
+                }
+                Err(error) => return refusal(error.into()),
+            };
+            let mut response = route(app, ask, &endpoint.sandbox, endpoint.port, req)
+                .await
+                .unwrap_or_else(refusal);
+            response
+                .headers_mut()
+                .insert(ENDPOINT_GENERATION, HeaderValue::from(endpoint.generation));
+            response
+        }
+    }
+}
+
 pub fn is_stale(response: &Response) -> bool {
+    is_code(response, Code::StaleRoute)
+}
+
+fn is_code(response: &Response, code: Code) -> bool {
     response
         .headers()
         .get(ERROR)
-        .is_some_and(|code| code.as_bytes() == Code::StaleRoute.as_str().as_bytes())
+        .is_some_and(|value| value.as_bytes() == code.as_str().as_bytes())
 }
 
 /// Splits a request into two copies, so it can be sent again after
@@ -406,8 +605,13 @@ pub async fn replayable(req: Request) -> Result<(Request, Option<Request>), ApiE
 }
 
 /// Sends the request to the host that runs the sandbox, or serves it here.
-async fn route(app: &App, ask: &Ask, req: Request) -> Result<Response, ApiError> {
-    let id = &ask.sandbox;
+async fn route(
+    app: &App,
+    ask: &Ask,
+    id: &str,
+    port: u16,
+    req: Request,
+) -> Result<Response, ApiError> {
     if matches!(app.role, Role::Worker(_)) {
         let here = app.sandboxes.generation(id);
         if here.is_none() || ask.expect.is_some_and(|n| here != Some(n)) {
@@ -424,15 +628,15 @@ async fn route(app: &App, ask: &Ask, req: Request) -> Result<Response, ApiError>
         .ok_or_else(ApiError::not_found)?;
     crate::fleet::primary::wait_for_move(app, id).await;
     if let Some(node) = crate::fleet::primary::node_of(app, id) {
-        return Ok(to_worker(app, &node, row.generation, req).await);
+        return Ok(to_worker(app, &node, id, port, row.generation, req).await);
     }
-    if !published(app, id, ask.port)? {
+    if !published(app, id, port)? {
         return Err(ApiError::new(
             Code::NotFound,
-            format!("port {} of this sandbox is not published", ask.port),
+            format!("port {port} of this sandbox is not published"),
         ));
     }
-    let in_flight = app.gateway.enter(id)?;
+    let in_flight = app.gateway.admit(id)?;
     let origin = Origin::of_call(&ask.caller.key, None, None)?;
     let slot = if ask.wake.admit(&row.state)? {
         let slot = app.gateway.wake_slot().await?;
@@ -447,33 +651,33 @@ async fn route(app: &App, ask: &Ask, req: Request) -> Result<Response, ApiError>
             if let Some(node) = crate::fleet::primary::node_of(app, id) {
                 drop((slot, in_flight));
                 let generation = app.db.get_sandbox(id)?.map_or(0, |row| row.generation);
-                return Ok(to_worker(app, &node, generation, req).await);
+                return Ok(to_worker(app, &node, id, port, generation, req).await);
             }
         }
         Some(slot)
     } else {
         None
     };
+    let woke = slot.is_some();
     let opened = within(WAKE_LIMIT, "wake", app.sandboxes.open(id, &origin)).await?;
     drop(slot);
-    if let Some(name) = app.sandboxes.service_on_port(id, ask.port)
-        && !app.sandboxes.wait_healthy(&opened.channel, &name).await
+    if let Some(name) = app.sandboxes.service_on_port(id, port) {
+        if !app.sandboxes.wait_healthy(&opened.channel, &name).await {
+            return Err(ApiError::new(
+                Code::NotReady,
+                format!("service {name:?} on port {port} is not healthy"),
+            ));
+        }
+    } else if woke
+        && let Some(reason) = wait_ready(app, &opened.channel, id, port, READY_AFTER_WAKE).await
     {
-        return Err(ApiError::new(
-            Code::NotReady,
-            format!("service {name:?} on port {} is not healthy", ask.port),
-        ));
+        return Err(ApiError::new(Code::NotReady, reason));
     }
     let generation = opened.busy.generation();
     let mut req = req;
     strip(req.headers_mut());
-    let forwarded = crate::preview::forward(
-        opened.channel,
-        (opened.busy, in_flight),
-        ask.port,
-        req,
-        None,
-    );
+    let forwarded =
+        crate::preview::forward(opened.channel, (opened.busy, in_flight), port, req, None);
     let mut response = within(ask.timeout, "response", forwarded).await?;
     let headers = response.headers_mut();
     strip(headers);
@@ -513,9 +717,20 @@ fn published(app: &App, id: &str, port: u16) -> Result<bool, ApiError> {
 
 /// Sends the request to the worker that runs the sandbox, which checks the
 /// generation before any byte reaches the app.
-async fn to_worker(app: &App, node: &str, generation: i64, mut req: Request) -> Response {
-    req.headers_mut()
-        .insert(EXPECT_GENERATION, HeaderValue::from(generation));
+async fn to_worker(
+    app: &App,
+    node: &str,
+    id: &str,
+    port: u16,
+    generation: i64,
+    mut req: Request,
+) -> Response {
+    let headers = req.headers_mut();
+    headers.insert(EXPECT_GENERATION, HeaderValue::from(generation));
+    // The worker has no endpoints, so it gets the port they resolved to.
+    if let Ok(target) = HeaderValue::from_str(&format!("{id}:{port}")) {
+        headers.insert(TARGET, target);
+    }
     let mut response = crate::fleet::primary::forward(app, node, req, Some("forward")).await;
     mark_fleet_error(&mut response);
     response
@@ -536,6 +751,152 @@ pub fn mark_fleet_error(response: &mut Response) {
     response
         .headers_mut()
         .insert(ERROR, HeaderValue::from_static(code.as_str()));
+}
+
+/// `GET /v1/sandboxes/{id}/ports/{port}/ready`
+#[derive(Debug, Serialize)]
+pub struct Readiness {
+    pub ready: bool,
+    pub generation: i64,
+    pub state: String,
+    pub reason: Option<String>,
+}
+
+/// Whether `port` of sandbox `id`, which this host runs, takes traffic. A
+/// zero `wait` does not wake the sandbox; a longer one wakes it and waits
+/// up to `wait` for the port to be ready.
+pub async fn readiness(
+    app: &App,
+    id: &str,
+    port: u16,
+    wait: Duration,
+    origin: &Origin,
+) -> Result<Readiness, ApiError> {
+    let row = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+    let not_ready = |reason: String, generation: i64, state: String| Readiness {
+        ready: false,
+        generation,
+        state,
+        reason: Some(reason),
+    };
+    if !published(app, id, port)? {
+        return Ok(not_ready(
+            format!("port {port} is not published"),
+            row.generation,
+            row.state,
+        ));
+    }
+    if app.gateway.draining(id) {
+        return Ok(not_ready(
+            "the sandbox is draining".into(),
+            row.generation,
+            row.state,
+        ));
+    }
+    if wait.is_zero() && row.state != state::RUNNING {
+        let reason = format!("the sandbox is {}", row.state);
+        return Ok(not_ready(reason, row.generation, row.state));
+    }
+    let opened = within(WAKE_LIMIT, "wake", app.sandboxes.open(id, origin)).await?;
+    let generation = opened.busy.generation();
+    let reason = wait_ready(app, &opened.channel, id, port, wait).await;
+    Ok(Readiness {
+        ready: reason.is_none(),
+        generation,
+        state: state::RUNNING.into(),
+        reason,
+    })
+}
+
+/// Waits up to `wait` for `port` to be ready. A service port is ready when
+/// its service is healthy; another port when it takes a connection.
+/// Returns why it is not ready, if it is not.
+async fn wait_ready(
+    app: &App,
+    channel: &tonic::transport::Channel,
+    id: &str,
+    port: u16,
+    wait: Duration,
+) -> Option<String> {
+    if let Some(name) = app.sandboxes.service_on_port(id, port) {
+        let healthy = app.sandboxes.wait_healthy_for(channel, &name, wait).await;
+        return (!healthy).then(|| format!("service {name:?} on port {port} is not healthy"));
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let reason = match crate::preview::dial(channel.clone(), port).await {
+            Ok(_) => return None,
+            Err(error) => error.message,
+        };
+        if Instant::now() + READY_POLL >= deadline {
+            return Some(reason);
+        }
+        tokio::time::sleep(READY_POLL).await;
+    }
+}
+
+/// Starts a drain of sandbox `id`, which this host runs or keeps. New
+/// forwarded and preview requests get `503 draining` at once; `then` runs
+/// once no request is in flight, or at the deadline.
+pub fn drain(
+    app: &AppState,
+    id: &str,
+    req: &DrainRequest,
+    origin: &Origin,
+) -> Result<(), ApiError> {
+    let timeout = req.timeout()?;
+    let row = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+    let serial = app.gateway.begin_drain(id, timeout, req.then, now_ms())?;
+    app.sandboxes.event(
+        "sandbox.drain_started",
+        origin,
+        &row.tenant,
+        id,
+        json!({ "timeout_s": timeout.as_secs(), "then": req.then.as_str() }),
+    );
+    let (app, id, then, origin) = (Arc::clone(app), id.to_owned(), req.then, origin.clone());
+    let deadline = Instant::now() + timeout;
+    tokio::spawn(async move {
+        loop {
+            if !app.gateway.drain_is(&id, serial) {
+                return;
+            }
+            if app.gateway.in_flight(&id) == 0 || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let in_flight = app.gateway.in_flight(&id);
+        let running = app
+            .db
+            .get_sandbox(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.state == state::RUNNING);
+        // Stopping the VM ends what is left; with `none` it runs on.
+        let (closed, done) = match then {
+            Then::None => (0, Ok(())),
+            Then::Pause if !running => (0, Ok(())),
+            Then::Pause => (in_flight, app.sandboxes.pause(&id, &origin).await.map(drop)),
+            Then::Delete => {
+                let done = app.sandboxes.delete(&id, &origin).await;
+                app.gateway.undrain(&id);
+                (in_flight, done)
+            }
+        };
+        let error = done.err().map(|e| e.message);
+        if let Some(error) = &error {
+            eprintln!("drain of {id}: {} failed: {error}", then.as_str());
+        }
+        app.sandboxes.event(
+            "sandbox.drained",
+            &origin,
+            &row.tenant,
+            &id,
+            json!({ "in_flight": in_flight, "closed": closed, "then": then.as_str(), "error": error }),
+        );
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -790,5 +1151,71 @@ mod tests {
             .insert(SANDBOX, HeaderValue::from_static("sbx_a"));
         mark_fleet_error(&mut app);
         assert!(!app.headers().contains_key(ERROR));
+    }
+
+    #[test]
+    fn a_drain_refuses_new_requests_and_counts_the_old_ones() {
+        let gateway = Gateway::new(Settings::default());
+        let old = gateway.admit("sbx_a").unwrap();
+        let serial = gateway
+            .begin_drain("sbx_a", Duration::from_secs(30), Then::Pause, 1_000)
+            .unwrap();
+        assert!(gateway.draining("sbx_a"));
+        assert!(gateway.drain_is("sbx_a", serial));
+        assert_eq!(gateway.admit("sbx_a").unwrap_err().code, Code::Draining);
+        assert!(
+            gateway.admit("sbx_b").is_ok(),
+            "other sandboxes take traffic"
+        );
+        let view = gateway.drain_view("sbx_a").unwrap();
+        assert_eq!((view.in_flight, view.then), (1, "pause"));
+        assert_eq!(view.deadline, rfc3339_ms(31_000));
+        drop(old);
+        assert_eq!(gateway.in_flight("sbx_a"), 0);
+        assert_eq!(
+            gateway
+                .begin_drain("sbx_a", Duration::from_secs(1), Then::None, 2_000)
+                .unwrap_err()
+                .code,
+            Code::Conflict
+        );
+        assert!(gateway.undrain("sbx_a"));
+        assert!(!gateway.drain_is("sbx_a", serial), "the task stops");
+        assert!(!gateway.undrain("sbx_a"));
+        assert!(gateway.admit("sbx_a").is_ok());
+        assert!(gateway.drain_view("sbx_a").is_none());
+    }
+
+    #[test]
+    fn drain_requests_default_to_30_s_and_no_action() {
+        let req: DrainRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            (req.timeout().unwrap(), req.then),
+            (Duration::from_secs(30), Then::None)
+        );
+        let req: DrainRequest = serde_json::from_str(r#"{"timeout_s":0}"#).unwrap();
+        assert_eq!(req.timeout().unwrap_err().code, Code::InvalidRequest);
+        let req: DrainRequest = serde_json::from_str(r#"{"timeout_s":3601}"#).unwrap();
+        assert_eq!(req.timeout().unwrap_err().code, Code::InvalidRequest);
+        let req: DrainRequest = serde_json::from_str(r#"{"then":"delete"}"#).unwrap();
+        assert_eq!(req.then, Then::Delete);
+        assert!(serde_json::from_str::<DrainRequest>(r#"{"then":"stop"}"#).is_err());
+    }
+
+    #[test]
+    fn endpoint_targets_name_a_valid_endpoint() {
+        assert_eq!(
+            Target::parse("endpoint:web-2").unwrap(),
+            Target::Endpoint {
+                name: "web-2".into()
+            }
+        );
+        for bad in ["endpoint:", "endpoint:Web", "endpoint:a/b"] {
+            assert_eq!(
+                Target::parse(bad).unwrap_err().code,
+                Code::InvalidRequest,
+                "{bad}"
+            );
+        }
     }
 }

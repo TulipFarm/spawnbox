@@ -388,6 +388,7 @@ pub(crate) mod tests {
             "PRAGMA secure_delete = OFF;
              ALTER TABLE sandboxes RENAME COLUMN saved_state TO saved;
              DROP TABLE upkeep;
+             DROP TABLE endpoints;
              ALTER TABLE nodes DROP COLUMN fenced_at;
              ALTER TABLE nodes DROP COLUMN fenced_by;
              ALTER TABLE builds DROP COLUMN guest;
@@ -397,7 +398,7 @@ pub(crate) mod tests {
         let version: i64 = old
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        old.pragma_update(None, "user_version", version - 3)
+        old.pragma_update(None, "user_version", version - 4)
             .unwrap();
         let json = serde_json::json!({
             "env": { "TOKEN": "sandbox-secret-env" }, "ports": {}, "secrets": [],

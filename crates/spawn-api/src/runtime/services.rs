@@ -341,7 +341,12 @@ impl Sandboxes {
     /// Returns whether it is. A guest that cannot tell counts as healthy,
     /// and the request goes on.
     pub async fn wait_healthy(&self, channel: &Channel, name: &str) -> bool {
-        let deadline = Instant::now() + HEALTHY_WAIT;
+        self.wait_healthy_for(channel, name, HEALTHY_WAIT).await
+    }
+
+    /// As `wait_healthy`, for up to `wait`. A zero `wait` asks once.
+    pub async fn wait_healthy_for(&self, channel: &Channel, name: &str, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
         let mut client = ServicesClient::new(channel.clone());
         loop {
             let Ok(listed) = client.list(ServicesListRequest {}).await else {

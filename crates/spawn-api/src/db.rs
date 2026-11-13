@@ -225,6 +225,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE nodes ADD COLUMN fenced_by TEXT;",
     "ALTER TABLE builds ADD COLUMN guest TEXT;
     ALTER TABLE builds ADD COLUMN root INTEGER NOT NULL DEFAULT 0;",
+    "CREATE TABLE endpoints (
+        tenant TEXT NOT NULL,
+        name TEXT NOT NULL,
+        sandbox TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (tenant, name)
+    );",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -462,6 +472,17 @@ const PG_MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE builds ADD COLUMN guest TEXT COLLATE "C";
     ALTER TABLE builds ADD COLUMN root BIGINT NOT NULL DEFAULT 0;"#,
+    r#"
+    CREATE TABLE endpoints (
+        tenant TEXT COLLATE "C" NOT NULL,
+        name TEXT COLLATE "C" NOT NULL,
+        sandbox TEXT COLLATE "C" NOT NULL,
+        port BIGINT NOT NULL,
+        generation BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (tenant, name)
+    );"#,
 ];
 
 pub mod state {
@@ -543,6 +564,19 @@ pub enum InUse {
     Templates(i64),
     Secrets(i64),
     Volumes(i64),
+}
+
+/// A stable name for one sandbox port. `generation` grows by 1 at each
+/// switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub tenant: String,
+    pub name: String,
+    pub sandbox: String,
+    pub port: u16,
+    pub generation: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1425,6 +1459,82 @@ impl Db {
         )?;
         stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect()
+    }
+
+    /// Adds an endpoint. `false` if the tenant has one by that name.
+    pub fn insert_endpoint(&self, endpoint: &Endpoint) -> Result<bool> {
+        let added = self.conn().execute(
+            "INSERT INTO endpoints
+                 (tenant, name, sandbox, port, generation, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT DO NOTHING",
+            params![
+                endpoint.tenant,
+                endpoint.name,
+                endpoint.sandbox,
+                i64::from(endpoint.port),
+                endpoint.generation,
+                endpoint.created_at,
+                endpoint.updated_at,
+            ],
+        )?;
+        Ok(added == 1)
+    }
+
+    pub fn get_endpoint(&self, tenant: &str, name: &str) -> Result<Option<Endpoint>> {
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT {ENDPOINT_COLUMNS} FROM endpoints WHERE tenant = ?1 AND name = ?2"
+                ),
+                [tenant, name],
+                endpoint_from_row,
+            )
+            .optional()
+    }
+
+    /// One tenant's endpoints, or every tenant's, by name.
+    pub fn list_endpoints(&self, tenant: Option<&str>) -> Result<Vec<Endpoint>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ENDPOINT_COLUMNS} FROM endpoints
+             WHERE CAST(?1 AS TEXT) IS NULL OR tenant = ?1
+             ORDER BY tenant, name"
+        ))?;
+        stmt.query_map([tenant], endpoint_from_row)?.collect()
+    }
+
+    /// Points an endpoint at a new target, only if it is still at
+    /// generation `expect`. Returns the endpoint after the switch, or
+    /// `None` if another switch came first or it is gone.
+    pub fn switch_endpoint(
+        &self,
+        tenant: &str,
+        name: &str,
+        sandbox: &str,
+        port: u16,
+        expect: i64,
+        now: i64,
+    ) -> Result<Option<Endpoint>> {
+        let switched = self.conn().execute(
+            "UPDATE endpoints SET sandbox = ?3, port = ?4, generation = generation + 1,
+                 updated_at = ?6
+             WHERE tenant = ?1 AND name = ?2 AND generation = ?5",
+            params![tenant, name, sandbox, i64::from(port), expect, now],
+        )?;
+        if switched == 0 {
+            return Ok(None);
+        }
+        self.get_endpoint(tenant, name)
+    }
+
+    /// Removes an endpoint. Returns whether there was one.
+    pub fn delete_endpoint(&self, tenant: &str, name: &str) -> Result<bool> {
+        let deleted = self.conn().execute(
+            "DELETE FROM endpoints WHERE tenant = ?1 AND name = ?2",
+            [tenant, name],
+        )?;
+        Ok(deleted == 1)
     }
 
     /// Adds a volume. `false` if the tenant has one by that name.
@@ -3347,6 +3457,7 @@ const IMPORT_TABLES: &[&str] = &[
     "volumes",
     "scale_requests",
     "retirements",
+    "endpoints",
 ];
 
 /// Postgres only: files that every primary of the database uses, and the
@@ -3441,6 +3552,7 @@ const SANDBOX_COLUMNS: &str = "id, state, template, labels, created_at, expires_
     persistent, generation, cold_starts, last_cold_start_at";
 const SANDBOX_COLUMN_COUNT: usize = 20;
 const VOLUME_COLUMNS: &str = "id, tenant, name, size_gib, node, backend, created_at";
+const ENDPOINT_COLUMNS: &str = "tenant, name, sandbox, port, generation, created_at, updated_at";
 const KEY_COLUMNS: &str = "id, tenant, scopes, name, created_at, revoked_at";
 const TENANT_COLUMNS: &str = "id, name, quotas, egress, created_at, updated_at, isolation";
 
@@ -3570,6 +3682,19 @@ fn sandbox_from_row(row: &Row) -> Result<Sandbox> {
         generation: row.get(17)?,
         cold_starts: row.get(18)?,
         last_cold_start_at: row.get(19)?,
+    })
+}
+
+fn endpoint_from_row(row: &Row) -> Result<Endpoint> {
+    let port: i64 = row.get(3)?;
+    Ok(Endpoint {
+        tenant: row.get(0)?,
+        name: row.get(1)?,
+        sandbox: row.get(2)?,
+        port: u16::try_from(port).unwrap_or(0),
+        generation: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 

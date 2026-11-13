@@ -1153,6 +1153,9 @@ pub struct SandboxView {
     pub generation: i64,
     pub cold_starts: i64,
     pub last_cold_start_at: Option<String>,
+    /// Only while a drain runs on its host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings_ms: Option<Timings>,
     /// Only on create: `warm_pool` or `build`.
@@ -1185,6 +1188,14 @@ pub struct BuildView {
     /// The end of the build log. Only on the build endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DrainView {
+    pub started_at: String,
+    pub deadline: String,
+    pub in_flight: u32,
+    pub then: &'static str,
 }
 
 /// `2026-11-04T01:40:12.381Z`
@@ -1234,11 +1245,16 @@ pub enum Code {
     UpstreamTimeout,
     /// Nothing answers on the port.
     UpstreamUnreachable,
+    /// The sandbox is drained and takes no new forwarded or preview
+    /// requests.
+    Draining,
+    /// An endpoint switch named a generation the endpoint is not at.
+    GenerationConflict,
     Internal,
 }
 
 impl Code {
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 24] = [
         Self::InvalidRequest,
         Self::Unauthorized,
         Self::NotFound,
@@ -1260,6 +1276,8 @@ impl Code {
         Self::NotReady,
         Self::UpstreamTimeout,
         Self::UpstreamUnreachable,
+        Self::Draining,
+        Self::GenerationConflict,
         Self::Internal,
     ];
 
@@ -1291,6 +1309,8 @@ impl Code {
             Self::NotReady => "not_ready",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::UpstreamUnreachable => "upstream_unreachable",
+            Self::Draining => "draining",
+            Self::GenerationConflict => "generation_conflict",
             Self::Internal => "internal",
         }
     }
@@ -1301,7 +1321,11 @@ impl Code {
             Self::Unauthorized => 401,
             Self::NotFound => 404,
             Self::Forbidden => 403,
-            Self::Conflict | Self::ProtectedEnv | Self::BuildFailed | Self::StaleRoute => 409,
+            Self::Conflict
+            | Self::ProtectedEnv
+            | Self::BuildFailed
+            | Self::StaleRoute
+            | Self::GenerationConflict => 409,
             Self::QuotaExceeded => 429,
             Self::NoCapacity
             | Self::NodeUnreachable
@@ -1311,7 +1335,8 @@ impl Code {
             | Self::SandboxPaused
             | Self::WakeBusy
             | Self::TooManyRequests
-            | Self::NotReady => 503,
+            | Self::NotReady
+            | Self::Draining => 503,
             Self::UpstreamUnreachable => 502,
             Self::UpstreamTimeout => 504,
             Self::Internal => 500,
@@ -1342,6 +1367,7 @@ impl Code {
                 | Self::WakeBusy
                 | Self::TooManyRequests
                 | Self::NotReady
+                | Self::Draining
         )
     }
 }
