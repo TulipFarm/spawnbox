@@ -2298,7 +2298,8 @@ request to the port.
 - Limits:
   - `--forward-max-wakes` (default 8): wakes that run at once on a host.
     A request waits up to `--forward-wake-queue-s` (default 10) for a
-    slot, then gets `503 wake_busy`.
+    slot, then gets `503 wake_busy`. Requests for a sandbox that another
+    request already wakes wait for that wake and take no slot.
   - `--forward-max-in-flight` (default 1024): requests and WebSockets in
     flight for one sandbox. More get `503 too_many_requests`.
   - A wake can take up to 60 s. Then the request gets
@@ -2345,8 +2346,9 @@ it serves.
   timeout, Spawnbox does `then`. A pause or delete ends the requests that
   are left.
 - Commands, files, terminals and other API calls continue to operate.
-- The sandbox stays out of traffic until `POST /v1/sandboxes/{id}:undrain`,
-  also after `then`. `:undrain` before the timeout stops the drain.
+- The sandbox stays out of traffic until `POST /v1/sandboxes/{id}:undrain`
+  or an [endpoint](#endpoints) switches to it, also after `then`. An
+  undrain before the timeout stops the drain.
 - `GET /v1/sandboxes/{id}` shows `drain` with `started_at`, `deadline`,
   `in_flight` and `then` while the sandbox is drained.
 - Events: `sandbox.drain_started`, and `sandbox.drained` with `in_flight`,
@@ -2382,18 +2384,21 @@ switch the endpoint to the new one. Gateways send requests to
   - `if_generation` is required. The switch happens only if the endpoint
     is at this generation. Else the response is `409 generation_conflict`.
     Of two switches from the same generation, one wins.
+  - The switch ends a [drain](#drain-a-sandbox) of the new target, so
+    you can switch back to a target that an earlier switch drained.
   - `ready_wait_s` (0 to 300, default 60): Spawnbox wakes the new target
     and waits until its port is [ready](#port-readiness). If it is not
-    ready in time, the response is `503 not_ready` and the endpoint does
-    not change. `0` skips the check. The key needs `sandboxes:read` for
-    this.
+    ready in time, or its port is not published, the response is
+    `503 not_ready` and the endpoint does not change. `0` skips the
+    check. The key needs `sandboxes:read` for this.
   - `previous`: after the switch, the old target
     [drains](#drain-a-sandbox) for `drain_s` (default 30), then does
     `then` (default `pause`). If `previous` is not given, these defaults
     apply. `null` leaves the old target alone.
   - The drain starts `--endpoint-propagation-s` (default 2) after the
     switch, so requests that read the endpoint just before the switch
-    still reach the old target. A request to an endpoint that gets
+    still reach the old target. If an endpoint of the tenant targets the
+    old sandbox again by then, it does not drain. A request to an endpoint that gets
     `draining` reads the endpoint again and is sent once more, when its
     body is at most 1 MiB.
   - The response has the endpoint with its new `generation`, and

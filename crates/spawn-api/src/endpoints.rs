@@ -7,6 +7,7 @@
 //! `--endpoint-propagation-s`, so hosts that read the row just before the
 //! switch still reach it.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -18,9 +19,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::db::{Endpoint, state};
+use crate::db::{Db, Endpoint, state};
 use crate::events::Origin;
-use crate::gateway::{Readiness, Then};
+use crate::gateway::{READY_POLL, Readiness, Then};
 use crate::ids;
 use crate::model::{ApiError, Code, rfc3339_ms};
 use crate::runtime::now_ms;
@@ -266,25 +267,13 @@ pub async fn switch(
     }
     target(&app, &caller, Some(tenant), &req.sandbox)?;
     let port = port(req.port)?;
-    if !ready_wait.is_zero()
-        && let Some(refused) = wait_ready(&app, &headers, &req.sandbox, port, ready_wait).await
-    {
-        return Ok(refused);
-    }
-    let Some(switched) = app.db.switch_endpoint(
-        tenant,
-        &name,
-        &req.sandbox,
-        port,
-        req.if_generation,
-        now_ms(),
-    )?
-    else {
-        let now = app
-            .db
-            .get_endpoint(tenant, &name)?
-            .ok_or_else(|| no_endpoint(&name))?;
-        return Err(conflict(&now));
+    let hosts = ThroughRouter {
+        app: Arc::clone(&app),
+        headers,
+    };
+    let switched = match switch_to(&app.db, &hosts, &current, &req, port, ready_wait).await {
+        Ok(switched) => switched,
+        Err(refused) => return Ok(*refused),
     };
     app.sandboxes.hub.record(
         "endpoint.switched",
@@ -301,11 +290,63 @@ pub async fn switch(
     if let (Some(previous), Some(drain_s)) = (req.previous, drain_s)
         && current.sandbox != switched.sandbox
     {
-        drain_later(&app, &headers, &current.sandbox, drain_s, previous.then);
+        drain_later(
+            app.db.clone(),
+            hosts,
+            tenant.to_owned(),
+            current.sandbox.clone(),
+            (drain_s, previous.then),
+            app.endpoint_propagation,
+        );
     }
     let mut reply = view(&app, &switched);
     reply["previous"] = json!({ "sandbox": current.sandbox, "port": current.port });
     Ok(Json(reply).into_response())
+}
+
+/// Takes any drain off the new target, waits for it to be ready and
+/// switches the endpoint if it is still at `if_generation`. Returns the
+/// reply to send instead, if it does not switch.
+async fn switch_to(
+    db: &Db,
+    hosts: &impl Hosts,
+    current: &Endpoint,
+    req: &SwitchEndpoint,
+    port: u16,
+    ready_wait: Duration,
+) -> Result<Endpoint, Refused> {
+    // A drain stays after its `then`, so a target that an earlier switch
+    // drained takes traffic again only this way.
+    hosts.undrain(&req.sandbox).await?;
+    if !ready_wait.is_zero() {
+        wait_ready(hosts, &req.sandbox, port, ready_wait).await?;
+    }
+    let switched = db
+        .switch_endpoint(
+            &current.tenant,
+            &current.name,
+            &req.sandbox,
+            port,
+            req.if_generation,
+            now_ms(),
+        )
+        .map_err(|e| refuse(e.into()))?;
+    let Some(switched) = switched else {
+        let now = db
+            .get_endpoint(&current.tenant, &current.name)
+            .map_err(|e| refuse(e.into()))?
+            .ok_or_else(|| refuse(no_endpoint(&current.name)))?;
+        return Err(refuse(conflict(&now)));
+    };
+    // A drain from an earlier switch may have started during the wait.
+    if let Err(reply) = hosts.undrain(&req.sandbox).await {
+        eprintln!(
+            "undrain {} after an endpoint switch: {}",
+            req.sandbox,
+            reply.status()
+        );
+    }
+    Ok(switched)
 }
 
 fn conflict(endpoint: &Endpoint) -> ApiError {
@@ -318,107 +359,162 @@ fn conflict(endpoint: &Endpoint) -> ApiError {
     )
 }
 
-/// Sends an API call for a sandbox through this server's own router, with
-/// the caller's key, so it reaches the host that runs the sandbox.
-async fn call(
-    app: &AppState,
-    headers: &HeaderMap,
-    method: Method,
-    uri: &str,
-    body: Value,
-) -> Response {
-    let mut req = Request::builder().method(method).uri(uri);
-    if let Some(auth) = headers.get(header::AUTHORIZATION) {
-        req = req.header(header::AUTHORIZATION, auth);
+/// The reply to send instead of the one asked for.
+type Refused = Box<Response>;
+
+fn refuse(error: ApiError) -> Refused {
+    Box::new(error.into_response())
+}
+
+/// What a switch asks of the host that runs a sandbox.
+trait Hosts: Clone + Send + Sync + 'static {
+    fn ready(
+        &self,
+        sandbox: &str,
+        port: u16,
+        wait_s: u64,
+    ) -> impl Future<Output = Result<Readiness, Refused>> + Send;
+    fn drain(
+        &self,
+        sandbox: &str,
+        drain_s: u64,
+        then: Then,
+    ) -> impl Future<Output = Result<(), Refused>> + Send;
+    /// Succeeds also if the sandbox is not draining.
+    fn undrain(&self, sandbox: &str) -> impl Future<Output = Result<(), Refused>> + Send;
+}
+
+/// Sends API calls for a sandbox through this server's own router, with
+/// the caller's key, so they reach the host that runs the sandbox.
+#[derive(Clone)]
+struct ThroughRouter {
+    app: AppState,
+    headers: HeaderMap,
+}
+
+impl ThroughRouter {
+    async fn call(&self, method: Method, uri: &str, body: Value) -> Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(auth) = self.headers.get(header::AUTHORIZATION) {
+            req = req.header(header::AUTHORIZATION, auth);
+        }
+        let req = match req
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+        {
+            Ok(req) => req,
+            Err(error) => return ApiError::internal(error.to_string()).into_response(),
+        };
+        match crate::server::router(Arc::clone(&self.app))
+            .oneshot(req)
+            .await
+        {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
     }
-    let req = match req
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-    {
-        Ok(req) => req,
-        Err(error) => return ApiError::internal(error.to_string()).into_response(),
-    };
-    match crate::server::router(std::sync::Arc::clone(app))
-        .oneshot(req)
-        .await
-    {
-        Ok(response) => response,
-        Err(never) => match never {},
+}
+
+impl Hosts for ThroughRouter {
+    async fn ready(&self, sandbox: &str, port: u16, wait_s: u64) -> Result<Readiness, Refused> {
+        let uri = format!("/v1/sandboxes/{sandbox}/ports/{port}/ready?wait_s={wait_s}");
+        let reply = self.call(Method::GET, &uri, Value::Null).await;
+        if !reply.status().is_success() {
+            return Err(Box::new(reply));
+        }
+        let bytes = axum::body::to_bytes(reply.into_body(), 64 << 10)
+            .await
+            .map_err(|e| refuse(ApiError::internal(format!("read the readiness reply: {e}"))))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| refuse(ApiError::internal(format!("read the readiness reply: {e}"))))
+    }
+
+    async fn drain(&self, sandbox: &str, drain_s: u64, then: Then) -> Result<(), Refused> {
+        let uri = format!("/v1/sandboxes/{sandbox}:drain");
+        let body = json!({ "timeout_s": drain_s, "then": then });
+        let reply = self.call(Method::POST, &uri, body).await;
+        if !reply.status().is_success() {
+            return Err(Box::new(reply));
+        }
+        Ok(())
+    }
+
+    async fn undrain(&self, sandbox: &str) -> Result<(), Refused> {
+        let uri = format!("/v1/sandboxes/{sandbox}:undrain");
+        let reply = self.call(Method::POST, &uri, json!({})).await;
+        if reply.status().is_success() || reply.status() == StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(Box::new(reply))
     }
 }
 
 /// Waits for `port` of `sandbox` to be ready, waking it. Returns the reply
 /// to send instead of switching, if it does not get ready.
 async fn wait_ready(
-    app: &AppState,
-    headers: &HeaderMap,
+    hosts: &impl Hosts,
     sandbox: &str,
     port: u16,
     wait: Duration,
-) -> Option<Response> {
+) -> Result<(), Refused> {
     let deadline = Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(Instant::now()).as_secs();
-        let wait_s = left.clamp(1, READY_CALL);
-        let uri = format!("/v1/sandboxes/{sandbox}/ports/{port}/ready?wait_s={wait_s}");
-        let reply = call(app, headers, Method::GET, &uri, Value::Null).await;
-        if !reply.status().is_success() {
-            return Some(reply);
+        let readiness = hosts
+            .ready(sandbox, port, left.clamp(1, READY_CALL))
+            .await?;
+        if readiness.ready {
+            return Ok(());
         }
-        let bytes = axum::body::to_bytes(reply.into_body(), 64 << 10)
-            .await
-            .ok()?;
-        let readiness: Option<Readiness> =
-            serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
-                Some(Readiness {
-                    ready: v.get("ready")?.as_bool()?,
-                    generation: v.get("generation")?.as_i64()?,
-                    state: v.get("state")?.as_str()?.to_owned(),
-                    reason: v.get("reason").and_then(Value::as_str).map(str::to_owned),
-                })
-            });
-        match readiness {
-            Some(r) if r.ready => return None,
-            Some(r) if Instant::now() >= deadline => {
-                let reason = r.reason.unwrap_or_default();
-                return Some(
-                    ApiError::new(
-                        Code::NotReady,
-                        format!(
-                            "port {port} of {sandbox} is not ready after {} s: {reason}",
-                            wait.as_secs()
-                        ),
-                    )
-                    .into_response(),
-                );
-            }
-            Some(_) => {}
-            None => {
-                return Some(ApiError::internal("read the readiness reply").into_response());
-            }
+        let reason = readiness.reason.unwrap_or_default();
+        if crate::gateway::lasting(&reason) || Instant::now() + READY_POLL >= deadline {
+            return Err(refuse(ApiError::new(
+                Code::NotReady,
+                format!("port {port} of {sandbox} is not ready: {reason}"),
+            )));
         }
+        tokio::time::sleep(READY_POLL).await;
     }
 }
 
-/// Drains the old target once every host has read the switch.
-fn drain_later(app: &AppState, headers: &HeaderMap, sandbox: &str, drain_s: u64, then: Then) {
-    let (app, headers, sandbox) = (
-        std::sync::Arc::clone(app),
-        headers.clone(),
-        sandbox.to_owned(),
-    );
+/// Drains the old target once every host has read the switch, unless an
+/// endpoint targets it again by then.
+fn drain_later(
+    db: Db,
+    hosts: impl Hosts,
+    tenant: String,
+    sandbox: String,
+    (drain_s, then): (u64, Then),
+    propagation: Duration,
+) -> tokio::task::JoinHandle<()> {
+    // An endpoint is in the tenant of its target.
+    let targeted = move |db: &Db, sandbox: &str| {
+        db.list_endpoints(Some(&tenant))
+            .map(|all| all.iter().any(|e| e.sandbox == sandbox))
+            .unwrap_or(true)
+    };
     tokio::spawn(async move {
-        tokio::time::sleep(app.endpoint_propagation).await;
-        let uri = format!("/v1/sandboxes/{sandbox}:drain");
-        let body = json!({ "timeout_s": drain_s, "then": then });
-        let reply = call(&app, &headers, Method::POST, &uri, body).await;
-        if !reply.status().is_success() {
+        tokio::time::sleep(propagation).await;
+        if targeted(&db, &sandbox) {
+            return;
+        }
+        if let Err(reply) = hosts.drain(&sandbox, drain_s, then).await {
             eprintln!(
                 "drain {sandbox} after an endpoint switch: {}",
                 reply.status()
             );
+            return;
         }
-    });
+        // A switch back to it may have committed while this drain started.
+        if targeted(&db, &sandbox)
+            && let Err(reply) = hosts.undrain(&sandbox).await
+        {
+            eprintln!(
+                "undrain {sandbox} after an endpoint switch: {}",
+                reply.status()
+            );
+        }
+    })
 }
 
 #[cfg(test)]
@@ -509,6 +605,198 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Hosts that keep drains in a real gateway. Every published port is
+    /// ready unless the sandbox is draining or listed in `starting`.
+    #[derive(Clone, Default)]
+    struct Fake(Arc<FakeHost>);
+
+    struct FakeHost {
+        gateway: crate::gateway::Gateway,
+        unpublished: std::sync::Mutex<Vec<String>>,
+        starting: std::sync::Mutex<Vec<String>>,
+        ready_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for FakeHost {
+        fn default() -> Self {
+            Self {
+                gateway: crate::gateway::Gateway::new(crate::gateway::Settings::default()),
+                unpublished: std::sync::Mutex::default(),
+                starting: std::sync::Mutex::default(),
+                ready_calls: std::sync::atomic::AtomicUsize::default(),
+            }
+        }
+    }
+
+    impl Hosts for Fake {
+        async fn ready(&self, sandbox: &str, port: u16, _: u64) -> Result<Readiness, Refused> {
+            self.0
+                .ready_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let has = |list: &std::sync::Mutex<Vec<String>>| {
+                list.lock().unwrap().iter().any(|s| s == sandbox)
+            };
+            let reason = if has(&self.0.unpublished) {
+                Some(format!("port {port} is not published"))
+            } else if self.0.gateway.draining(sandbox) {
+                Some("the sandbox is draining".to_owned())
+            } else if has(&self.0.starting) {
+                Some(format!("connection to port {port} refused"))
+            } else {
+                None
+            };
+            Ok(Readiness {
+                ready: reason.is_none(),
+                generation: 1,
+                state: "running".into(),
+                reason,
+            })
+        }
+
+        async fn drain(&self, sandbox: &str, drain_s: u64, then: Then) -> Result<(), Refused> {
+            self.0
+                .gateway
+                .begin_drain(sandbox, Duration::from_secs(drain_s), then, 1)
+                .map(drop)
+                .map_err(refuse)
+        }
+
+        async fn undrain(&self, sandbox: &str) -> Result<(), Refused> {
+            self.0.gateway.undrain(sandbox);
+            Ok(())
+        }
+    }
+
+    fn to(sandbox: &str, if_generation: i64) -> SwitchEndpoint {
+        SwitchEndpoint {
+            sandbox: sandbox.into(),
+            port: 8000,
+            if_generation,
+            ready_wait_s: None,
+            previous: default_previous(),
+        }
+    }
+
+    async fn error_code(reply: Refused) -> String {
+        let bytes = axum::body::to_bytes(reply.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["error"]["code"].as_str().unwrap().to_owned()
+    }
+
+    /// Switches `web` from `sbx_old` to `sbx_new`, and lets the old target
+    /// drain and pause as a switch does.
+    async fn switched_once(db: &Db, hosts: &Fake) -> Endpoint {
+        db.insert_endpoint(&endpoint("web", "sbx_old")).unwrap();
+        let current = db.get_endpoint("default", "web").unwrap().unwrap();
+        let new = switch_to(
+            db,
+            hosts,
+            &current,
+            &to("sbx_new", 1),
+            8000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        drain_later(
+            db.clone(),
+            hosts.clone(),
+            "default".into(),
+            "sbx_old".into(),
+            (30, Then::Pause),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(hosts.0.gateway.draining("sbx_old"));
+        new
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_a_drained_target_takes_it_out_of_the_drain() {
+        for wait in [Duration::from_secs(5), Duration::ZERO] {
+            let (db, hosts) = (Db::memory().unwrap(), Fake::default());
+            let current = switched_once(&db, &hosts).await;
+            let started = Instant::now();
+            let back = switch_to(&db, &hosts, &current, &to("sbx_old", 2), 8000, wait)
+                .await
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1), "{wait:?}");
+            assert_eq!((back.sandbox.as_str(), back.generation), ("sbx_old", 3));
+            assert!(!hosts.0.gateway.draining("sbx_old"), "{wait:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_drain_leaves_a_target_that_an_endpoint_switched_back_to() {
+        let (db, hosts) = (Db::memory().unwrap(), Fake::default());
+        db.insert_endpoint(&endpoint("web", "sbx_old")).unwrap();
+        let current = db.get_endpoint("default", "web").unwrap().unwrap();
+        let wait = Duration::ZERO;
+        let new = switch_to(&db, &hosts, &current, &to("sbx_new", 1), 8000, wait)
+            .await
+            .unwrap();
+        let old_drain = drain_later(
+            db.clone(),
+            hosts.clone(),
+            "default".into(),
+            "sbx_old".into(),
+            (30, Then::Delete),
+            Duration::from_millis(200),
+        );
+        switch_to(&db, &hosts, &new, &to("sbx_old", 2), 8000, wait)
+            .await
+            .unwrap();
+        let new_drain = drain_later(
+            db.clone(),
+            hosts.clone(),
+            "default".into(),
+            "sbx_new".into(),
+            (30, Then::Delete),
+            Duration::from_millis(200),
+        );
+        old_drain.await.unwrap();
+        new_drain.await.unwrap();
+        assert!(!hosts.0.gateway.draining("sbx_old"));
+        assert!(hosts.0.gateway.draining("sbx_new"));
+    }
+
+    #[tokio::test]
+    async fn readiness_that_cannot_change_fails_at_once() {
+        let hosts = Fake::default();
+        hosts.0.unpublished.lock().unwrap().push("sbx_a".into());
+        let started = Instant::now();
+        let reply = wait_ready(&hosts, "sbx_a", 8000, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(error_code(reply).await, "not_ready");
+        assert_eq!(
+            hosts
+                .0
+                .ready_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_that_may_change_is_asked_again_after_a_pause() {
+        let hosts = Fake::default();
+        hosts.0.starting.lock().unwrap().push("sbx_a".into());
+        let reply = wait_ready(&hosts, "sbx_a", 8000, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(reply).await, "not_ready");
+        let calls = hosts
+            .0
+            .ready_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!((2..=5).contains(&calls), "{calls} calls in 1 s");
     }
 
     #[test]

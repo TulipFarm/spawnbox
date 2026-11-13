@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::db::{Db, state};
 use crate::events::Origin;
@@ -57,7 +57,15 @@ const DEFAULT_RESPONSE: Duration = Duration::from_secs(60);
 const REPLAY_BODY: usize = 1 << 20;
 /// How long a forwarded request waits for a port to be ready after a wake.
 const READY_AFTER_WAKE: Duration = Duration::from_secs(30);
-const READY_POLL: Duration = Duration::from_millis(250);
+pub const READY_POLL: Duration = Duration::from_millis(250);
+const DRAINING: &str = "the sandbox is draining";
+const NOT_PUBLISHED: &str = " is not published";
+
+/// Whether a port that is not ready for `reason` stays so however long a
+/// caller waits.
+pub fn lasting(reason: &str) -> bool {
+    reason == DRAINING || reason.ends_with(NOT_PUBLISHED)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -201,6 +209,7 @@ pub fn strip(headers: &mut HeaderMap) {
 pub struct Gateway {
     pub settings: Settings,
     wakes: Arc<Semaphore>,
+    waking: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     in_flight: Arc<Mutex<HashMap<String, u32>>>,
     keys: Mutex<HashMap<Vec<u8>, (Instant, Caller)>>,
     drains: Mutex<HashMap<String, Drain>>,
@@ -255,6 +264,27 @@ impl DrainRequest {
     }
 }
 
+/// The turn of one request to wake a sandbox. Requests for the same
+/// sandbox take turns, so a burst of them uses one wake slot.
+pub struct WakeTurn {
+    waking: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    id: String,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for WakeTurn {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
+        if waking
+            .get(&self.id)
+            .is_some_and(|turns| Arc::strong_count(turns) == 1)
+        {
+            waking.remove(&self.id);
+        }
+    }
+}
+
 /// One forwarded request or upgraded connection in a sandbox.
 #[derive(Debug)]
 pub struct InFlight {
@@ -279,6 +309,7 @@ impl Gateway {
         Self {
             settings,
             wakes: Arc::new(Semaphore::new(settings.max_wakes)),
+            waking: Arc::default(),
             in_flight: Arc::default(),
             keys: Mutex::default(),
             drains: Mutex::default(),
@@ -302,7 +333,7 @@ impl Gateway {
 
     /// Refuses new traffic for sandbox `id` from now. Returns the drain's
     /// serial, which the task that finishes it checks.
-    fn begin_drain(
+    pub(crate) fn begin_drain(
         &self,
         id: &str,
         timeout: Duration,
@@ -432,6 +463,23 @@ impl Gateway {
         Ok(InFlight {
             counts: Arc::clone(&self.in_flight),
             id: id.to_owned(),
+        })
+    }
+
+    /// Waits until no other request wakes sandbox `id`. The caller checks
+    /// again whether the sandbox still needs a wake.
+    pub async fn wake_turn(&self, id: &str) -> Result<WakeTurn, ApiError> {
+        let turns = {
+            let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(waking.entry(id.to_owned()).or_default())
+        };
+        let guard = tokio::time::timeout(self.settings.wake_queue + WAKE_LIMIT, turns.lock_owned())
+            .await
+            .map_err(|_| ApiError::new(Code::WakeBusy, "the sandbox is still waking; try again"))?;
+        Ok(WakeTurn {
+            waking: Arc::clone(&self.waking),
+            id: id.to_owned(),
+            guard: Some(guard),
         })
     }
 
@@ -638,29 +686,36 @@ async fn route(
     }
     let in_flight = app.gateway.admit(id)?;
     let origin = Origin::of_call(&ask.caller.key, None, None)?;
-    let slot = if ask.wake.admit(&row.state)? {
-        let slot = app.gateway.wake_slot().await?;
-        metrics::inc("spawnbox_forward_wakes_total", vec![]);
-        if matches!(app.role, Role::Primary(_)) {
-            within(
-                WAKE_LIMIT,
-                "wake",
-                crate::fleet::primary::wake_cold(app, id, false),
-            )
-            .await?;
-            if let Some(node) = crate::fleet::primary::node_of(app, id) {
-                drop((slot, in_flight));
-                let generation = app.db.get_sandbox(id)?.map_or(0, |row| row.generation);
-                return Ok(to_worker(app, &node, id, port, generation, req).await);
+    let woke = ask.wake.admit(&row.state)?;
+    let (mut turn, mut slot) = (None, None);
+    if woke {
+        turn = Some(app.gateway.wake_turn(id).await?);
+        // The request that had the turn before may have woken it.
+        let row = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+        if let Some(node) = crate::fleet::primary::node_of(app, id) {
+            drop((turn, in_flight));
+            return Ok(to_worker(app, &node, id, port, row.generation, req).await);
+        }
+        if ask.wake.admit(&row.state)? {
+            slot = Some(app.gateway.wake_slot().await?);
+            metrics::inc("spawnbox_forward_wakes_total", vec![]);
+            if matches!(app.role, Role::Primary(_)) {
+                within(
+                    WAKE_LIMIT,
+                    "wake",
+                    crate::fleet::primary::wake_cold(app, id, false),
+                )
+                .await?;
+                if let Some(node) = crate::fleet::primary::node_of(app, id) {
+                    drop((slot, turn, in_flight));
+                    let generation = app.db.get_sandbox(id)?.map_or(0, |row| row.generation);
+                    return Ok(to_worker(app, &node, id, port, generation, req).await);
+                }
             }
         }
-        Some(slot)
-    } else {
-        None
-    };
-    let woke = slot.is_some();
+    }
     let opened = within(WAKE_LIMIT, "wake", app.sandboxes.open(id, &origin)).await?;
-    drop(slot);
+    drop((slot, turn));
     if let Some(name) = app.sandboxes.service_on_port(id, port) {
         if !app.sandboxes.wait_healthy(&opened.channel, &name).await {
             return Err(ApiError::new(
@@ -754,7 +809,7 @@ pub fn mark_fleet_error(response: &mut Response) {
 }
 
 /// `GET /v1/sandboxes/{id}/ports/{port}/ready`
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Readiness {
     pub ready: bool,
     pub generation: i64,
@@ -781,17 +836,13 @@ pub async fn readiness(
     };
     if !published(app, id, port)? {
         return Ok(not_ready(
-            format!("port {port} is not published"),
+            format!("port {port}{NOT_PUBLISHED}"),
             row.generation,
             row.state,
         ));
     }
     if app.gateway.draining(id) {
-        return Ok(not_ready(
-            "the sandbox is draining".into(),
-            row.generation,
-            row.state,
-        ));
+        return Ok(not_ready(DRAINING.into(), row.generation, row.state));
     }
     if wait.is_zero() && row.state != state::RUNNING {
         let reason = format!("the sandbox is {}", row.state);
@@ -1114,6 +1165,49 @@ mod tests {
         });
         drop(first);
         assert!(waiting.await.unwrap());
+    }
+
+    /// Wakes `id` as a forwarded request does: in its turn, and in a slot
+    /// only if it still needs a wake. Returns whether it took a slot.
+    async fn wake_like_a_request(
+        gateway: &Gateway,
+        id: &str,
+        awake: &Mutex<Vec<String>>,
+    ) -> Result<bool, Code> {
+        let _turn = gateway.wake_turn(id).await.map_err(|e| e.code)?;
+        if awake.lock().unwrap().iter().any(|a| a == id) {
+            return Ok(false);
+        }
+        let _slot = gateway.wake_slot().await.map_err(|e| e.code)?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        awake.lock().unwrap().push(id.to_owned());
+        Ok(true)
+    }
+
+    #[tokio::test]
+    async fn a_burst_to_one_sandbox_takes_one_wake_slot() {
+        let gateway = Arc::new(Gateway::new(Settings {
+            max_wakes: 2,
+            wake_queue: Duration::from_millis(50),
+            ..Settings::default()
+        }));
+        let awake = Arc::new(Mutex::new(Vec::new()));
+        let burst: Vec<_> = (0..8)
+            .map(|i| {
+                let (gateway, awake) = (Arc::clone(&gateway), Arc::clone(&awake));
+                let id = if i == 7 { "sbx_b" } else { "sbx_a" };
+                tokio::spawn(async move { wake_like_a_request(&gateway, id, &awake).await })
+            })
+            .collect();
+        let mut slots = 0;
+        for request in burst {
+            slots += usize::from(request.await.unwrap().expect("no wake_busy"));
+        }
+        assert_eq!(slots, 2, "one wake of each sandbox");
+        assert!(
+            gateway.waking.lock().unwrap().is_empty(),
+            "turns are cleaned up"
+        );
     }
 
     #[tokio::test]
