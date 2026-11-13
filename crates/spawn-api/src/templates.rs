@@ -2152,8 +2152,8 @@ fn remove_dir(dir: &Path) {
 }
 
 /// Changes when spawn-node builds snapshots differently, as when VMs got
-/// their volume disks, so older builds are rebuilt.
-const BUILD_FORMAT: &[u8] = b"build-format-3\0";
+/// their volume disks or new kernel options, so older builds are rebuilt.
+const BUILD_FORMAT: &[u8] = b"build-format-4\0";
 
 /// SHA-256 over the files every build is made from, and `extra`.
 fn fingerprint(files: &[PathBuf], extra: &[u8]) -> Result<String> {
