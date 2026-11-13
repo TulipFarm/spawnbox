@@ -1380,6 +1380,19 @@ impl Db {
         Ok(deleted > 0)
     }
 
+    /// Sandboxes admitted for a first start before `before` that no claim
+    /// has taken.
+    pub fn unstarted_before(&self, before: i64) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sandboxes
+             WHERE persistent = 1 AND first_start = 1 AND state = 'cold' AND node IS NULL
+               AND generation = 0 AND created_at < ?1
+             ORDER BY seq",
+        )?;
+        stmt.query_map([before], |r| r.get(0))?.collect()
+    }
+
     /// Gives up a claim: the sandbox is cold again, and this host's.
     pub fn abandon_claim(
         &self,
@@ -3799,7 +3812,7 @@ fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sandbox(id: &str, state: &str) -> Sandbox {
@@ -3834,7 +3847,7 @@ mod tests {
         }
     }
 
-    fn start_record(id: &str, build: &str) -> StartRecord {
+    pub(crate) fn start_record(id: &str, build: &str) -> StartRecord {
         StartRecord {
             sandbox: id.into(),
             tenant: "default".into(),
@@ -3854,7 +3867,7 @@ mod tests {
         }
     }
 
-    fn persistent(id: &str, state: &str) -> Sandbox {
+    pub(crate) fn persistent(id: &str, state: &str) -> Sandbox {
         Sandbox {
             persistent: true,
             expires_at: i64::MAX,

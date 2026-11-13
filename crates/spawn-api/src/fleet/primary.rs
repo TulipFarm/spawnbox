@@ -36,7 +36,8 @@ use super::{
     SUSPECT_AFTER_MS, SecretPush, SyncReply, TemplateCopy, UsageBatch, check_node_url, hex,
 };
 use crate::db::{
-    self, NodeRow, Retirement, VolumeRef, node_kind, node_state, retire_origin, retire_state, state,
+    self, Db, NodeRow, Retirement, VolumeRef, node_kind, node_state, retire_origin, retire_state,
+    state,
 };
 use crate::events::Origin;
 use crate::ids;
@@ -51,6 +52,12 @@ use crate::traces::{self, Traced};
 /// How much longer than a cold start may take the primary waits for a
 /// worker's, and its claim lasts.
 const COLD_START_SLACK: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a sandbox admitted for a first start may wait for its claim
+/// before it is deleted to free its tenant's quota: as long as a claim
+/// lasts. Its start runs to the end in its own task, so only a primary that
+/// stopped mid-start leaves one waiting longer.
+const UNSTARTED_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(COLD_START_CLAIM.as_secs() + 2 * COLD_START_SLACK.as_secs());
 /// Most hosts a create is tried on.
 const PLACE_TRIES: usize = 3;
 /// Largest body on fleet calls: heartbeats list every sandbox.
@@ -82,7 +89,7 @@ pub struct Primary {
     pub moves: Moves,
     /// Held to read while a create uses volumes already on one host; held
     /// to write while volumes get a home or move.
-    pub volume_lock: tokio::sync::RwLock<()>,
+    pub volume_lock: Arc<tokio::sync::RwLock<()>>,
     /// The egress CA's certificate and key, which every host uses.
     egress_ca: EgressCa,
     /// Set when the primary runs with `--autoscale-hook`.
@@ -140,7 +147,7 @@ impl Primary {
             version: AtomicU64::new(u64::try_from(now_ms()).unwrap_or(1)),
             live: Mutex::default(),
             moves: Moves::default(),
-            volume_lock: tokio::sync::RwLock::new(()),
+            volume_lock: Arc::default(),
             egress_ca,
             autoscaler: OnceLock::new(),
             busy: Busy::default(),
@@ -664,12 +671,16 @@ async fn usage(
 
 /// Marks nodes suspect, then down, when their heartbeats stop, and makes
 /// cold the persistent sandboxes of lost nodes once their copies are
-/// known to be gone. `margin` is added to a worker's fence time.
+/// known to be gone. `margin` is added to a worker's fence time. Also
+/// deletes sandboxes whose first start was cut off, at once and then on
+/// each check.
 pub fn watch(app: AppState, margin: std::time::Duration) -> tokio::task::JoinHandle<()> {
     let margin_ms = i64::try_from(margin.as_millis()).unwrap_or(i64::MAX);
     tokio::spawn(async move {
+        sweep(&app);
         loop {
             tokio::time::sleep(super::HEARTBEAT_EVERY).await;
+            sweep(&app);
             if let Err(error) = check_nodes(&app) {
                 eprintln!("fleet: check nodes: {error:#}");
             }
@@ -678,6 +689,30 @@ pub fn watch(app: AppState, margin: std::time::Duration) -> tokio::task::JoinHan
             }
         }
     })
+}
+
+fn sweep(app: &App) {
+    match sweep_unstarted(&app.db, now_ms()) {
+        Ok(deleted) => {
+            for id in deleted {
+                eprintln!("{id} never started: deleted after its first start was cut off");
+            }
+        }
+        Err(error) => eprintln!("fleet: sweep unstarted sandboxes: {error:#}"),
+    }
+}
+
+/// Deletes the sandboxes admitted for a first start that no claim took
+/// within `UNSTARTED_GRACE` of `now`, and returns their IDs.
+fn sweep_unstarted(db: &Db, now: i64) -> Result<Vec<String>> {
+    let grace = i64::try_from(UNSTARTED_GRACE.as_millis()).unwrap_or(i64::MAX);
+    let mut deleted = Vec::new();
+    for id in db.unstarted_before(now.saturating_sub(grace))? {
+        if db.delete_unstarted(&id)? {
+            deleted.push(id);
+        }
+    }
+    Ok(deleted)
 }
 
 /// Records that a persistent sandbox is cold again.
@@ -1189,14 +1224,15 @@ fn takes_first_start(capacity: &Capacity, key: &str, wanted: &str) -> bool {
 /// start at generation 1. `None` when this host should create it instead:
 /// it ranks above every such worker, or each one surely did not start it.
 async fn first_start(
-    app: &App,
-    p: &Primary,
+    app: &AppState,
     tenant: &Tenant,
     req: &CreateSandbox,
     key: &str,
     candidates: &[Candidate],
     need: Option<&Need>,
+    volumes: Option<&Arc<VolumeGuard>>,
 ) -> Result<Option<Response>, ApiError> {
+    let p = primary(app)?;
     let Some(template) = app.db.get_template(key)? else {
         return Ok(None);
     };
@@ -1233,43 +1269,130 @@ async fn first_start(
         app.sandboxes
             .admit_first_start(tenant, req.clone(), template.spec, &build, *limits)?;
     let id = sandbox.id.clone();
-    let made_volumes = |node: &NodeRow, backend: &str| -> Result<(), ApiError> {
-        for volume in need.iter().flat_map(|n| &n.unplaced) {
-            app.db.set_volume_home(volume, Some(&node.id), backend)?;
-        }
-        Ok(())
-    };
-    for (node, _, backend) in &workers {
-        match start_on(app, p, node, tenant, sandbox.clone(), &start, need).await {
-            Ok(()) => {
-                made_volumes(node, backend)?;
-                return first_started(app, &id).map(Some);
+    let admitted = Arc::new(Admitted {
+        app: Arc::clone(app),
+        p: Arc::clone(p),
+        tenant: tenant.clone(),
+        sandbox,
+        start,
+        need: need.cloned(),
+        wanted,
+        _volumes: volumes.cloned(),
+    });
+    let workers = workers
+        .into_iter()
+        .map(|(node, _, backend)| (node, backend))
+        .collect();
+    let started = start_admitted(
+        app.db.clone(),
+        id.clone(),
+        workers,
+        move |(node, backend)| {
+            let (admitted, node, backend) = (Arc::clone(&admitted), node.clone(), backend.clone());
+            async move { admitted.on(&node, &backend).await }
+        },
+    )
+    .await?;
+    match started {
+        FirstStart::On(_, Ok(())) | FirstStart::Claimed => first_started(app, &id).map(Some),
+        FirstStart::On((node, _), Err(failure)) => Err(ApiError::new(
+            Code::NodeUnreachable,
+            format!(
+                "sandbox {id} may have started on node {}: {:#}; get it to see",
+                node.id,
+                failure.error()
+            ),
+        )),
+        FirstStart::Deleted => Ok(None),
+    }
+}
+
+/// What became of an admitted sandbox's first start.
+enum FirstStart<W> {
+    /// `W` started it, or may have if the start failed.
+    On(W, Result<(), Failure>),
+    /// No worker started it, and its row is gone.
+    Deleted,
+    /// No worker started it, and something else claimed it since.
+    Claimed,
+}
+
+/// Tries `start` on each of `workers` in turn until one starts admitted
+/// sandbox `id` or may have, and deletes the sandbox if none did. This runs
+/// in its own task: a client that disconnects must not leave the sandbox
+/// unstarted, holding the tenant's quota.
+async fn start_admitted<W, S, F>(
+    db: Db,
+    id: String,
+    workers: Vec<W>,
+    mut start: S,
+) -> Result<FirstStart<W>, ApiError>
+where
+    W: Send + 'static,
+    S: FnMut(&W) -> F + Send + 'static,
+    F: Future<Output = Result<(), Failure>> + Send,
+{
+    crate::server::finish(async move {
+        for worker in workers {
+            match start(&worker).await {
+                Err(failure) if certain(&failure) => {}
+                outcome => return Ok(FirstStart::On(worker, outcome)),
             }
+        }
+        Ok(if db.delete_unstarted(&id)? {
+            FirstStart::Deleted
+        } else {
+            FirstStart::Claimed
+        })
+    })
+    .await
+}
+
+/// A sandbox admitted for its first start on a worker, and what starting
+/// it needs.
+struct Admitted {
+    app: AppState,
+    p: Arc<Primary>,
+    tenant: Tenant,
+    sandbox: db::Sandbox,
+    start: db::StartRecord,
+    need: Option<Need>,
+    /// The hash of its template's spec.
+    wanted: String,
+    /// Keeps the create's volumes in place until the start ends.
+    _volumes: Option<Arc<VolumeGuard>>,
+}
+
+impl Admitted {
+    /// Starts it on `node`, whose volumes use `backend`.
+    async fn on(&self, node: &NodeRow, backend: &str) -> Result<(), Failure> {
+        let (app, p) = (&self.app, &self.p);
+        let need = self.need.as_ref();
+        let id = &self.sandbox.id;
+        let sandbox = self.sandbox.clone();
+        match start_on(app, p, node, &self.tenant, sandbox, &self.start, need).await {
             Err(failure) if certain(&failure) => {
                 if let Failure::Refused { error, .. } = &failure
                     && error.code == Code::BuildFailed
                 {
-                    p.failed_builds.note(&node.id, &wanted);
+                    p.failed_builds.note(&node.id, &self.wanted);
                 }
-                eprintln!("create {id} on node {}: {:#}", node.id, failure.error());
+                let error = failure.error();
+                eprintln!("create {id} on node {}: {error:#}", node.id);
+                Err(Failure::Unreachable(error))
             }
-            Err(failure) => {
-                made_volumes(node, backend)?;
-                return Err(ApiError::new(
-                    Code::NodeUnreachable,
-                    format!(
-                        "sandbox {id} may have started on node {}: {:#}; get it to see",
-                        node.id,
-                        failure.error()
-                    ),
-                ));
+            outcome => {
+                for volume in need.iter().flat_map(|n| &n.unplaced) {
+                    app.db
+                        .set_volume_home(volume, Some(&node.id), backend)
+                        .map_err(|e| {
+                            Failure::Broken(anyhow::anyhow!("record the home of {volume}: {e}"))
+                        })?;
+                }
+                outcome
             }
         }
     }
-    if app.db.delete_unstarted(&id)? {
-        return Ok(None);
-    }
-    first_started(app, &id).map(Some)
 }
 
 /// The create reply for persistent sandbox `id`, started by `first_start`.
@@ -1339,21 +1462,22 @@ async fn place_any(
     } else {
         Some(Need::of(app, &refs)?)
     };
-    let mut _volumes = None;
+    let mut volumes = None;
     if let Some(first) = &need {
         if first.is_simple() {
-            let guard = p.volume_lock.read().await;
+            let guard = Arc::clone(&p.volume_lock).read_owned().await;
             // Read again under the lock: a copy may have moved them.
             let now = Need::of(app, &refs)?;
             if now.is_simple() {
-                _volumes = Some(VolumeGuard::Read(guard));
+                volumes = Some(Arc::new(VolumeGuard::Read(guard)));
                 need = Some(now);
             } else {
                 drop(guard);
             }
         }
-        if _volumes.is_none() {
-            _volumes = Some(VolumeGuard::Write(p.volume_lock.write().await));
+        if volumes.is_none() {
+            let guard = Arc::clone(&p.volume_lock).write_owned().await;
+            volumes = Some(Arc::new(VolumeGuard::Write(guard)));
             need = Some(Need::of(app, &refs)?);
         }
     }
@@ -1368,8 +1492,16 @@ async fn place_any(
     );
     if req.persistent {
         if p.persistent_anywhere
-            && let Some(created) =
-                first_start(app, p, &tenant, &req, &key, &candidates, need.as_ref()).await?
+            && let Some(created) = first_start(
+                app,
+                &tenant,
+                &req,
+                &key,
+                &candidates,
+                need.as_ref(),
+                volumes.as_ref(),
+            )
+            .await?
         {
             return Ok(created);
         }
@@ -1438,9 +1570,9 @@ async fn place_any(
 }
 
 #[expect(dead_code, reason = "held only to keep the lock")]
-enum VolumeGuard<'a> {
-    Read(tokio::sync::RwLockReadGuard<'a, ()>),
-    Write(tokio::sync::RwLockWriteGuard<'a, ()>),
+enum VolumeGuard {
+    Read(tokio::sync::OwnedRwLockReadGuard<()>),
+    Write(tokio::sync::OwnedRwLockWriteGuard<()>),
 }
 
 enum Placed {
@@ -2250,6 +2382,93 @@ impl ApiError {
 mod tests {
     use super::*;
     use crate::fleet::ReadyTemplate;
+
+    fn admit(db: &Db, id: &str, created_at: i64) -> Result<(), db::Refused> {
+        let row = db::Sandbox {
+            generation: 0,
+            first_start: true,
+            created_at,
+            ..db::tests::persistent(id, state::COLD)
+        };
+        db.insert_persistent(&row, &db::tests::start_record(id, "b1"), Some(3))
+            .unwrap()
+    }
+
+    /// The state and node of `id` once it is no longer cold, or `None`
+    /// once it is gone. Gives up after 5 seconds.
+    async fn settled(db: &Db, id: &str) -> Option<(String, Option<String>)> {
+        for _ in 0..500 {
+            match db.get_sandbox(id).unwrap() {
+                Some(s) if s.state == state::COLD => {}
+                found => return found.map(|s| (s.state, s.node)),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let s = db.get_sandbox(id).unwrap().unwrap();
+        Some((s.state, s.node))
+    }
+
+    #[tokio::test]
+    async fn a_first_start_whose_caller_goes_away_still_ends() {
+        let db = Db::memory().unwrap();
+        for (id, starts) in [("sbx_refused", false), ("sbx_started", true)] {
+            admit(&db, id, 1).unwrap();
+            let (began, has_begun) = tokio::sync::oneshot::channel();
+            let (go, wait) = tokio::sync::oneshot::channel::<()>();
+            let mut gates = Some((began, wait));
+            let worker_db = db.clone();
+            let start = move |node: &&'static str| {
+                let (began, wait) = gates.take().unwrap();
+                let (db, node) = (worker_db.clone(), *node);
+                async move {
+                    began.send(()).unwrap();
+                    let _ = wait.await;
+                    if !starts {
+                        return Err(Failure::Unreachable(anyhow::anyhow!("no room")));
+                    }
+                    let generation = db.claim_cold(id, Some(node), "c1", i64::MAX).unwrap();
+                    assert_eq!(generation, Some(1));
+                    assert!(db.finish_cold_start(id, Some(node), 1, "c1", 5).unwrap());
+                    Ok(())
+                }
+            };
+            let call = tokio::spawn(start_admitted(db.clone(), id.into(), vec!["nod_w"], start));
+            has_begun.await.unwrap();
+            call.abort();
+            let _ = go.send(());
+            let expected = starts.then(|| (state::RUNNING.to_owned(), Some("nod_w".to_owned())));
+            assert_eq!(settled(&db, id).await, expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_deletes_only_first_starts_left_unclaimed_too_long() {
+        let db = Db::memory().unwrap();
+        let now = 1_800_000_000_000;
+        let minute = 60_000;
+        admit(&db, "sbx_old", now - 10 * minute).unwrap();
+        admit(&db, "sbx_young", now - 1000).unwrap();
+        // Told to the client as maybe started: its claim was given up.
+        admit(&db, "sbx_told", now - 10 * minute).unwrap();
+        assert_eq!(
+            db.claim_cold("sbx_told", Some("nod_w"), "c1", 0).unwrap(),
+            Some(1)
+        );
+        assert!(
+            db.abandon_claim("sbx_told", Some("nod_w"), 1, "c1")
+                .unwrap()
+        );
+        assert_eq!(admit(&db, "sbx_new", now), Err(db::Refused::Persistent(3)));
+
+        assert_eq!(sweep_unstarted(&db, now).unwrap(), ["sbx_old"]);
+        assert_eq!(db.get_sandbox("sbx_old").unwrap(), None);
+        assert_eq!(db.get_start_record("sbx_old").unwrap(), None);
+        let kept = |id| db.get_sandbox(id).unwrap().map(|s| (s.state, s.generation));
+        assert_eq!(kept("sbx_young"), Some((state::COLD.to_owned(), 0)));
+        assert_eq!(kept("sbx_told"), Some((state::COLD.to_owned(), 1)));
+        assert_eq!(admit(&db, "sbx_new", now), Ok(()));
+        assert_eq!(sweep_unstarted(&db, now).unwrap(), Vec::<String>::new());
+    }
 
     #[test]
     fn a_first_start_needs_a_build_of_the_current_spec_and_a_new_enough_host() {

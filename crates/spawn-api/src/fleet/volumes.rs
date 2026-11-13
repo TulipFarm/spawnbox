@@ -395,6 +395,7 @@ pub async fn evacuate(app: &App, p: &Primary, node: &str) -> (u32, u32) {
 }
 
 /// Where a sandbox with volumes may go.
+#[derive(Clone)]
 pub struct Need {
     /// The backend of the volumes that have files.
     pub backend: Option<String>,

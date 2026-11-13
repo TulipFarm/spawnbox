@@ -1969,7 +1969,7 @@ async fn delete(
 
 /// Runs `work` in its own task. A client that disconnects drops the handler,
 /// which would otherwise stop a create or delete halfway and leak its VM.
-async fn finish<T: Send + 'static>(
+pub async fn finish<T: Send + 'static>(
     work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
     tokio::spawn(work)
