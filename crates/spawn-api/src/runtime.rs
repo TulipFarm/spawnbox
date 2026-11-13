@@ -68,6 +68,31 @@ enum VmState {
     Changing,
 }
 
+/// A create request's checked parts.
+struct Checked {
+    egress: Policy,
+    volumes: Vec<db::VolumeRef>,
+    attached: Vec<Attached>,
+    placeholders: BTreeMap<String, String>,
+    service_ports: BTreeMap<u16, Published>,
+    own_env: SandboxEnv,
+}
+
+/// Why `tenant`'s new sandbox was not added.
+fn refused(tenant: &Tenant, refused: db::Refused) -> ApiError {
+    match refused {
+        db::Refused::Volume(name) => ApiError::new(
+            Code::Conflict,
+            format!("volume {name:?} is in use by another sandbox"),
+        ),
+        db::Refused::Persistent(in_use) => tenant
+            .quotas
+            .admit_persistent(in_use)
+            .err()
+            .unwrap_or_else(|| ApiError::internal("persistent sandbox refused")),
+    }
+}
+
 /// A sandbox that runs or is paused.
 struct Record {
     tenant: String,
@@ -934,32 +959,14 @@ impl Sandboxes {
         }
         let idle_pause_s = req.idle_pause_s.unwrap_or(self.settings.idle_pause_s);
         let persistent = req.persistent;
-        let egress = req.egress.take().unwrap_or_else(Policy::allow_all);
-        let volumes = self.volumes.resolve(&tenant.id, &req.volumes)?;
-        let mut attached = Vec::new();
-        let mut placeholders = BTreeMap::new();
-        for (key, spec) in self.secrets.specs(Some(&tenant.id), &req.secrets)? {
-            let placeholder = ids::placeholder().map_err(ApiError::internal)?;
-            if let Some(var) = &spec.env {
-                if req.env.contains_key(var) || placeholders.contains_key(var) {
-                    return Err(ApiError::invalid(format!(
-                        "{var} is set by both env and secret {:?}",
-                        spec.name
-                    )));
-                }
-                placeholders.insert(var.clone(), placeholder.clone());
-            }
-            attached.push(Attached {
-                name: key,
-                placeholder,
-            });
-        }
-        services::check_env(&req.services, &placeholders)?;
-        let service_ports = services::ports(&req.services)?;
-        let own_env = SandboxEnv {
-            env: req.env.clone(),
-            services: req.services.clone(),
-        };
+        let Checked {
+            egress,
+            volumes,
+            attached,
+            placeholders,
+            service_ports,
+            own_env,
+        } = self.check_create(&tenant, &mut req)?;
         let protected = own_env.is_protected();
         let template = req.template.as_deref().unwrap_or(BASE_TEMPLATE);
         // Held until the VM is restored, so the build's files stay in place.
@@ -1050,30 +1057,20 @@ impl Sandboxes {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
-        };
-        let refused = |refused| match refused {
-            db::Refused::Volume(name) => ApiError::new(
-                Code::Conflict,
-                format!("volume {name:?} is in use by another sandbox"),
-            ),
-            db::Refused::Persistent(in_use) => tenant
-                .quotas
-                .admit_persistent(in_use)
-                .err()
-                .unwrap_or_else(|| ApiError::internal("persistent sandbox refused")),
+            first_start: false,
         };
         let inserted = if persistent {
-            self.start_record(&sandbox, &ready, &own_env, &service_ports)
-                .and_then(|start| {
-                    let limit = tenant.quotas.persistent_sandboxes;
-                    Ok(self.db.insert_persistent(&sandbox, &start, limit)?)
+            serde_json::to_string(&ready.spec)
+                .map_err(ApiError::internal)
+                .and_then(|spec| {
+                    self.start_record(&sandbox, &ready.id, spec, &own_env, &service_ports)
                 })
-                .and_then(|inserted| inserted.map_err(refused))
+                .and_then(|start| self.insert_persistent(&tenant, &sandbox, &start))
                 .inspect(|()| self.templates.hold(&ready))
         } else {
             match self.db.insert_sandbox(&sandbox) {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(name)) => Err(refused(db::Refused::Volume(name))),
+                Ok(Err(name)) => Err(refused(&tenant, db::Refused::Volume(name))),
                 Err(error) => Err(error.into()),
             }
         };
@@ -1336,11 +1333,119 @@ impl Sandboxes {
         Ok((sandbox, timings))
     }
 
+    /// Checks create request `req` of `tenant` and takes its egress policy.
+    fn check_create(&self, tenant: &Tenant, req: &mut CreateSandbox) -> Result<Checked, ApiError> {
+        let egress = req.egress.take().unwrap_or_else(Policy::allow_all);
+        let volumes = self.volumes.resolve(&tenant.id, &req.volumes)?;
+        let mut attached = Vec::new();
+        let mut placeholders = BTreeMap::new();
+        for (key, spec) in self.secrets.specs(Some(&tenant.id), &req.secrets)? {
+            let placeholder = ids::placeholder().map_err(ApiError::internal)?;
+            if let Some(var) = &spec.env {
+                if req.env.contains_key(var) || placeholders.contains_key(var) {
+                    return Err(ApiError::invalid(format!(
+                        "{var} is set by both env and secret {:?}",
+                        spec.name
+                    )));
+                }
+                placeholders.insert(var.clone(), placeholder.clone());
+            }
+            attached.push(Attached {
+                name: key,
+                placeholder,
+            });
+        }
+        services::check_env(&req.services, &placeholders)?;
+        let service_ports = services::ports(&req.services)?;
+        let own_env = SandboxEnv {
+            env: req.env.clone(),
+            services: req.services.clone(),
+        };
+        Ok(Checked {
+            egress,
+            volumes,
+            attached,
+            placeholders,
+            service_ports,
+            own_env,
+        })
+    }
+
+    /// Adds persistent sandbox `sandbox` and its start record, within the
+    /// tenant's quota.
+    fn insert_persistent(
+        &self,
+        tenant: &Tenant,
+        sandbox: &db::Sandbox,
+        start: &db::StartRecord,
+    ) -> Result<(), ApiError> {
+        let limit = tenant.quotas.persistent_sandboxes;
+        self.db
+            .insert_persistent(sandbox, start, limit)?
+            .map_err(|r| refused(tenant, r))
+    }
+
+    /// Admits persistent sandbox `req` without starting it: it is written
+    /// cold at generation 0 with its start record, so its first start, on
+    /// any host, claims generation 1. `spec` is the JSON of its template's
+    /// spec, and `build` a build of it, which a host without that build
+    /// makes again from `spec`.
+    pub fn admit_first_start(
+        &self,
+        tenant: &Tenant,
+        mut req: CreateSandbox,
+        spec: String,
+        build: &str,
+        limits: Limits,
+    ) -> Result<(db::Sandbox, db::StartRecord), ApiError> {
+        req.check(tenant.quotas.max_timeout_s(self.settings.max_timeout_s))?;
+        if !req.persistent {
+            return Err(ApiError::internal("only persistent sandboxes start later"));
+        }
+        let Checked {
+            egress,
+            volumes,
+            service_ports,
+            own_env,
+            ..
+        } = self.check_create(tenant, &mut req)?;
+        tenant
+            .quotas
+            .admit_egress(self.meter.month_egress(&tenant.id, now_ms())?)?;
+        let sandbox = db::Sandbox {
+            id: ids::new_id("sbx").map_err(ApiError::internal)?,
+            tenant: tenant.id.clone(),
+            state: state::COLD.into(),
+            template: req.template.unwrap_or_else(|| BASE_TEMPLATE.into()),
+            build: None,
+            labels: req.labels,
+            secrets: req.secrets,
+            egress,
+            created_at: now_ms(),
+            expires_at: i64::MAX,
+            idle_pause_s: req.idle_pause_s.unwrap_or(self.settings.idle_pause_s),
+            paused_at: None,
+            node: None,
+            vcpus: u32::from(limits.vcpus),
+            memory_mib: limits.memory_mib,
+            volumes,
+            persistent: true,
+            generation: 0,
+            cold_starts: 0,
+            last_cold_start_at: None,
+            first_start: true,
+        };
+        let start = self.start_record(&sandbox, build, spec, &own_env, &service_ports)?;
+        self.insert_persistent(tenant, &sandbox, &start)?;
+        Ok((sandbox, start))
+    }
+
     /// What a persistent sandbox starts from again once it is cold.
     fn start_record(
         &self,
         sandbox: &db::Sandbox,
-        ready: &ReadyBuild,
+        build: &str,
+        spec: String,
         env: &SandboxEnv,
         ports: &BTreeMap<u16, Published>,
     ) -> Result<db::StartRecord, ApiError> {
@@ -1353,8 +1458,8 @@ impl Sandboxes {
             sandbox: sandbox.id.clone(),
             tenant: sandbox.tenant.clone(),
             template: sandbox.template.clone(),
-            build: ready.id.clone(),
-            spec: serde_json::to_string(&ready.spec).map_err(ApiError::internal)?,
+            build: build.to_owned(),
+            spec,
             vcpus: sandbox.vcpus,
             memory_mib: sandbox.memory_mib,
             egress: sandbox.egress.clone(),
@@ -1947,17 +2052,33 @@ impl Sandboxes {
         drop(changing);
         let duration_ms = begin.elapsed().as_millis();
         eprintln!("{id} started cold in {duration_ms} ms");
-        self.event(
-            "sandbox.cold_started",
-            origin,
-            &start.tenant,
-            id,
-            json!({
-                "generation": generation,
-                "build": start.build,
-                "duration_ms": u64::try_from(duration_ms).unwrap_or(u64::MAX),
-            }),
-        );
+        let duration_ms = u64::try_from(duration_ms).unwrap_or(u64::MAX);
+        let (kind, data) = if sandbox.first_start {
+            (
+                "sandbox.created",
+                json!({
+                    "template": start.template,
+                    "build": start.build,
+                    "vcpus": start.vcpus,
+                    "memory_mib": start.memory_mib,
+                    "persistent": true,
+                    "idle_pause_s": start.idle_pause_s,
+                    "secrets": start.secrets,
+                    "generation": generation,
+                    "duration_ms": duration_ms,
+                }),
+            )
+        } else {
+            (
+                "sandbox.cold_started",
+                json!({
+                    "generation": generation,
+                    "build": start.build,
+                    "duration_ms": duration_ms,
+                }),
+            )
+        };
+        self.event(kind, origin, &start.tenant, id, data);
         self.watch_services(id, generation, Some(seq));
         if let Some(lost) = lost {
             let (this, id, origin) = (self.clone(), id.to_owned(), origin.clone());
@@ -3592,6 +3713,7 @@ mod tests {
             generation,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         }
     }
 
@@ -3805,6 +3927,7 @@ mod tests {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         };
         // Create: the start record.
         let own = SandboxEnv {

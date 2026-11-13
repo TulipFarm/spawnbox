@@ -19,6 +19,7 @@ use rustls::ClientConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spawn_egress::Policy;
+use spawn_node::firecracker::Limits;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tower::ServiceExt;
@@ -91,6 +92,8 @@ pub struct Primary {
     pub retirer: Retirer,
     pub drain_passes: migrate::DrainPasses,
     failed_builds: FailedBuilds,
+    /// New persistent sandboxes may first start on workers, not only here.
+    pub persistent_anywhere: bool,
     /// Storage keys of the secrets pushed to each node since this primary
     /// started. A node's config sync gets values only for these and the
     /// secrets its sandboxes and templates attach.
@@ -126,6 +129,7 @@ impl Primary {
         dir: &Path,
         sbox: &crate::secretbox::SecretBox,
         egress_ca: EgressCa,
+        persistent_anywhere: bool,
     ) -> Result<Self> {
         let ca = FleetCa::load_or_create(dir, sbox)?;
         let identity = ca.primary_identity(&dir.join("primary"))?;
@@ -143,6 +147,7 @@ impl Primary {
             retirer: Retirer::default(),
             drain_passes: migrate::DrainPasses::default(),
             failed_builds: FailedBuilds::default(),
+            persistent_anywhere,
             pushed: Mutex::default(),
         })
     }
@@ -787,7 +792,9 @@ struct Candidate {
     memory_mib: u32,
 }
 
-/// Hosts that can take a sandbox of template `key`, best first.
+/// Hosts that can take a sandbox of template `key`, best first. `cold`:
+/// the sandbox starts from a start record, so a worker needs a build of the
+/// template's current spec, also for `base`, and warm VMs do not help.
 fn candidates(
     app: &App,
     p: &Primary,
@@ -795,8 +802,9 @@ fn candidates(
     key: &str,
     network: &str,
     need: Option<&Need>,
+    cold: bool,
 ) -> Vec<Candidate> {
-    let wanted = (key != BASE_TEMPLATE)
+    let wanted = (cold || key != BASE_TEMPLATE)
         .then(|| app.db.get_template(key).ok().flatten())
         .flatten()
         .map(|t| super::build_hash(&t.spec));
@@ -842,9 +850,9 @@ fn candidates(
             let near = need.map_or(0.0, |need| 1000.0 * need.gib_on(id) as f64);
             let template = capacity.template(key)?;
             let current = node.is_none()
-                || key == BASE_TEMPLATE
+                || (key == BASE_TEMPLATE && !cold)
                 || wanted.as_deref() == Some(template.spec_sha256.as_str());
-            let warm = capacity.warm_ready(key, network) > 0;
+            let warm = !cold && capacity.warm_ready(key, network) > 0;
             let room = capacity.free_slots.saturating_sub(placing) > 0;
             // A warm VM already holds its memory, but it is not reserved yet.
             let asked = u64::from(template.memory_mib);
@@ -922,6 +930,7 @@ impl Created {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         })
     }
 }
@@ -979,7 +988,7 @@ pub async fn wake_cold(app: &App, id: &str, here: bool) -> Result<(), ApiError> 
                         .and_then(|l| l.capacity.template(&key).cloned())
                         .is_some_and(|t| t.spec_sha256 == wanted)
                 };
-                candidates(app, p, &tenant, &key, network, need.as_ref())
+                candidates(app, p, &tenant, &key, network, need.as_ref(), true)
                     .into_iter()
                     .find(|c| {
                         c.node.as_ref().is_none_or(|n| {
@@ -1165,6 +1174,112 @@ fn certain(failure: &Failure) -> bool {
     }
 }
 
+/// Whether a host with `capacity` can take the first start of a new
+/// persistent sandbox of template `key`, whose current spec hashes to
+/// `wanted`. That build becomes a root the sandbox may use all its life.
+fn takes_first_start(capacity: &Capacity, key: &str, wanted: &str) -> bool {
+    capacity.first_starts
+        && capacity
+            .template(key)
+            .is_some_and(|t| t.spec_sha256 == wanted)
+}
+
+/// Admits persistent sandbox `req` and starts it on the first worker in
+/// `candidates` that has a build of its template's current spec, as a cold
+/// start at generation 1. `None` when this host should create it instead:
+/// it ranks above every such worker, or each one surely did not start it.
+async fn first_start(
+    app: &App,
+    p: &Primary,
+    tenant: &Tenant,
+    req: &CreateSandbox,
+    key: &str,
+    candidates: &[Candidate],
+    need: Option<&Need>,
+) -> Result<Option<Response>, ApiError> {
+    let Some(template) = app.db.get_template(key)? else {
+        return Ok(None);
+    };
+    let wanted = super::build_hash(&template.spec);
+    let workers: Vec<(NodeRow, Limits, String)> = {
+        let live = p.live();
+        candidates
+            .iter()
+            .map_while(|c| c.node.as_ref().map(|node| (node, c)))
+            .filter(|(node, _)| {
+                live.get(&node.id)
+                    .is_some_and(|l| takes_first_start(&l.capacity, key, &wanted))
+                    && !p.failed_builds.recent(&node.id, &wanted)
+            })
+            .map(|(node, c)| {
+                let limits = Limits {
+                    vcpus: c.vcpus,
+                    memory_mib: c.memory_mib,
+                };
+                (node.clone(), limits, c.backend.clone())
+            })
+            .collect()
+    };
+    let Some((_, limits, _)) = workers.first() else {
+        return Ok(None);
+    };
+    let build = app
+        .db
+        .latest_build(key)?
+        .filter(|b| b.state == db::build_state::READY)
+        .map(|b| b.id)
+        .unwrap_or_default();
+    let (sandbox, start) =
+        app.sandboxes
+            .admit_first_start(tenant, req.clone(), template.spec, &build, *limits)?;
+    let id = sandbox.id.clone();
+    let made_volumes = |node: &NodeRow, backend: &str| -> Result<(), ApiError> {
+        for volume in need.iter().flat_map(|n| &n.unplaced) {
+            app.db.set_volume_home(volume, Some(&node.id), backend)?;
+        }
+        Ok(())
+    };
+    for (node, _, backend) in &workers {
+        match start_on(app, p, node, tenant, sandbox.clone(), &start, need).await {
+            Ok(()) => {
+                made_volumes(node, backend)?;
+                return first_started(app, &id).map(Some);
+            }
+            Err(failure) if certain(&failure) => {
+                if let Failure::Refused { error, .. } = &failure
+                    && error.code == Code::BuildFailed
+                {
+                    p.failed_builds.note(&node.id, &wanted);
+                }
+                eprintln!("create {id} on node {}: {:#}", node.id, failure.error());
+            }
+            Err(failure) => {
+                made_volumes(node, backend)?;
+                return Err(ApiError::new(
+                    Code::NodeUnreachable,
+                    format!(
+                        "sandbox {id} may have started on node {}: {:#}; get it to see",
+                        node.id,
+                        failure.error()
+                    ),
+                ));
+            }
+        }
+    }
+    if app.db.delete_unstarted(&id)? {
+        return Ok(None);
+    }
+    first_started(app, &id).map(Some)
+}
+
+/// The create reply for persistent sandbox `id`, started by `first_start`.
+fn first_started(app: &App, id: &str) -> Result<Response, ApiError> {
+    let sandbox = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+    let mut view = crate::server::view(sandbox, None);
+    view.started_from = Some("build");
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
 /// Creates a sandbox on this host or a worker.
 pub async fn create(
     app: &AppState,
@@ -1242,16 +1357,26 @@ async fn place_any(
             need = Some(Need::of(app, &refs)?);
         }
     }
-    let mut candidates = candidates(app, p, &tenant, &key, network, need.as_ref());
+    let candidates = candidates(
+        app,
+        p,
+        &tenant,
+        &key,
+        network,
+        need.as_ref(),
+        req.persistent,
+    );
     if req.persistent {
-        // Persistent sandboxes stay on this host: they cannot move yet.
-        candidates.retain(|c| c.node.is_none());
-        if candidates.is_empty() {
-            if let Some(need) = &need {
-                need.gather(app, p, None).await?;
-            }
-            return crate::server::create_here(Arc::clone(app), tenant, req, origin).await;
+        if p.persistent_anywhere
+            && let Some(created) =
+                first_start(app, p, &tenant, &req, &key, &candidates, need.as_ref()).await?
+        {
+            return Ok(created);
         }
+        if let Some(need) = &need {
+            need.gather(app, p, None).await?;
+        }
+        return crate::server::create_here(Arc::clone(app), tenant, req, origin).await;
     }
     let mut local = Some(req);
     let mut last = None;
@@ -2124,6 +2249,37 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::ReadyTemplate;
+
+    #[test]
+    fn a_first_start_needs_a_build_of_the_current_spec_and_a_new_enough_host() {
+        let host = |first_starts, spec: &str| Capacity {
+            first_starts,
+            templates: vec![ReadyTemplate {
+                key: BASE_TEMPLATE.into(),
+                spec_sha256: spec.into(),
+                vcpus: 1,
+                memory_mib: 512,
+            }],
+            ..Capacity::default()
+        };
+        assert!(takes_first_start(&host(true, "s1"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(true, "s0"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(false, "s1"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(true, "s1"), "py", "s1"));
+    }
+
+    #[test]
+    fn hosts_from_before_first_starts_do_not_take_them() {
+        let old: Capacity = serde_json::from_value(json!({
+            "free_slots": 4,
+            "memory_available_mib": 4096,
+            "templates": [],
+            "warm": [],
+        }))
+        .unwrap();
+        assert!(!old.first_starts);
+    }
 
     #[test]
     fn only_refusals_before_the_start_release_a_claim() {

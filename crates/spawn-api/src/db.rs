@@ -235,6 +235,7 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (tenant, name)
     );",
+    "ALTER TABLE sandboxes ADD COLUMN first_start INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// The same schema for Postgres, as of the last SQLite migration, and its
@@ -483,6 +484,7 @@ const PG_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (tenant, name)
     );"#,
+    "ALTER TABLE sandboxes ADD COLUMN first_start BIGINT NOT NULL DEFAULT 0;",
 ];
 
 pub mod state {
@@ -645,6 +647,10 @@ pub struct Sandbox {
     pub cold_starts: i64,
     #[serde(default)]
     pub last_cold_start_at: Option<i64>,
+    /// Admitted and not started yet: its first start creates it, and is
+    /// not a cold start.
+    #[serde(default)]
+    pub first_start: bool,
 }
 
 /// What starting a persistent sandbox again needs, kept until it ends.
@@ -1076,8 +1082,10 @@ impl Db {
         tx.execute(
             "INSERT INTO sandboxes
              (id, state, template, build, labels, created_at, expires_at, secrets, egress,
-              idle_pause_s, tenant, node, vcpus, memory_mib, volumes, persistent, generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              idle_pause_s, tenant, node, vcpus, memory_mib, volumes, persistent, generation,
+              first_start)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)",
             params![
                 sandbox.id,
                 sandbox.state,
@@ -1096,6 +1104,7 @@ impl Db {
                 volumes_json(&sandbox.volumes),
                 i64::from(sandbox.persistent),
                 sandbox.generation,
+                i64::from(sandbox.first_start),
             ],
         )?;
         if let Some((start, _)) = start {
@@ -1340,15 +1349,35 @@ impl Db {
         now: i64,
     ) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE sandboxes
-             SET state = 'running', claim = NULL, claim_deadline = NULL,
-                 cold_starts = cold_starts + 1, last_cold_start_at = ?4, paused_at = NULL,
-                 saved_state = NULL
-             WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
-               AND node IS NOT DISTINCT FROM ?5",
+            &format!(
+                "UPDATE sandboxes
+                 SET state = 'running', claim = NULL, claim_deadline = NULL, paused_at = NULL,
+                     saved_state = NULL, {FINISH_START}
+                 WHERE id = ?1 AND generation = ?2 AND claim = ?3 AND state = 'starting'
+                   AND node IS NOT DISTINCT FROM ?5"
+            ),
             params![id, generation, claim, now, node],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Deletes persistent sandbox `id` and its start record if it was
+    /// admitted, is cold and never started. `false` if a start claimed it,
+    /// it started or it is gone.
+    pub fn delete_unstarted(&self, id: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM sandboxes
+             WHERE id = ?1 AND persistent = 1 AND first_start = 1 AND state = 'cold'
+               AND node IS NULL",
+            [id],
+        )?;
+        if deleted > 0 {
+            tx.execute("DELETE FROM start_records WHERE sandbox = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
     }
 
     /// Gives up a claim: the sandbox is cold again, and this host's.
@@ -3023,10 +3052,11 @@ impl Db {
             });
             if let Some(runs) = runs {
                 tx.execute(
-                    "UPDATE sandboxes
-                     SET state = ?3, claim = NULL, claim_deadline = NULL,
-                         cold_starts = cold_starts + 1, last_cold_start_at = ?4
-                     WHERE id = ?1 AND node = ?2 AND state = 'starting'",
+                    &format!(
+                        "UPDATE sandboxes
+                         SET state = ?3, claim = NULL, claim_deadline = NULL, {FINISH_START}
+                         WHERE id = ?1 AND node = ?2 AND state = 'starting'"
+                    ),
                     params![id, node, runs, now],
                 )?;
             } else {
@@ -3547,10 +3577,17 @@ fn to_json(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// What a finished start sets, with the time as `?4`. A first start
+/// creates the sandbox and is not a cold start. Its time still keeps
+/// `cool_missing` from cooling it on an older report.
+const FINISH_START: &str = "first_start = 0,
+    created_at = CASE WHEN first_start = 1 THEN ?4 ELSE created_at END,
+    cold_starts = cold_starts + CASE WHEN first_start = 0 THEN 1 ELSE 0 END,
+    last_cold_start_at = CASE WHEN first_start = 0 THEN ?4 ELSE last_cold_start_at END";
 const SANDBOX_COLUMNS: &str = "id, state, template, labels, created_at, expires_at, build, \
     secrets, egress, idle_pause_s, paused_at, tenant, node, vcpus, memory_mib, volumes, \
-    persistent, generation, cold_starts, last_cold_start_at";
-const SANDBOX_COLUMN_COUNT: usize = 20;
+    persistent, generation, cold_starts, last_cold_start_at, first_start";
+const SANDBOX_COLUMN_COUNT: usize = 21;
 const VOLUME_COLUMNS: &str = "id, tenant, name, size_gib, node, backend, created_at";
 const ENDPOINT_COLUMNS: &str = "tenant, name, sandbox, port, generation, created_at, updated_at";
 const KEY_COLUMNS: &str = "id, tenant, scopes, name, created_at, revoked_at";
@@ -3682,6 +3719,7 @@ fn sandbox_from_row(row: &Row) -> Result<Sandbox> {
         generation: row.get(17)?,
         cold_starts: row.get(18)?,
         last_cold_start_at: row.get(19)?,
+        first_start: row.get::<_, i64>(20)? != 0,
     })
 }
 
@@ -3792,6 +3830,7 @@ mod tests {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         }
     }
 
@@ -3948,6 +3987,164 @@ mod tests {
         assert_eq!(db.get_sandbox("a").unwrap().unwrap().state, state::DELETED);
         assert_eq!(db.get_start_record("a").unwrap(), None);
         assert!(!db.delete_cold("a", 62).unwrap());
+    }
+
+    #[test]
+    fn an_admitted_sandbox_starts_first_at_generation_1_and_is_not_a_cold_start() {
+        let db = Db::memory().unwrap();
+        let admitted = Sandbox {
+            generation: 0,
+            first_start: true,
+            ..persistent("a", state::COLD)
+        };
+        db.insert_persistent(&admitted, &start_record("a", "b1"), Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.claim_cold("a", Some("nod_w"), "c1", 100).unwrap(),
+            Some(1)
+        );
+        assert!(
+            db.finish_cold_start("a", Some("nod_w"), 1, "c1", 50)
+                .unwrap()
+        );
+        let a = db.get_sandbox("a").unwrap().unwrap();
+        assert_eq!(
+            (
+                a.state.as_str(),
+                a.node.as_deref(),
+                a.generation,
+                a.cold_starts,
+                a.last_cold_start_at,
+                a.created_at
+            ),
+            (state::RUNNING, Some("nod_w"), 1, 0, None, 50)
+        );
+
+        assert!(db.cool_on_node("a", "nod_w", 1).unwrap());
+        assert_eq!(db.claim_cold("a", None, "c2", 100).unwrap(), Some(2));
+        assert!(db.finish_cold_start("a", None, 2, "c2", 70).unwrap());
+        let a = db.get_sandbox("a").unwrap().unwrap();
+        assert_eq!(
+            (a.generation, a.cold_starts, a.last_cold_start_at),
+            (2, 1, Some(70))
+        );
+    }
+
+    #[test]
+    fn a_first_start_settled_from_a_report_is_not_a_cold_start() {
+        let db = Db::memory().unwrap();
+        let admitted = Sandbox {
+            generation: 0,
+            first_start: true,
+            ..persistent("a", state::COLD)
+        };
+        db.insert_persistent(&admitted, &start_record("a", "b1"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.claim_cold("a", Some("nod_w"), "c1", 10).unwrap(),
+            Some(1)
+        );
+        let cooled = db
+            .settle_claims("nod_w", &[("a", 1, state::RUNNING)], 20)
+            .unwrap();
+        assert!(cooled.is_empty());
+        let a = db.get_sandbox("a").unwrap().unwrap();
+        assert_eq!(
+            (a.state.as_str(), a.generation, a.cold_starts, a.first_start),
+            (state::RUNNING, 1, 0, false)
+        );
+
+        // The worker was lost during the first start: it is cold, kept,
+        // and its next start is still its first.
+        let b = Sandbox {
+            generation: 0,
+            first_start: true,
+            ..persistent("b", state::COLD)
+        };
+        db.insert_persistent(&b, &start_record("b", "b1"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.claim_cold("b", Some("nod_w"), "c1", 10).unwrap(),
+            Some(1)
+        );
+        let cooled = db.settle_claims("nod_w", &[], 20).unwrap();
+        assert_eq!(cooled, vec![("b".to_owned(), "default".to_owned())]);
+        let b = db.get_sandbox("b").unwrap().unwrap();
+        assert_eq!(
+            (b.state.as_str(), b.node, b.generation, b.first_start),
+            (state::COLD, None, 1, true)
+        );
+        assert!(db.get_start_record("b").unwrap().is_some());
+        assert_eq!(db.claim_cold("b", None, "c2", 100).unwrap(), Some(2));
+        assert!(db.finish_cold_start("b", None, 2, "c2", 30).unwrap());
+        let b = db.get_sandbox("b").unwrap().unwrap();
+        assert_eq!(
+            (
+                b.generation,
+                b.cold_starts,
+                b.last_cold_start_at,
+                b.first_start
+            ),
+            (2, 0, None, false)
+        );
+    }
+
+    #[test]
+    fn only_an_unstarted_admitted_sandbox_is_deleted_and_frees_its_quota() {
+        let db = Db::memory().unwrap();
+        let admitted = |id: &str| Sandbox {
+            generation: 0,
+            first_start: true,
+            ..persistent(id, state::COLD)
+        };
+        db.insert_persistent(&admitted("a"), &start_record("a", "b1"), Some(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            db.insert_persistent(&admitted("b"), &start_record("b", "b1"), Some(1))
+                .unwrap(),
+            Err(Refused::Persistent(1))
+        ));
+        assert!(db.delete_unstarted("a").unwrap());
+        assert_eq!(db.get_sandbox("a").unwrap(), None);
+        assert_eq!(db.get_start_record("a").unwrap(), None);
+        assert!(!db.delete_unstarted("a").unwrap());
+        db.insert_persistent(&admitted("b"), &start_record("b", "b1"), Some(1))
+            .unwrap()
+            .unwrap();
+
+        // A claim sent to a worker has an unknown outcome: the row stays.
+        assert_eq!(
+            db.claim_cold("b", Some("nod_w"), "c1", 100).unwrap(),
+            Some(1)
+        );
+        assert!(!db.delete_unstarted("b").unwrap());
+        // Given up for sure, it never started: it can go.
+        assert!(db.abandon_claim("b", Some("nod_w"), 1, "c1").unwrap());
+        assert!(db.delete_unstarted("b").unwrap());
+        assert_eq!(db.get_start_record("b").unwrap(), None);
+
+        // Once it ran, it is not deleted this way.
+        db.insert_persistent(&admitted("d"), &start_record("d", "b1"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.claim_cold("d", None, "c1", 100).unwrap(), Some(1));
+        assert!(db.finish_cold_start("d", None, 1, "c1", 50).unwrap());
+        assert!(db.set_cold("d", 1).unwrap());
+        assert!(!db.delete_unstarted("d").unwrap());
+
+        // A sandbox created and started here is never deleted this way.
+        db.insert_persistent(
+            &persistent("c", state::COLD),
+            &start_record("c", "b1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!db.delete_unstarted("c").unwrap());
     }
 
     #[test]

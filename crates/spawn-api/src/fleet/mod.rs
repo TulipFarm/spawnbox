@@ -105,6 +105,10 @@ pub struct Capacity {
     /// `firecracker` or `gvisor`.
     #[serde(default)]
     pub backend: String,
+    /// The host takes the first start of a new persistent sandbox. False
+    /// from older hosts.
+    #[serde(default)]
+    pub first_starts: bool,
 }
 
 impl Capacity {
@@ -368,6 +372,7 @@ pub fn local_capacity(app: &App) -> Capacity {
         fingerprint: app.templates.fingerprint().to_owned(),
         cpu: app.templates.cpu().to_owned(),
         backend: app.templates.backend().name().to_owned(),
+        first_starts: true,
     }
 }
 

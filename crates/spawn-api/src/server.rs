@@ -112,6 +112,16 @@ enum PinArg {
     Off,
 }
 
+/// Which hosts a new persistent sandbox may first start on.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PersistentPlacementArg {
+    /// The primary.
+    Primary,
+    /// Any ready worker with a build of the template's current spec, or
+    /// the primary.
+    Any,
+}
+
 /// How Firecracker does disk IO.
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum DiskIoEngineArg {
@@ -207,6 +217,12 @@ pub struct Args {
     /// elsewhere.
     #[arg(long, default_value_t = 30)]
     fence_margin_s: u64,
+    /// Primary: where a new persistent sandbox first starts. `any` starts
+    /// it on the best ready worker that has a build of its template's
+    /// current spec and runs a version that can, or here. Upgrade the
+    /// workers first.
+    #[arg(long, value_enum, default_value_t = PersistentPlacementArg::Primary)]
+    persistent_placement: PersistentPlacementArg,
     /// Host port the egress proxy listens on. Only sandboxes can reach it.
     #[arg(long, default_value_t = 15_001)]
     egress_port: u16,
@@ -722,8 +738,13 @@ async fn run(
     } else if args.fleet_listen.is_some() {
         let (cert_pem, key_pem) = secrets::egress_ca_pem(data, &sbox)?;
         Role::Primary(Arc::new(
-            Primary::new(&data.join("fleet"), &sbox, EgressCa { cert_pem, key_pem })
-                .context("load the fleet CA")?,
+            Primary::new(
+                &data.join("fleet"),
+                &sbox,
+                EgressCa { cert_pem, key_pem },
+                matches!(args.persistent_placement, PersistentPlacementArg::Any),
+            )
+            .context("load the fleet CA")?,
         ))
     } else {
         Role::Single
@@ -1771,7 +1792,7 @@ pub fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| ApiError::invalid(format!("request body: {e}")))
 }
 
-fn view(sandbox: db::Sandbox, timings_ms: Option<Timings>) -> SandboxView {
+pub fn view(sandbox: db::Sandbox, timings_ms: Option<Timings>) -> SandboxView {
     let paused = sandbox.state == state::PAUSED;
     let expires = !paused && !sandbox.persistent;
     SandboxView {
@@ -1829,7 +1850,7 @@ async fn create(
         if req.persistent && matches!(app.role, Role::Worker(_)) {
             return Err(ApiError::new(
                 Code::Conflict,
-                "persistent sandboxes run on the primary only",
+                "persistent sandboxes are created through the primary",
             ));
         }
         create_here(app, tenant, req, origin).await

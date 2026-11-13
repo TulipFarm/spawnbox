@@ -2392,6 +2392,7 @@ mod tests {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         };
         let start = db::StartRecord {
             sandbox: id.into(),
