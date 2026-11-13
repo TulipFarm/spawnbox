@@ -23,6 +23,8 @@ pub enum Access {
     Token,
     /// Needs the API key in `Authorization`.
     Private,
+    /// Only the forward listener reaches it; previews answer `404`.
+    Gateway,
 }
 
 /// `POST /v1/sandboxes/{id}/ports`

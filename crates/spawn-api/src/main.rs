@@ -27,6 +27,8 @@ mod egress;
 #[cfg(target_os = "linux")]
 mod fleet;
 #[cfg(target_os = "linux")]
+mod gateway;
+#[cfg(target_os = "linux")]
 mod hub;
 #[cfg(target_os = "linux")]
 mod otlp;

@@ -29,10 +29,14 @@ pub enum Scope {
     AuditRead,
     #[serde(rename = "usage:read")]
     UsageRead,
+    /// Send requests to sandbox ports through the forward listener. Grants
+    /// no other API call.
+    #[serde(rename = "sandboxes:forward")]
+    SandboxesForward,
 }
 
 impl Scope {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::SandboxesRead,
         Self::SandboxesWrite,
         Self::TemplatesWrite,
@@ -40,6 +44,7 @@ impl Scope {
         Self::TenantsAdmin,
         Self::AuditRead,
         Self::UsageRead,
+        Self::SandboxesForward,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -51,6 +56,7 @@ impl Scope {
             Self::TenantsAdmin => "tenants:admin",
             Self::AuditRead => "audit:read",
             Self::UsageRead => "usage:read",
+            Self::SandboxesForward => "sandboxes:forward",
         }
     }
 

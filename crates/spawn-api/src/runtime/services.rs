@@ -133,7 +133,7 @@ pub(super) fn ports(services: &[Service]) -> Result<BTreeMap<u16, Published>, Ap
                     i64::try_from(ports::DEFAULT_TOKEN_TTL_S * 1000).unwrap_or(i64::MAX),
                 ),
             )),
-            Access::Public | Access::Private => None,
+            Access::Public | Access::Private | Access::Gateway => None,
         };
         published.insert(port, Published { access, token });
     }
