@@ -47,6 +47,19 @@ pub struct Host {
     pub ksm: bool,
     /// Keeps each vCPU on one host CPU; see `CpuPins`.
     pub pins: Option<Arc<CpuPins>>,
+    /// How Firecracker does disk IO for drives it boots with. Snapshots
+    /// keep the engine of the VM they were taken from.
+    pub io_engine: IoEngine,
+}
+
+/// Firecracker's block device IO engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoEngine {
+    /// Blocking reads and writes.
+    Sync,
+    /// io_uring. Needs Linux 5.10.51 or later; upstream calls it a
+    /// developer preview.
+    Async,
 }
 
 /// Gives each VM its own host CPUs, least used first. A VM's vCPUs share

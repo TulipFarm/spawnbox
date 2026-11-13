@@ -656,16 +656,16 @@ impl Node {
             drives.push(("layer".to_owned(), "/layer.ext4".to_owned(), true));
         }
         for (id, path, read_only) in drives {
-            vm.put(
-                &format!("/drives/{id}"),
-                json!({
-                    "drive_id": id,
-                    "path_on_host": path,
-                    "is_root_device": id == "rootfs",
-                    "is_read_only": read_only,
-                }),
-            )
-            .await?;
+            let mut drive = json!({
+                "drive_id": id,
+                "path_on_host": path,
+                "is_root_device": id == "rootfs",
+                "is_read_only": read_only,
+            });
+            if self.host.io_engine == firecracker::IoEngine::Async {
+                drive["io_engine"] = json!("Async");
+            }
+            vm.put(&format!("/drives/{id}"), drive).await?;
         }
         vm.put(
             "/machine-config",

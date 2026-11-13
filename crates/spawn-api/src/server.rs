@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use spawn_egress::{Activity, Ca, Egress, Policy, SecretStore};
-use spawn_node::firecracker::{CpuPins, Host};
+use spawn_node::firecracker::{CpuPins, Host, IoEngine};
 use spawn_node::gvisor::Runsc;
 use spawn_node::net::{self, HostNet};
 use spawn_node::{Backend, Node, absolute};
@@ -110,6 +110,16 @@ enum PinArg {
     Auto,
     On,
     Off,
+}
+
+/// How Firecracker does disk IO.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DiskIoEngineArg {
+    /// Blocking reads and writes.
+    Sync,
+    /// io_uring. Needs Linux 5.10.51 or later. Firecracker calls it a
+    /// developer preview.
+    Async,
 }
 
 #[derive(clap::Args)]
@@ -284,6 +294,14 @@ pub struct Args {
     /// virtualization they can also crash once many VMs share each CPU.
     #[arg(long, value_enum, default_value_t = PinArg::On)]
     pin_vcpus: PinArg,
+    /// Firecracker's disk IO engine. `async` uses io_uring, which needs
+    /// Linux 5.10.51 or later and which Firecracker calls a developer
+    /// preview. Snapshots keep the engine they were taken with, so turning
+    /// it on or off makes all builds outdated: templates are built again,
+    /// and snapshot templates can no longer be used. Paused sandboxes keep
+    /// their engine.
+    #[arg(long, value_enum, default_value_t = DiskIoEngineArg::Sync)]
+    disk_io_engine: DiskIoEngineArg,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
@@ -562,6 +580,10 @@ pub async fn serve(args: Args) -> Result<()> {
         logs: data.join("logs"),
         ksm: args.ksm,
         pins: None,
+        io_engine: match args.disk_io_engine {
+            DiskIoEngineArg::Sync => IoEngine::Sync,
+            DiskIoEngineArg::Async => IoEngine::Async,
+        },
     };
     let (runsc, inputs) = match backend {
         Backend::Firecracker => {

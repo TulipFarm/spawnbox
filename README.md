@@ -812,7 +812,7 @@ it can lack its build, for example after a leader failover. So:
   sandbox then starts from that build from now on, and the event
   `sandbox.rebuilt` shows `from_build`, `to_build` and the `reason`:
   `missing` (no host file and not in the store), `outdated` (made with
-  another kernel, base disk or runtime) or `guest_too_old`.
+  another kernel, base disk, runtime or disk IO engine) or `guest_too_old`.
 - Cold starts on one host that need the same spec wait for one build.
   On the primary, the call waits up to 60 seconds for it. When the
   sandbox starts on a worker, the call does not wait. In both cases, the
@@ -2176,7 +2176,7 @@ deleted. The files of `outdated` and `removed` builds are deleted.
   `min_warm`, Spawnbox does not start a new build.
 - If a template has no ready build, a create request gives `409`.
 - Builds stay after a restart. Spawnbox builds again only when the kernel,
-  base disk or Firecracker version changes.
+  base disk, Firecracker version or `--disk-io-engine` changes.
 - Spawnbox runs a maximum of `--max-builds` builds at the same time.
 
 ### Services
@@ -2561,6 +2561,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--memory-pressure-pct` | 10 | Pause idle sandboxes to disk and refuse new ones when free host memory is below this percent, or processes wait for memory (PSI) this percent of the time. `0` turns it off. |
 | `--ksm` | off | Let the kernel merge equal memory pages across Firecracker VMs. Saves memory when sandboxes run the same programs, but a sandbox can learn what another holds by timing its writes. Use it only when all sandboxes trust each other. Needs Linux 6.7 or later. |
 | `--pin-vcpus` | `on` | Keep each Firecracker vCPU on one host CPU. A VM's vCPUs share one L3 cache while it has free CPUs, and VMs go to the least used L3 caches, so they do not share a link to memory. Firecracker's disk and network threads run on any CPU. vCPUs that move between CPUs lose their caches: on a 96-core bare-metal host, a Node.js allocation benchmark took 25 to 45% longer unpinned. Under nested virtualization they can also crash (`KVM_EXIT_FAIL_ENTRY` in the sandbox log) once many VMs share each CPU. One L3 has one link to memory, so a VM's memory bandwidth is that of one L3 (on the same host, STREAM fell from about 140 to 53 GB/s). `auto` pins only when the host is itself a VM; `off` never pins, which lets the kernel spread a VM over L3 caches and move busy vCPUs to idle CPUs. |
+| `--disk-io-engine` | `sync` | Firecracker's disk IO engine. `async` is opt-in and uses Firecracker's io_uring engine, which Firecracker marks as a developer preview. It needs Linux 5.10.51 or later. Snapshots keep the engine they were made with, so a change makes all builds outdated: Spawnbox builds the templates again at the next start, and snapshot templates can no longer be used. Paused sandboxes keep their engine. |
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
 | `--paused-retention-s` | 604800 | Delete paused sandboxes after this time. Persistent sandboxes are kept. |
 | `--shutdown-pause-s` | 30 | On SIGTERM, time for running persistent sandboxes to pause. The ones that do not pause in this time stop and become `cold`. |
