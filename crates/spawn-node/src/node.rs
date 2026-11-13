@@ -629,8 +629,15 @@ impl Node {
 
         // The kernel brings up eth0 with the fixed guest address.
         let ip = format!("ip={GUEST_IP}::{GATEWAY_IP}:255.255.255.252::eth0:off");
+        // haltpoll polls briefly before an idle vCPU halts, so a wakeup
+        // does not wait for the host to reschedule it. Linux turns it on
+        // only for hosts that mark vCPUs as dedicated, which Firecracker
+        // does not. Huge pages for every program make memory heavy work,
+        // such as JavaScript garbage collection, a little faster.
         let boot_args = format!(
-            "console=ttyS0 reboot=k panic=1 ro {ip} ipv6.disable=1 init=/usr/local/bin/spawn-guest"
+            "console=ttyS0 reboot=k panic=1 ro {ip} ipv6.disable=1 \
+             cpuidle_haltpoll.force=1 transparent_hugepage=always \
+             init=/usr/local/bin/spawn-guest"
         );
         vm.put(
             "/boot-source",
