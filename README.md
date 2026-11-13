@@ -1936,8 +1936,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 | `wake_busy` | 503 | Yes | Forward listener only: the host wakes too many sandboxes now. The response has `Retry-After: 5`. |
 | `too_many_requests` | 503 | Yes | Forward listener only: the sandbox has too many requests in flight. The response has `Retry-After: 1`. |
 | `not_ready` | 503 | Yes | Forward listener only: the service on the port is not healthy after 30 s. |
-| `upstream_timeout` | 504 | Yes | Forward listener only: the wake or the app took too long. |
-| `upstream_unreachable` | 502 | Yes | Forward listener only: nothing answers on the port in the sandbox. |
+| `upstream_timeout` | 504 | No | Forward listener only: the wake or the app took too long. |
+| `upstream_unreachable` | 502 | No | Forward listener only: nothing answers on the port in the sandbox. |
 | `internal` | 500 | Yes | An unexpected error. The server log has the cause with the `request_id`. |
 
 `retryable` in the response has the same value. Repeat a retryable call
