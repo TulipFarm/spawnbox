@@ -1014,6 +1014,9 @@ Prometheus adds the `instance` label.
 | `spawnbox_leader_term` (gauge) | `holder` (this host's ID) | The term of the database lease this server holds as the primary. Only the leader shows it. It goes up each time a primary takes the lease: at a failover, and when the same primary restarts. A new `holder` means another host took over. |
 | `spawnbox_data_dir_available_bytes`, `spawnbox_data_dir_size_bytes` (gauges) | None | Free space and size of the file system of `--data-dir` |
 | `spawnbox_start_time_seconds` (gauge) | None | When this server process started, in seconds since the Unix epoch. It changes at each restart. |
+| `spawnbox_forward_requests_total` (counter) | `code` (`ok` or an error code) | Requests on the forward listener, by result |
+| `spawnbox_forward_wakes_total` (counter) | None | Sandboxes that the forward listener woke |
+| `spawnbox_forward_wake_wait_seconds` (histogram) | None | Time that forwarded requests waited for a wake |
 
 [`deploy/prometheus/spawnbox-alerts.yml`](deploy/prometheus/spawnbox-alerts.yml)
 has alert rules for these metrics. Each alert is described, with its likely
@@ -1928,6 +1931,13 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 | `volume_unavailable` | 503 | Yes | The only copy of a volume is on a host that cannot be reached. |
 | `rebuilding` | 503 | Yes | A build that the sandbox needs is being made. |
 | `sandbox_cold` | 503 | Yes | A worker stopped the sandbox, and the primary starts it again. |
+| `stale_route` | 409 | Yes | Forward listener only: the sandbox moved or started again on another host. |
+| `sandbox_paused` | 503 | No | Forward listener only: the sandbox is paused and `X-Spawnbox-Wake: never` was set. |
+| `wake_busy` | 503 | Yes | Forward listener only: the host wakes too many sandboxes now. The response has `Retry-After: 5`. |
+| `too_many_requests` | 503 | Yes | Forward listener only: the sandbox has too many requests in flight. The response has `Retry-After: 1`. |
+| `not_ready` | 503 | Yes | Forward listener only: the service on the port is not healthy after 30 s. |
+| `upstream_timeout` | 504 | Yes | Forward listener only: the wake or the app took too long. |
+| `upstream_unreachable` | 502 | Yes | Forward listener only: nothing answers on the port in the sandbox. |
 | `internal` | 500 | Yes | An unexpected error. The server log has the cause with the `request_id`. |
 
 `retryable` in the response has the same value. Repeat a retryable call
@@ -2226,7 +2236,7 @@ deleted. The files of `outdated` and `removed` builds are deleted.
   Fields: `port`, `access`, `ttl_s`.
 - `GET` lists the published ports.
 - `DELETE /v1/sandboxes/{id}/ports/{port}` removes a published port.
-- `access` has three values:
+- `access` has four values:
   - `token` (default): the URL contains a token. The token stops after
     `ttl_s` (default 24 hours). At the first visit, it becomes a cookie.
   - `public`: all persons with the URL can open it.
@@ -2234,6 +2244,8 @@ deleted. The files of `outdated` and `removed` builds are deleted.
     a `preview` session token for the port. Add the token to the URL as
     `?spawnbox_session=<token>`. At the first visit, it becomes a cookie.
     Spawnbox removes this cookie before the request goes to the app.
+  - `gateway`: the port has no preview URL. Only the
+    [forward listener](#forward-requests-from-a-gateway) can reach it.
 - For each `access`, Spawnbox removes these from a request before it goes
   to the app: the `spawnbox_session` and `spawnbox_preview` cookies, the
   `spawnbox_session` query parameter, and an `Authorization` header with a
@@ -2246,6 +2258,55 @@ deleted. The files of `outdated` and `removed` builds are deleted.
 - HTTP/1.1 and WebSockets are supported.
 - A request to the port of a service waits up to 30 s until the service
   is healthy. Then it gives `503`.
+
+### Forward requests from a gateway
+
+Use the forward listener when your own HTTP gateway or load balancer
+sends traffic to sandbox ports. The gateway owns the host names, TLS for
+users and its own logins. Spawnbox wakes the sandbox and sends the
+request to the port.
+
+- Start it with `--forward-listen ADDR`. Add `--forward-tls-cert` and
+  `--forward-tls-key` for TLS. Put the listener on a private network. Only
+  your gateway must reach it.
+- Make a key with only the `sandboxes:forward` scope for the gateway. This
+  key cannot call the other APIs. A tenant key reaches only the sandboxes
+  of its tenant. A revoked key stops working within 5 s.
+- Publish the port first, with `POST /v1/sandboxes/{id}/ports`. Use
+  `access: gateway` if the port must not have a preview URL. The listener
+  forwards to a published port of each `access`.
+- The gateway sends the original request, with these headers:
+
+  | Header | Required | Meaning |
+  | --- | --- | --- |
+  | `X-Spawnbox-Key` | Yes | The API key |
+  | `X-Spawnbox-Target` | Yes | `sbx_ID:PORT` |
+  | `X-Spawnbox-Wake` | No | `any` (default) resumes a paused sandbox and starts a cold one. `paused` only resumes. `never` wakes nothing. |
+  | `X-Spawnbox-Timeout-Ms` | No | How long to wait for the response headers of the app. Default 60000, at most `--forward-max-response-s`. |
+
+- Spawnbox removes all `X-Spawnbox-*` headers before the request goes to
+  the app, and from the response of the app. Other headers, the path, the
+  query and the body go to the app without change.
+- The response has `X-Spawnbox-Sandbox` and `X-Spawnbox-Generation`. The
+  generation goes up each time the sandbox starts on a host.
+- If Spawnbox refuses the request, the body is a normal
+  [error](#errors) and the response has `X-Spawnbox-Error` with the code.
+  A response without this header comes from the app.
+- Limits:
+  - `--forward-max-wakes` (default 8): wakes that run at once on a host.
+    A request waits up to `--forward-wake-queue-s` (default 10) for a
+    slot, then gets `503 wake_busy`.
+  - `--forward-max-in-flight` (default 1024): requests and WebSockets in
+    flight for one sandbox. More get `503 too_many_requests`.
+  - A wake can take up to 60 s. Then the request gets
+    `504 upstream_timeout`.
+  - A request to the port of a service waits up to 30 s until the service
+    is healthy. Then it gives `503 not_ready`.
+- HTTP/1.1 and WebSockets are supported.
+- In a fleet, the forward listener runs on the primary and on edges (with
+  the same flags). It sends each request to the host of the sandbox. If
+  the sandbox moved, the request is sent again once, when its body is at
+  most 1 MiB.
 
 ### Network access (egress)
 
@@ -2369,9 +2430,9 @@ deleted. The files of `outdated` and `removed` builds are deleted.
 - `POST /v1/keys` creates a key. Fields: `tenant`, `scopes`, `name`.
   Spawnbox shows the key only in this response.
 - `GET /v1/keys` lists keys. `DELETE /v1/keys/{id}` cancels a key.
-- Scopes: `sandboxes:read`, `sandboxes:write`, `templates:write`,
-  `secrets:write`, `tenants:admin` (only org keys), `audit:read`,
-  `usage:read`. A key without a scope list gets all the scopes that its
+- Scopes: `sandboxes:read`, `sandboxes:write`, `sandboxes:forward`,
+  `templates:write`, `secrets:write`, `tenants:admin` (only org keys),
+  `audit:read`, `usage:read`. A key without a scope list gets all the scopes that its
   type allows.
 - A template or secret is for all tenants, or only for one tenant
   (`?tenant=`). If two have the same name, the tenant's own one wins.
