@@ -278,10 +278,11 @@ pub struct Args {
     /// by timing; use it only when all sandboxes trust each other.
     #[arg(long)]
     ksm: bool,
-    /// Keeps each Firecracker vCPU on one host CPU, spreading VMs over the
-    /// CPUs. Under nested virtualization, VMs whose vCPUs move between
-    /// CPUs can crash once many share each CPU.
-    #[arg(long, value_enum, default_value_t = PinArg::Auto)]
+    /// Keeps each Firecracker vCPU on one host CPU, a VM's vCPUs on one L3
+    /// cache, and VMs on the least used L3 caches. vCPUs that move between CPUs lose their caches, which made
+    /// guest work take up to 45% longer on a bare-metal host. Under nested
+    /// virtualization they can also crash once many VMs share each CPU.
+    #[arg(long, value_enum, default_value_t = PinArg::On)]
     pin_vcpus: PinArg,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
