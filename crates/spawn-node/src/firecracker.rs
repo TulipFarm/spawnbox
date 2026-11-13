@@ -49,15 +49,29 @@ pub struct Host {
     pub pins: Option<Arc<CpuPins>>,
 }
 
-/// Gives each VM its own host CPUs, least used first. A vCPU that moves
-/// between host CPUs loses its caches and runs slower. Under nested
+/// Gives each VM its own host CPUs, least used first. A VM's vCPUs share
+/// one L3 cache while it has free CPUs, since vCPUs that work together
+/// (for example a garbage collector's threads) are much slower across L3
+/// caches. Different VMs go to the least used L3 caches, since CPUs that
+/// share an L3 also share its link to memory. A vCPU that moves between
+/// host CPUs loses its caches and runs slower. Under nested
 /// virtualization (a cloud VM running Firecracker) a vCPU that moves
 /// between host CPUs can fail to enter the guest (`KVM_EXIT_FAIL_ENTRY`)
 /// once many VMs share each CPU, and Firecracker exits. A vCPU that stays
 /// on one CPU does not.
 pub struct CpuPins {
-    /// How many vCPUs are pinned to each CPU, by CPU number.
-    used: Mutex<Vec<(usize, u32)>>,
+    used: Mutex<Vec<CpuSlot>>,
+    /// The CPUs this process may run on. Firecracker's other threads, which
+    /// emulate disks and the network, run on any of them.
+    all: nix::sched::CpuSet,
+}
+
+struct CpuSlot {
+    cpu: usize,
+    /// Which L3 cache the CPU uses.
+    l3: usize,
+    /// How many vCPUs are pinned to it.
+    vcpus: u32,
 }
 
 impl CpuPins {
@@ -67,13 +81,18 @@ impl CpuPins {
             .context("read CPU affinity")?;
         let used: Vec<_> = (0..nix::sched::CpuSet::count())
             .filter(|&cpu| allowed.is_set(cpu).unwrap_or(false))
-            .map(|cpu| (cpu, 0))
+            .map(|cpu| CpuSlot {
+                cpu,
+                l3: l3_of(cpu).unwrap_or(cpu),
+                vcpus: 0,
+            })
             .collect();
         if used.is_empty() {
             bail!("no CPUs to pin vCPUs to");
         }
         Ok(Self {
             used: Mutex::new(used),
+            all: allowed,
         })
     }
 
@@ -91,19 +110,33 @@ impl CpuPins {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         let mut cpus = Vec::new();
         for _ in 0..vcpus.max(1) {
-            let fresh = used
-                .iter_mut()
-                .filter(|(cpu, _)| !cpus.contains(cpu))
-                .min_by_key(|(cpu, count)| (*count, *cpu));
-            let (cpu, count) = match fresh {
-                Some(slot) => slot,
-                None => used
-                    .iter_mut()
-                    .min_by_key(|(cpu, count)| (*count, *cpu))
-                    .expect("not empty"),
+            let mut l3_load = std::collections::HashMap::<usize, u32>::new();
+            for slot in used.iter() {
+                *l3_load.entry(slot.l3).or_default() += slot.vcpus;
+            }
+            let mine: Vec<_> = used
+                .iter()
+                .filter(|slot| cpus.contains(&slot.cpu))
+                .map(|slot| slot.l3)
+                .collect();
+            let key = |slot: &CpuSlot| {
+                (
+                    slot.vcpus,
+                    !mine.contains(&slot.l3),
+                    l3_load[&slot.l3],
+                    slot.cpu,
+                )
             };
-            *count += 1;
-            cpus.push(*cpu);
+            let best = used
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| !cpus.contains(&slot.cpu))
+                .min_by_key(|(_, slot)| key(slot))
+                .or_else(|| used.iter().enumerate().min_by_key(|(_, slot)| key(slot)))
+                .map(|(i, _)| i)
+                .expect("not empty");
+            used[best].vcpus += 1;
+            cpus.push(used[best].cpu);
         }
         CpuLease {
             pins: Arc::clone(self),
@@ -132,11 +165,27 @@ impl Drop for CpuLease {
     fn drop(&mut self) {
         let mut used = self.pins.used.lock().unwrap_or_else(|e| e.into_inner());
         for cpu in &self.cpus {
-            if let Some((_, count)) = used.iter_mut().find(|(c, _)| c == cpu) {
-                *count = count.saturating_sub(1);
+            if let Some(slot) = used.iter_mut().find(|slot| slot.cpu == *cpu) {
+                slot.vcpus = slot.vcpus.saturating_sub(1);
             }
         }
     }
+}
+
+/// The id of the L3 cache `cpu` uses, from sysfs.
+fn l3_of(cpu: usize) -> Option<usize> {
+    let caches = std::fs::read_dir(format!("/sys/devices/system/cpu/cpu{cpu}/cache")).ok()?;
+    caches.flatten().find_map(|cache| {
+        let level = std::fs::read_to_string(cache.path().join("level")).ok()?;
+        if level.trim() != "3" {
+            return None;
+        }
+        std::fs::read_to_string(cache.path().join("id"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 impl Host {
@@ -410,7 +459,8 @@ impl Vm {
             .map(|pins| Box::new(pins.take(limits.vcpus)));
         if let Some(lease) = &lease {
             // Every thread starts on the VM's CPUs; `pin_vcpus` then gives
-            // each vCPU thread its own, which a one-vCPU VM already has.
+            // each vCPU thread its own and lets the other threads run on
+            // any CPU.
             let set = lease.set()?;
             // SAFETY: sched_setaffinity is a plain syscall, safe after fork.
             unsafe {
@@ -467,28 +517,34 @@ impl Vm {
             .is_some_and(|lease| lease.cpus.len() > 1)
     }
 
-    /// Moves each vCPU thread (`fc_vcpu <n>`) to its own CPU. Call it once
-    /// Firecracker has made them, before they run if possible.
+    /// Moves each vCPU thread (`fc_vcpu <n>`) to its own CPU, and lets
+    /// Firecracker's other threads run on any CPU, so disk and network
+    /// emulation do not wait for the vCPUs. Call it once Firecracker has
+    /// made the vCPU threads, before they run if possible.
     pub fn pin_vcpus(&self) -> Result<()> {
-        let Some(lease) = self.lease.as_ref().filter(|_| self.pins_each_vcpu()) else {
+        let Some(lease) = self.lease.as_ref() else {
             return Ok(());
         };
         let pid = self.pid().context("Firecracker has exited")?;
         for task in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+            let Some(tid) = task.file_name().to_str().and_then(|t| t.parse().ok()) else {
+                continue;
+            };
             let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
-            let Some(n) = comm.trim().strip_prefix("fc_vcpu ") else {
-                continue;
+            let vcpu = comm
+                .trim()
+                .strip_prefix("fc_vcpu ")
+                .and_then(|n| n.parse::<usize>().ok());
+            let set = match vcpu {
+                Some(n) => {
+                    let mut set = nix::sched::CpuSet::new();
+                    set.set(lease.cpus[n % lease.cpus.len()])?;
+                    set
+                }
+                None => lease.pins.all,
             };
-            let (Ok(n), Some(tid)) = (
-                n.parse::<usize>(),
-                task.file_name().to_str().and_then(|t| t.parse().ok()),
-            ) else {
-                continue;
-            };
-            let mut set = nix::sched::CpuSet::new();
-            set.set(lease.cpus[n % lease.cpus.len()])?;
             nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &set)
-                .with_context(|| format!("pin vCPU {n} of {}", self.jail.id))?;
+                .with_context(|| format!("set the CPUs of thread {tid} of {}", self.jail.id))?;
         }
         Ok(())
     }
@@ -684,15 +740,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn pins(cpus: usize) -> Arc<CpuPins> {
+    /// `cpus` CPUs, `per_l3` to each L3 cache.
+    fn pins(cpus: usize, per_l3: usize) -> Arc<CpuPins> {
         Arc::new(CpuPins {
-            used: Mutex::new((0..cpus).map(|cpu| (cpu, 0)).collect()),
+            used: Mutex::new(
+                (0..cpus)
+                    .map(|cpu| CpuSlot {
+                        cpu,
+                        l3: cpu / per_l3,
+                        vcpus: 0,
+                    })
+                    .collect(),
+            ),
+            all: nix::sched::CpuSet::new(),
         })
     }
 
     #[test]
     fn vms_spread_over_the_least_used_cpus() {
-        let pins = pins(4);
+        let pins = pins(4, 4);
         let a = pins.take(1);
         let b = pins.take(2);
         let c = pins.take(1);
@@ -706,7 +772,18 @@ mod tests {
 
     #[test]
     fn a_vm_with_more_vcpus_than_cpus_shares_them() {
-        let pins = pins(2);
+        let pins = pins(2, 2);
         assert_eq!(pins.take(3).cpus, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_vm_shares_one_l3_and_vms_spread_over_the_l3s() {
+        let pins = pins(8, 4);
+        let leases: Vec<_> = [2, 2, 1, 1, 3].map(|n| pins.take(n)).into();
+        let cpus: Vec<_> = leases.iter().map(|lease| lease.cpus.clone()).collect();
+        assert_eq!(
+            cpus,
+            [vec![0, 1], vec![4, 5], vec![2], vec![6], vec![3, 7, 0]]
+        );
     }
 }

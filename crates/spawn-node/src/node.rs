@@ -935,7 +935,7 @@ impl Node {
                 Ok(()) => vm.patch("/vm", json!({ "state": "Resumed" })).await,
                 Err(error) => Err(error),
             },
-            other => other,
+            other => other.and_then(|()| vm.pin_vcpus()),
         };
         if let Err(error) = loaded {
             vm.stop().await;
