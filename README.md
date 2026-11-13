@@ -1938,6 +1938,8 @@ this format: `{"error": {"code", "message", "request_id", "retryable"}}`.
 | `not_ready` | 503 | Yes | Forward listener only: the service on the port is not healthy after 30 s. |
 | `upstream_timeout` | 504 | No | Forward listener only: the wake or the app took too long. |
 | `upstream_unreachable` | 502 | No | Forward listener only: nothing answers on the port in the sandbox. |
+| `draining` | 503 | Yes | Forward and preview requests: the sandbox is [drained](#drain-a-sandbox). |
+| `generation_conflict` | 409 | No | An endpoint switch named a generation that the endpoint is not at. The message has the current generation and target. |
 | `internal` | 500 | Yes | An unexpected error. The server log has the cause with the `request_id`. |
 
 `retryable` in the response has the same value. Repeat a retryable call
@@ -2280,7 +2282,7 @@ request to the port.
   | Header | Required | Meaning |
   | --- | --- | --- |
   | `X-Spawnbox-Key` | Yes | The API key |
-  | `X-Spawnbox-Target` | Yes | `sbx_ID:PORT` |
+  | `X-Spawnbox-Target` | Yes | `sbx_ID:PORT`, or `endpoint:NAME` for an [endpoint](#endpoints) of the key's tenant (`default` for an org key) |
   | `X-Spawnbox-Wake` | No | `any` (default) resumes a paused sandbox and starts a cold one. `paused` only resumes. `never` wakes nothing. |
   | `X-Spawnbox-Timeout-Ms` | No | How long to wait for the response headers of the app. Default 60000, at most `--forward-max-response-s`. |
 
@@ -2288,7 +2290,8 @@ request to the port.
   the app, and from the response of the app. Other headers, the path, the
   query and the body go to the app without change.
 - The response has `X-Spawnbox-Sandbox` and `X-Spawnbox-Generation`. The
-  generation goes up each time the sandbox starts on a host.
+  generation goes up each time the sandbox starts on a host. A request to
+  an endpoint also has `X-Spawnbox-Endpoint-Generation`.
 - If Spawnbox refuses the request, the body is a normal
   [error](#errors) and the response has `X-Spawnbox-Error` with the code.
   A response without this header comes from the app.
@@ -2301,12 +2304,104 @@ request to the port.
   - A wake can take up to 60 s. Then the request gets
     `504 upstream_timeout`.
   - A request to the port of a service waits up to 30 s until the service
-    is healthy. Then it gives `503 not_ready`.
+    is healthy. Then it gives `503 not_ready`. After a wake, a request to
+    a port without a service waits up to 30 s until the port takes a
+    connection.
 - HTTP/1.1 and WebSockets are supported.
 - In a fleet, the forward listener runs on the primary and on edges (with
   the same flags). It sends each request to the host of the sandbox. If
   the sandbox moved, the request is sent again once, when its body is at
-  most 1 MiB.
+  most 1 MiB. Edges send requests to an endpoint to the primary.
+
+### Port readiness
+
+`GET /v1/sandboxes/{id}/ports/{port}/ready` tells whether a port takes
+traffic:
+
+```json
+{ "ready": false, "generation": 3, "state": "running", "reason": "service \"web\" on port 8000 is not healthy" }
+```
+
+- The port of a service is ready when the service is `healthy`. Another
+  published port is ready when it takes a TCP connection in the sandbox.
+- Without `wait_s`, the call does not wake the sandbox. A sandbox that is
+  not running, a port that is not published and a draining sandbox are
+  not ready.
+- With `?wait_s=N` (at most 120), the call wakes the sandbox and waits up
+  to `N` seconds for the port to be ready.
+- The key needs `sandboxes:read`.
+
+### Drain a sandbox
+
+A drain takes a sandbox out of traffic without cutting the requests that
+it serves.
+
+- `POST /v1/sandboxes/{id}:drain` with `timeout_s` (1 to 3600, default
+  30) and `then` (`none` by default, `pause` or `delete`). The response
+  is `202` with the sandbox.
+- New forwarded and preview requests get `503 draining` at once. A
+  draining sandbox that is paused does not wake for them.
+- When no forwarded or preview request or WebSocket is left, or at the
+  timeout, Spawnbox does `then`. A pause or delete ends the requests that
+  are left.
+- Commands, files, terminals and other API calls continue to operate.
+- The sandbox stays out of traffic until `POST /v1/sandboxes/{id}:undrain`,
+  also after `then`. `:undrain` before the timeout stops the drain.
+- `GET /v1/sandboxes/{id}` shows `drain` with `started_at`, `deadline`,
+  `in_flight` and `then` while the sandbox is drained.
+- Events: `sandbox.drain_started`, and `sandbox.drained` with `in_flight`,
+  `closed` (requests that the pause or delete ended) and `then`.
+- The drain is kept in the memory of the host that runs the sandbox. If
+  that host restarts, the drain ends.
+
+### Endpoints
+
+An endpoint is a stable name for one sandbox port. To replace a sandbox,
+switch the endpoint to the new one. Gateways send requests to
+`X-Spawnbox-Target: endpoint:NAME`.
+
+- `POST /v1/endpoints` with `name`, `sandbox` and `port`. The endpoint is
+  in the tenant of the sandbox. A name is 1 to 63 of `a-z`, `0-9` and
+  `-`, unique in its tenant. A new endpoint has `generation` 1.
+- `GET /v1/endpoints` and `GET /v1/endpoints/{name}` show the target, the
+  `generation` and the `target_state`. Org keys add `?tenant=` for an
+  endpoint that is not in `default`.
+- `DELETE /v1/endpoints/{name}` removes the endpoint, not its target.
+- `PUT /v1/endpoints/{name}` switches it:
+
+  ```json
+  {
+    "sandbox": "sbx_NEW",
+    "port": 8000,
+    "if_generation": 4,
+    "ready_wait_s": 60,
+    "previous": { "drain_s": 30, "then": "pause" }
+  }
+  ```
+
+  - `if_generation` is required. The switch happens only if the endpoint
+    is at this generation. Else the response is `409 generation_conflict`.
+    Of two switches from the same generation, one wins.
+  - `ready_wait_s` (0 to 300, default 60): Spawnbox wakes the new target
+    and waits until its port is [ready](#port-readiness). If it is not
+    ready in time, the response is `503 not_ready` and the endpoint does
+    not change. `0` skips the check. The key needs `sandboxes:read` for
+    this.
+  - `previous`: after the switch, the old target
+    [drains](#drain-a-sandbox) for `drain_s` (default 30), then does
+    `then` (default `pause`). If `previous` is not given, these defaults
+    apply. `null` leaves the old target alone.
+  - The drain starts `--endpoint-propagation-s` (default 2) after the
+    switch, so requests that read the endpoint just before the switch
+    still reach the old target. A request to an endpoint that gets
+    `draining` reads the endpoint again and is sent once more, when its
+    body is at most 1 MiB.
+  - The response has the endpoint with its new `generation`, and
+    `previous` with the old target.
+- Each response through an endpoint has `X-Spawnbox-Endpoint-Generation`,
+  so you can see which generation served it.
+- Events: `endpoint.created`, `endpoint.switched`, `endpoint.deleted`.
+- Endpoints are kept in the database of the primary and are in backups.
 
 ### Network access (egress)
 
@@ -2485,6 +2580,8 @@ request to the port.
     `duration_ms`)
   - `secret.injected` (without the value)
   - `volume.created`, `volume.deleted`
+  - `sandbox.drain_started`, `sandbox.drained`
+  - `endpoint.created`, `endpoint.switched`, `endpoint.deleted`
   - changes to tenants, keys, secrets and templates, such as
     `template.saved` and `template.deleted`
   - `autoscale.requested`, `.done`, `.failed` (primary only)
@@ -2626,6 +2723,12 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--idle-pause-s` | 600 | Pause a sandbox after this time without requests. `0` means never. |
 | `--paused-retention-s` | 604800 | Delete paused sandboxes after this time. Persistent sandboxes are kept. |
 | `--shutdown-pause-s` | 30 | On SIGTERM, time for running persistent sandboxes to pause. The ones that do not pause in this time stop and become `cold`. |
+| `--forward-listen` | None | Address of the [forward listener](#forward-requests-from-a-gateway) for your gateway. Off if not set. |
+| `--forward-tls-cert`, `--forward-tls-key` | None | HTTPS for the forward listener |
+| `--forward-max-wakes`, `--forward-wake-queue-s` | 8, 10 | Wakes from forwarded requests that run at once, and how long a request waits for one |
+| `--forward-max-in-flight` | 1024 | Forwarded and preview requests in flight for one sandbox |
+| `--forward-max-response-s` | 600 | Longest `X-Spawnbox-Timeout-Ms` a gateway can ask for, in seconds |
+| `--endpoint-propagation-s` | 2 | After an endpoint switch, the time before the old target starts to drain |
 | `--max-builds` | 2 | Maximum number of template builds at the same time |
 | `--egress-policy` | `{"mode":"allow_all"}` | Network policy for all sandboxes |
 | `--dns` | `1.1.1.1` | DNS server that the DNS forwarder sends queries to |

@@ -712,6 +712,25 @@ tries once more after it looks up the sandbox again. Edges have no
 database, so a worker's `stale_route` is how an edge learns that its
 routing table is out of date.
 
+### Readiness, drain and endpoints
+
+- **Readiness.** A port is ready when its service is healthy, or, with no
+  service, when `Ports.Dial` opens a connection to it. A readiness check
+  never restarts anything.
+- **Drain.** The host that runs a sandbox keeps its drains in memory, next
+  to the in-flight count of forwarded and preview requests. A draining
+  sandbox refuses new ones with `503 draining`. A task waits until the
+  count is 0 or the deadline, then pauses or deletes the sandbox if asked.
+  The primary sends `:drain` to the worker that runs the sandbox, as for
+  other sandbox calls.
+- **Endpoints.** A row in `endpoints` (`tenant`, `name`, `sandbox`,
+  `port`, `generation`). A switch is one `UPDATE ... WHERE generation = ?`,
+  so concurrent switches commit once. The primary resolves `endpoint:NAME`
+  for each request and sends the worker the resolved `sbx_ID:PORT`. The old
+  target drains `--endpoint-propagation-s` after the switch. A request
+  that meets a draining target reads the endpoint again and is sent once
+  more.
+
 ## Tenants, keys and quotas
 
 ```mermaid
