@@ -1,0 +1,1894 @@
+{
+  "schemaVersion": "6",
+  "runId": "azn1",
+  "sha": "local",
+  "generatedAt": "2026-11-14T07:57:00.898Z",
+  "targetSpec": {
+    "vcpus": 4,
+    "memoryGb": 8,
+    "diskGb": 40
+  },
+  "providers": [
+    {
+      "providerId": "blaxel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "boat",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "brezel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "daytona-container",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "daytona-vm",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "digitalocean",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "e2b",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "freestyle",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "microsandbox-cloud",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "modal-gvisor",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "modal-vm",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "namespace",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "novita",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "runcloud",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "spawnbox",
+      "costEvidence": [],
+      "artifactEvidence": [
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 0
+          },
+          "sandboxId": "sbx_gh6yseqdd59h2cmr",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 1
+          },
+          "sandboxId": "sbx_g68fj8kxjg0q7rrs",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 2
+          },
+          "sandboxId": "sbx_126yq40ggyw5k9qa",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 3
+          },
+          "sandboxId": "sbx_jtbp1qrn52vr41ws",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 4
+          },
+          "sandboxId": "sbx_0tfp4mtrc2gpfne3",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 5
+          },
+          "sandboxId": "sbx_trwhsagezaby6ssw",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 6
+          },
+          "sandboxId": "sbx_3tv9webdvw1qj0xz",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 7
+          },
+          "sandboxId": "sbx_yrtmfqq447646hne",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 8
+          },
+          "sandboxId": "sbx_x8kezn6nhxxcfstz",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 9
+          },
+          "sandboxId": "sbx_a9gsp2f3wn5t62nh",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 10
+          },
+          "sandboxId": "sbx_qwjxx06en65t58tx",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        },
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 11
+          },
+          "sandboxId": "sbx_038pdrccgnk8vzeh",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        }
+      ],
+      "validationStatus": "validated",
+      "specMatched": true,
+      "observedSpecs": {
+        "containerRuntime": "none",
+        "cpuModel": "AMD EPYC",
+        "detectedIsolation": "firecracker",
+        "diskGb": 41,
+        "hostMemoryGb": 8,
+        "hostVcpus": 4,
+        "isolationClass": "microvm",
+        "isolationConfidence": "confirmed",
+        "kernel": "6.18.60",
+        "machineVmm": "firecracker",
+        "memoryGb": 7.78,
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "vcpus": 4,
+        "virtualization": "kvm"
+      },
+      "observedMixtures": {
+        "sandboxes": 12,
+        "hostHardware": {
+          "fc6998c3ea5bcaf1": {
+            "count": 12,
+            "specs": {
+              "containerRuntime": "none",
+              "cpuModel": "AMD EPYC",
+              "detectedIsolation": "firecracker",
+              "diskGb": 41,
+              "hostMemoryGb": 8,
+              "hostVcpus": 4,
+              "isolationClass": "microvm",
+              "isolationConfidence": "confirmed",
+              "kernel": "6.18.60",
+              "machineVmm": "firecracker",
+              "memoryGb": 7.78,
+              "os": "Debian GNU/Linux 13 (trixie)",
+              "vcpus": 4,
+              "virtualization": "kvm"
+            },
+            "specMatched": true
+          }
+        },
+        "hostNetwork": {}
+      },
+      "hostMetadata": [
+        {
+          "source": "phoronix/result-file-to-json",
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth--metadata.json",
+          "fields": [
+            {
+              "path": "ci.client_version",
+              "value": "10.8.4"
+            },
+            {
+              "path": "ci.data.cpu-microcode",
+              "value": "0x1000065"
+            },
+            {
+              "path": "ci.data.kernel-extra-details",
+              "value": "Transparent Huge Pages: always"
+            },
+            {
+              "path": "ci.data.security",
+              "value": "gather_data_sampling: Not affected + ghostwrite: Not affected + indirect_target_selection: Not affected + itlb_multihit: Not affected + l1tf: Not affected + mds: Not affected + meltdown: Not affected + mmio_stale_data: Not affected + old_microcode: Not affected + reg_file_data_sampling: Not affected + retbleed: Not affected + spec_rstack_overflow: Vulnerable: Microcode no safe RET + spec_store_bypass: Mitigation of SSB disabled via prctl + spectre_v1: Mitigation of usercopy/swapgs barriers and __user pointer sanitization + spectre_v2: Mitigation of Enhanced / Automatic IBRS; IBPB: conditional; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected + srbds: Not affected + tsa: Not affected + tsx_async_abort: Not affected + vmscape: Not affected"
+            },
+            {
+              "path": "ci.hardware.Disk",
+              "value": "42GB"
+            },
+            {
+              "path": "ci.hardware.Memory",
+              "value": "8GB"
+            },
+            {
+              "path": "ci.hardware.Processor",
+              "value": "AMD EPYC (4 Cores)"
+            },
+            {
+              "path": "ci.identifier",
+              "value": "ci"
+            },
+            {
+              "path": "ci.software.Compiler",
+              "value": "GCC 14.2.0"
+            },
+            {
+              "path": "ci.software.File-System",
+              "value": "overlayfs"
+            },
+            {
+              "path": "ci.software.Kernel",
+              "value": "6.18.60 (x86_64)"
+            },
+            {
+              "path": "ci.software.OS",
+              "value": "Debian GNU/Linux 13"
+            },
+            {
+              "path": "ci.software.System Layer",
+              "value": "KVM"
+            },
+            {
+              "path": "ci.user",
+              "value": "root"
+            }
+          ],
+          "sandboxes": 12,
+          "hostHardwareId": "fc6998c3ea5bcaf1"
+        }
+      ],
+      "metrics": [
+        {
+          "metricId": "realworld_better_auth_task_build",
+          "samples": [
+            47.051,
+            47.187,
+            46.957,
+            47.56,
+            47.036,
+            47.169,
+            47.357,
+            46.791,
+            47.468,
+            47.404,
+            47.158,
+            47.559
+          ],
+          "aggregates": {
+            "p50": 47.178,
+            "p95": 47.55945,
+            "mean": 47.22475,
+            "stdev": 0.24634422516618804,
+            "min": 46.791,
+            "max": 47.56,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "build",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                47.051
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                47.187
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                46.957
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                47.56
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                47.036
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                47.169
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                47.357
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                46.791
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                47.468
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                47.404
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                47.158
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                47.559
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_cold_install",
+          "samples": [
+            8.345,
+            8.345,
+            8.245,
+            8.688,
+            8.394,
+            8.377,
+            8.293,
+            11.808,
+            8.39,
+            8.71,
+            11.862,
+            8.194
+          ],
+          "aggregates": {
+            "p50": 8.383500000000002,
+            "p95": 11.8323,
+            "mean": 8.970916666666668,
+            "stdev": 1.3467883317752867,
+            "min": 8.194,
+            "max": 11.862,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "cold_install",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                8.345
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                8.345
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                8.245
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                8.688
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                8.394
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                8.377
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                8.293
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                11.808
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                8.39
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                8.71
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                11.862
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                8.194
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_git_clone",
+          "samples": [
+            1.057,
+            1.081,
+            1.084,
+            1.13,
+            1.109,
+            1.11,
+            1.094,
+            1.069,
+            1.102,
+            1.094,
+            1.087,
+            1.118
+          ],
+          "aggregates": {
+            "p50": 1.094,
+            "p95": 1.1234,
+            "mean": 1.0945833333333332,
+            "stdev": 0.020725295626067158,
+            "min": 1.057,
+            "max": 1.13,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "git_clone",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                1.057
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                1.081
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                1.084
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                1.13
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                1.109
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                1.11
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                1.094
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                1.069
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                1.102
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                1.094
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                1.087
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                1.118
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_biome",
+          "samples": [
+            2.371,
+            2.395,
+            2.392,
+            2.386,
+            2.366,
+            2.343,
+            2.365,
+            2.37,
+            2.328,
+            2.313,
+            2.344,
+            2.383
+          ],
+          "aggregates": {
+            "p50": 2.3680000000000003,
+            "p95": 2.39335,
+            "mean": 2.363,
+            "stdev": 0.02594749944161724,
+            "min": 2.313,
+            "max": 2.395,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_biome",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                2.371
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                2.395
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                2.392
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                2.386
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                2.366
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                2.343
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                2.365
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                2.37
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                2.328
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                2.313
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                2.344
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                2.383
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_deps_knip",
+          "samples": [
+            7.513,
+            7.49,
+            7.495,
+            7.383,
+            7.343,
+            7.485,
+            7.412,
+            7.544,
+            7.5,
+            7.535,
+            7.43,
+            7.393
+          ],
+          "aggregates": {
+            "p50": 7.487500000000001,
+            "p95": 7.53905,
+            "mean": 7.46025,
+            "stdev": 0.06547049994949164,
+            "min": 7.343,
+            "max": 7.544,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_deps",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                7.513
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                7.49
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                7.495
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                7.383
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                7.343
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                7.485
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                7.412
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                7.544
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                7.5
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                7.535
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                7.43
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                7.393
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_format",
+          "samples": [
+            2.096,
+            2.107,
+            2.109,
+            2.117,
+            2.175,
+            2.176,
+            2.077,
+            2.106,
+            2.135,
+            2.165,
+            2.127,
+            2.155
+          ],
+          "aggregates": {
+            "p50": 2.122,
+            "p95": 2.17545,
+            "mean": 2.1287499999999997,
+            "stdev": 0.03259426887715648,
+            "min": 2.077,
+            "max": 2.176,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_format",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                2.096
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                2.107
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                2.109
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                2.117
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                2.175
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                2.176
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                2.077
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                2.106
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                2.135
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                2.165
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                2.127
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                2.155
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_packages",
+          "samples": [
+            2.035,
+            2.019,
+            2.001,
+            1.999,
+            2.017,
+            1.977,
+            1.987,
+            1.976,
+            1.976,
+            1.998,
+            2.015,
+            2.002
+          ],
+          "aggregates": {
+            "p50": 2,
+            "p95": 2.0262000000000002,
+            "mean": 2.0001666666666664,
+            "stdev": 0.018972867389240335,
+            "min": 1.976,
+            "max": 2.035,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_packages",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                2.035
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                2.019
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                2.001
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                1.999
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                2.017
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                1.977
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                1.987
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                1.976
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                1.976
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                1.998
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                2.015
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                2.002
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_spell",
+          "samples": [
+            5.31,
+            5.323,
+            5.334,
+            5.308,
+            5.313,
+            5.337,
+            5.351,
+            5.297,
+            5.299,
+            5.335,
+            5.338,
+            5.311
+          ],
+          "aggregates": {
+            "p50": 5.318,
+            "p95": 5.34385,
+            "mean": 5.321333333333333,
+            "stdev": 0.01739034911737709,
+            "min": 5.297,
+            "max": 5.351,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_spell",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                5.31
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                5.323
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                5.334
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                5.308
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                5.313
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                5.337
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                5.351
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                5.297
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                5.299
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                5.335
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                5.338
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                5.311
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_types",
+          "samples": [
+            24.637,
+            24.129,
+            24.637,
+            24.185,
+            24.45,
+            24.52,
+            24.875,
+            24.244,
+            24.553,
+            23.995,
+            24.705,
+            24.558
+          ],
+          "aggregates": {
+            "p50": 24.5365,
+            "p95": 24.781499999999998,
+            "mean": 24.457333333333334,
+            "stdev": 0.26368760212636283,
+            "min": 23.995,
+            "max": 24.875,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_types",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                24.637
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                24.129
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                24.637
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                24.185
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                24.45
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                24.52
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                24.875
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                24.244
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                24.553
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                23.995
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                24.705
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                24.558
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        },
+        {
+          "metricId": "realworld_better_auth_task_typecheck",
+          "samples": [
+            30.32,
+            30.782,
+            31.025,
+            30.622,
+            29.909,
+            30.4,
+            30.594,
+            31.75,
+            31.802,
+            30.63,
+            30.94,
+            30.418
+          ],
+          "aggregates": {
+            "p50": 30.625999999999998,
+            "p95": 31.7734,
+            "mean": 30.766,
+            "stdev": 0.5556655305290977,
+            "min": 29.909,
+            "max": 31.802,
+            "n": 12
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "typecheck",
+          "replicates": [
+            {
+              "index": 0,
+              "samples": [
+                30.32
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 1,
+              "samples": [
+                30.782
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 2,
+              "samples": [
+                31.025
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 3,
+              "samples": [
+                30.622
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 4,
+              "samples": [
+                29.909
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 5,
+              "samples": [
+                30.4
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 6,
+              "samples": [
+                30.594
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 7,
+              "samples": [
+                31.75
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 8,
+              "samples": [
+                31.802
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 9,
+              "samples": [
+                30.63
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 10,
+              "samples": [
+                30.94
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            },
+            {
+              "index": 11,
+              "samples": [
+                30.418
+              ],
+              "ptsSampleSource": "aggregate-value",
+              "hostHardwareId": "fc6998c3ea5bcaf1"
+            }
+          ]
+        }
+      ],
+      "suitesCovered": [
+        "realworld-better-auth"
+      ],
+      "gaps": [
+        {
+          "scope": "suite",
+          "id": "realworld-better-auth",
+          "outcome": "failed",
+          "reason": "Step \"clone repo\" lost its sandbox: 12 consecutive detached polls failed (last: computesdk filesystem exists failed: Spawnbox 409 conflict: sandbox is deleted, not running) — the sandbox stopped responding, not a quiet long step",
+          "cause": {
+            "kind": "sandbox-lost",
+            "step": "clone repo",
+            "consecutivePollFailures": 12
+          }
+        }
+      ],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "tama",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "vercel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    }
+  ]
+}
