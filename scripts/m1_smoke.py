@@ -669,9 +669,12 @@ def egress_checks():
     check("allowlist denies other http", code != 0, code)
     code, _ = curl(sid, "http://example.com:8080", 5)
     check("allowlist denies other ports", code != 0, code)
-    out = run(sid, "getent ahostsv4 www.google.com | awk '{print $1; exit}'")
-    ip = out["stdout"].strip()
-    check("allowlist resolves names", ip != "", out)
+    out = run(sid, "getent ahostsv4 www.google.com")
+    check("allowlist refuses other names", out["stdout"].strip() == "", out)
+    out = run(sid, "getent ahostsv4 example.com | awk '{print $1; exit}'")
+    check("allowlist resolves listed names", out["stdout"].strip() != "", out)
+    # An address that is not example.com's: the proxy goes by the name.
+    ip = "1.1.1.1"
     code, body = curl(sid, f"-k --resolve example.com:443:{ip} https://example.com")
     check("fake address goes to the named host", code == 0 and "Example Domain" in body, (code, body))
     code, _ = curl(sid, f"-k https://{ip}", 10)
@@ -1526,7 +1529,8 @@ def event_checks():
     # The sleep lets the proxy report closed connections while the step runs.
     net_cmd = (
         "curl -s -o /dev/null -w '%{http_code}\\n' https://example.com; "
-        "curl -s -m 5 -o /dev/null https://github.com || echo blocked; "
+        # DNS refuses github.com; a fixed address lets the proxy block it.
+        "curl -s -m 5 -o /dev/null --resolve github.com:443:1.1.1.1 https://github.com || echo blocked; "
         "curl -s https://postman-echo.com/headers >/dev/null; sleep 1"
     )
     status, got = request("POST", f"/v1/sandboxes/{sid}/exec", {"cmd": net_cmd}, headers=step("step-net"))
