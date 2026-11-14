@@ -74,10 +74,21 @@ fleet grew by itself from 26 to 37 servers. Measured on AWS m8i.2xlarge
 workers, 10 Nov 2026.
 [How we tested](https://spawnbox.tulipfarm.ai/#scale).
 
+## Benchmark
+
+On the Better-Auth task from the open
+[hpc-sandbox-benchmarks](https://github.com/starslingdev/hpc-sandbox-benchmarks) suite, Spawnbox
+ranked second: 131.1 s to clone, install, build, lint and typecheck the better-auth repo in a
+4 vCPU, 8 GiB sandbox. Brezel took 118.1 s and boat 135.8 s. Spawnbox ran v0.1.13 with
+`--huge-pages` on one AWS m8azn.metal-12xl, one sandbox at a time, 14 Nov 2026. The other providers
+come from the suite's published run of 3 Oct 2026 on their own hardware.
+[Results, scripts and how to rerun it](bench/README.md).
+
 ## Contents
 
 - [Install in one line](#install-in-one-line)
 - [Tested at scale](#tested-at-scale)
+- [Benchmark](#benchmark)
 - [Why use Spawnbox](#why-use-spawnbox)
 - [Features](#features)
 - [Getting started](#getting-started)

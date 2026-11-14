@@ -84,6 +84,28 @@ const scale = [
   { v: "2×", unit: "", label: "Double the servers, double the agents" },
 ];
 
+const benchTotals: [string, number][] = [
+  ["Brezel", 118.1],
+  ["Spawnbox", 131.1],
+  ["boat", 135.8],
+  ["Namespace", 150.5],
+  ["Daytona (VM)", 156.6],
+  ["Modal (VM)", 180.8],
+];
+const benchMax = 190;
+const benchSteps: [string, number, number, number][] = [
+  ["Build", 42.2, 47.2, 47.7],
+  ["Typecheck", 27.6, 30.6, 29.9],
+  ["Lint types", 20.6, 24.5, 23.3],
+  ["Cold install", 8.1, 8.4, 13.7],
+  ["Lint deps (Knip)", 6.9, 7.5, 7.5],
+  ["Lint spell", 4.9, 5.3, 5.3],
+  ["Lint (Biome)", 2.2, 2.4, 2.3],
+  ["Lint format", 2.0, 2.1, 2.2],
+  ["Lint packages", 1.8, 2.0, 2.4],
+  ["Git clone", 1.9, 1.1, 1.7],
+];
+
 const groups: { name: string; shape: string; items: [string, string, boolean?][] }[] = [
   {
     name: "Run code",
@@ -494,6 +516,63 @@ const events = [
         <p class="scale-note">
           Measured 10 Nov 2026 on AWS m8i.2xlarge workers. A typical agent sandbox started in about 400 ms through the fleet API. The agents talked
           to a stand-in model and a local git remote, so no AI or GitHub rate limits applied.
+        </p>
+      </section>
+
+      <section id="benchmark" class="bench">
+        <header class="scale-head reveal">
+          <p class="eyebrow">BENCHMARK</p>
+          <h2>Second on a real coding task.<br /><span class="hl">131 s to build and check Better-Auth.</span></h2>
+          <p class="scale-sub">
+            The Better-Auth task from the open <a href="https://github.com/starslingdev/hpc-sandbox-benchmarks">hpc-sandbox-benchmarks</a> suite clones the
+            better-auth repo, installs it, builds it, and runs its lint and type checks in a 4 vCPU, 8 GiB sandbox. The score is the sum of each step's
+            median over 12 runs. Lower is better.
+          </p>
+        </header>
+        <div class="bench-grid">
+          <figure class="bench-chart reveal" aria-label="Better-Auth total time by provider, in seconds">
+            {
+              benchTotals.map(([name, t], n) => (
+                <div class={name === "Spawnbox" ? "brow us-row" : "brow"}>
+                  <span class="brow-rank">{n + 1}</span>
+                  <span class="brow-name">{name}</span>
+                  <span class="brow-track">
+                    <span class="brow-fill" style={`width:${((t / benchMax) * 100).toFixed(1)}%`}></span>
+                  </span>
+                  <span class="brow-v">{t.toFixed(1)} s</span>
+                </div>
+              ))
+            }
+          </figure>
+          <div class="table-wrap bench-table reveal">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Step, median s</th>
+                  <th scope="col">Brezel</th>
+                  <th scope="col" class="us">Spawnbox</th>
+                  <th scope="col">boat</th>
+                </tr>
+              </thead>
+              <tbody>
+                {
+                  benchSteps.map(([step, a, b, c]) => (
+                    <tr>
+                      <th scope="row">{step}</th>
+                      <td>{a.toFixed(1)}</td>
+                      <td class="us">{b.toFixed(1)}</td>
+                      <td>{c.toFixed(1)}</td>
+                    </tr>
+                  ))
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="scale-note">
+          Spawnbox: v0.1.13 with --huge-pages, self-hosted on one AWS m8azn.metal-12xl (AMD EPYC, up to 5 GHz), one sandbox at a time, 14 Nov 2026.
+          Other providers: the suite's published run of 3 Oct 2026 on their own hardware, so the machines differ. Only this task was rerun.{" "}
+          <a href={`${repo}/tree/main/bench`}>Scripts, raw results and how to rerun it →</a>
         </p>
       </section>
 
@@ -1538,6 +1617,66 @@ const events = [
     font-size: 11px;
     color: var(--muted);
     max-width: 110ch;
+  }
+  .bench-grid {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+    gap: 28px;
+    align-items: start;
+  }
+  .bench-chart {
+    margin: 0;
+    padding: 18px 20px;
+    border: 1px solid var(--line);
+    background: #fff;
+    display: grid;
+    gap: 12px;
+  }
+  .brow {
+    display: grid;
+    grid-template-columns: 18px 110px 1fr 64px;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .brow-rank {
+    font-size: 11px;
+  }
+  .brow-track {
+    height: 14px;
+    background: var(--grid-minor);
+  }
+  .brow-fill {
+    display: block;
+    height: 100%;
+    background: var(--left);
+  }
+  .brow-v {
+    text-align: right;
+  }
+  .us-row {
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .us-row .brow-fill {
+    background: var(--blue);
+  }
+  .bench-table table {
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .bench-table th,
+  .bench-table td {
+    padding: 8px 12px;
+  }
+  .bench-table tbody th {
+    position: static;
+    width: auto;
+    font-family: var(--sans);
+    font-size: 14px;
   }
   .group {
     display: grid;
@@ -2587,6 +2726,9 @@ const events = [
   }
 
   @media (max-width: 1000px) {
+    .bench-grid {
+      grid-template-columns: 1fr;
+    }
     .hero {
       grid-template-columns: 1fr;
     }
@@ -2625,6 +2767,10 @@ const events = [
   }
 
   @media (max-width: 640px) {
+    .brow {
+      grid-template-columns: 14px 92px 1fr 56px;
+      font-size: 12px;
+    }
     .cards,
     .metrics {
       grid-template-columns: 1fr;

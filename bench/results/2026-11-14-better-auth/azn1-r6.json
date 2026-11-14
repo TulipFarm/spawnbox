@@ -1,0 +1,505 @@
+{
+  "schemaVersion": "6",
+  "runId": "azn1",
+  "sha": "local",
+  "generatedAt": "2026-11-14T06:59:03.185Z",
+  "replicateIndex": 6,
+  "targetSpec": {
+    "vcpus": 4,
+    "memoryGb": 8,
+    "diskGb": 40
+  },
+  "providers": [
+    {
+      "providerId": "blaxel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "boat",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "brezel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "daytona-container",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "daytona-vm",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "digitalocean",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "e2b",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "freestyle",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "microsandbox-cloud",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "modal-gvisor",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "modal-vm",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "namespace",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "novita",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "runcloud",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "spawnbox",
+      "costEvidence": [],
+      "artifactEvidence": [
+        {
+          "cell": {
+            "runId": "azn1",
+            "providerId": "spawnbox",
+            "suite": "realworld-better-auth",
+            "replicateIndex": 6
+          },
+          "sandboxId": "sbx_3tv9webdvw1qj0xz",
+          "provenance": {
+            "source": "guest-fingerprint",
+            "requested": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            },
+            "fingerprint": {
+              "authority": "toolchain-manifest-v1",
+              "imageName": "sandbox-benchmarks-toolchain",
+              "imageVersion": "v8"
+            },
+            "reported": {
+              "kind": "image",
+              "ref": "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8"
+            }
+          }
+        }
+      ],
+      "validationStatus": "validated",
+      "specMatched": true,
+      "observedSpecs": {
+        "cpuModel": "AMD EPYC",
+        "hostVcpus": 4,
+        "hostMemoryGb": 8,
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "kernel": "6.18.60",
+        "virtualization": "kvm",
+        "user": "root",
+        "vcpus": 4,
+        "memoryGb": 7.78,
+        "diskGb": 41,
+        "detectedIsolation": "firecracker",
+        "isolationClass": "microvm",
+        "isolationConfidence": "confirmed",
+        "machineVmm": "firecracker",
+        "containerRuntime": "none"
+      },
+      "hostMetadata": [
+        {
+          "source": "phoronix/result-file-to-json",
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth--metadata.json",
+          "fields": [
+            {
+              "path": "ci.client_version",
+              "value": "10.8.4"
+            },
+            {
+              "path": "ci.data.cpu-microcode",
+              "value": "0x1000065"
+            },
+            {
+              "path": "ci.data.kernel-extra-details",
+              "value": "Transparent Huge Pages: always"
+            },
+            {
+              "path": "ci.data.security",
+              "value": "gather_data_sampling: Not affected + ghostwrite: Not affected + indirect_target_selection: Not affected + itlb_multihit: Not affected + l1tf: Not affected + mds: Not affected + meltdown: Not affected + mmio_stale_data: Not affected + old_microcode: Not affected + reg_file_data_sampling: Not affected + retbleed: Not affected + spec_rstack_overflow: Vulnerable: Microcode no safe RET + spec_store_bypass: Mitigation of SSB disabled via prctl + spectre_v1: Mitigation of usercopy/swapgs barriers and __user pointer sanitization + spectre_v2: Mitigation of Enhanced / Automatic IBRS; IBPB: conditional; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected + srbds: Not affected + tsa: Not affected + tsx_async_abort: Not affected + vmscape: Not affected"
+            },
+            {
+              "path": "ci.hardware.Disk",
+              "value": "42GB"
+            },
+            {
+              "path": "ci.hardware.Memory",
+              "value": "8GB"
+            },
+            {
+              "path": "ci.hardware.Processor",
+              "value": "AMD EPYC (4 Cores)"
+            },
+            {
+              "path": "ci.identifier",
+              "value": "ci"
+            },
+            {
+              "path": "ci.software.Compiler",
+              "value": "GCC 14.2.0"
+            },
+            {
+              "path": "ci.software.File-System",
+              "value": "overlayfs"
+            },
+            {
+              "path": "ci.software.Kernel",
+              "value": "6.18.60 (x86_64)"
+            },
+            {
+              "path": "ci.software.OS",
+              "value": "Debian GNU/Linux 13"
+            },
+            {
+              "path": "ci.software.System Layer",
+              "value": "KVM"
+            },
+            {
+              "path": "ci.timestamp",
+              "value": "2026-11-14 06:53:22"
+            },
+            {
+              "path": "ci.user",
+              "value": "root"
+            }
+          ]
+        }
+      ],
+      "metrics": [
+        {
+          "metricId": "realworld_better_auth_task_build",
+          "samples": [
+            47.357
+          ],
+          "aggregates": {
+            "p50": 47.357,
+            "p95": 47.357,
+            "mean": 47.357,
+            "stdev": 0,
+            "min": 47.357,
+            "max": 47.357,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "build"
+        },
+        {
+          "metricId": "realworld_better_auth_task_cold_install",
+          "samples": [
+            8.293
+          ],
+          "aggregates": {
+            "p50": 8.293,
+            "p95": 8.293,
+            "mean": 8.293,
+            "stdev": 0,
+            "min": 8.293,
+            "max": 8.293,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "cold_install"
+        },
+        {
+          "metricId": "realworld_better_auth_task_git_clone",
+          "samples": [
+            1.094
+          ],
+          "aggregates": {
+            "p50": 1.094,
+            "p95": 1.094,
+            "mean": 1.094,
+            "stdev": 0,
+            "min": 1.094,
+            "max": 1.094,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "git_clone"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_biome",
+          "samples": [
+            2.365
+          ],
+          "aggregates": {
+            "p50": 2.365,
+            "p95": 2.365,
+            "mean": 2.365,
+            "stdev": 0,
+            "min": 2.365,
+            "max": 2.365,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_biome"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_deps_knip",
+          "samples": [
+            7.412
+          ],
+          "aggregates": {
+            "p50": 7.412,
+            "p95": 7.412,
+            "mean": 7.412,
+            "stdev": 0,
+            "min": 7.412,
+            "max": 7.412,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_deps"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_format",
+          "samples": [
+            2.077
+          ],
+          "aggregates": {
+            "p50": 2.077,
+            "p95": 2.077,
+            "mean": 2.077,
+            "stdev": 0,
+            "min": 2.077,
+            "max": 2.077,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_format"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_packages",
+          "samples": [
+            1.987
+          ],
+          "aggregates": {
+            "p50": 1.987,
+            "p95": 1.987,
+            "mean": 1.987,
+            "stdev": 0,
+            "min": 1.987,
+            "max": 1.987,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_packages"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_spell",
+          "samples": [
+            5.351
+          ],
+          "aggregates": {
+            "p50": 5.351,
+            "p95": 5.351,
+            "mean": 5.351,
+            "stdev": 0,
+            "min": 5.351,
+            "max": 5.351,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_spell"
+        },
+        {
+          "metricId": "realworld_better_auth_task_lint_types",
+          "samples": [
+            24.875
+          ],
+          "aggregates": {
+            "p50": 24.875,
+            "p95": 24.875,
+            "mean": 24.875,
+            "stdev": 0,
+            "min": 24.875,
+            "max": 24.875,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "lint_types"
+        },
+        {
+          "metricId": "realworld_better_auth_task_typecheck",
+          "samples": [
+            30.594
+          ],
+          "aggregates": {
+            "p50": 30.594,
+            "p95": 30.594,
+            "mean": 30.594,
+            "stdev": 0,
+            "min": 30.594,
+            "max": 30.594,
+            "n": 1
+          },
+          "sourceFile": "realworld-better-auth/pts_realworld-better-auth.xml",
+          "ptsSampleSource": "aggregate-value",
+          "appVersion": "6f3ba45639579da152b69e8e5342e02f28288670",
+          "arguments": "typecheck"
+        }
+      ],
+      "suitesCovered": [
+        "realworld-better-auth"
+      ],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "tama",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    },
+    {
+      "providerId": "vercel",
+      "costEvidence": [],
+      "artifactEvidence": [],
+      "validationStatus": "pending",
+      "observedSpecs": {},
+      "metrics": [],
+      "suitesCovered": [],
+      "gaps": [],
+      "uncatalogued": []
+    }
+  ]
+}

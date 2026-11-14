@@ -1,0 +1,1037 @@
+From c3e9378bfd88aa98472144f965f8aaaafde45d26 Mon Sep 17 00:00:00 2001
+From: Dhruv Jain <dhruvjainpenny@gmail.com>
+Date: Sat, 14 Nov 2026 18:56:55 +0530
+Subject: [PATCH] feat(providers): add Spawnbox as an opt-in driver-kit
+ provider
+
+---
+ .env.example                                  |   4 +
+ .github/workflows/bench-smoke.yml             |   1 +
+ .github/workflows/bench-suite.yml             |   2 +
+ .github/workflows/toolchain-image.yml         |   4 +
+ apps/cli/src/bin/release-plan.test.ts         |   3 +-
+ apps/cli/src/bin/release-plan.ts              |   2 +
+ apps/cli/src/lib/bake/validate.ts             |   2 +
+ apps/cli/src/lib/driver-run.test.ts           |   1 +
+ bun.lock                                      |  17 +
+ docs/ci-secrets.md                            |   2 +
+ packages/drivers/package.json                 |   1 +
+ packages/drivers/src/index.test.ts            |   1 +
+ packages/drivers/src/index.ts                 |   2 +
+ packages/providers/src/lib/adapters.ts        |   1 +
+ .../scripts/generate-provider-wiring.test.ts  |   1 +
+ .../scripts/generate-provider-wiring.ts       |   2 +
+ packages/schema/src/provider-ids.ts           |   1 +
+ packages/schema/src/provider-meta.test.ts     |   2 +
+ packages/schema/src/provider-meta/index.ts    |   3 +
+ packages/schema/src/provider-meta/spawnbox.ts |  37 +++
+ packages/schema/src/providers.test.ts         |   1 +
+ packages/spawnbox/README.md                   |  36 +++
+ packages/spawnbox/package.json                |  26 ++
+ packages/spawnbox/src/index.ts                |  26 ++
+ packages/spawnbox/src/provenance.ts           |   7 +
+ .../spawnbox/src/vendor.integration.test.ts   | 162 ++++++++++
+ packages/spawnbox/src/vendor.ts               | 293 ++++++++++++++++++
+ packages/spawnbox/tsconfig.json               |   4 +
+ scripts/setup-privileged-environment.sh       |   2 +-
+ 29 files changed, 644 insertions(+), 2 deletions(-)
+ create mode 100644 packages/schema/src/provider-meta/spawnbox.ts
+ create mode 100644 packages/spawnbox/README.md
+ create mode 100644 packages/spawnbox/package.json
+ create mode 100644 packages/spawnbox/src/index.ts
+ create mode 100644 packages/spawnbox/src/provenance.ts
+ create mode 100644 packages/spawnbox/src/vendor.integration.test.ts
+ create mode 100644 packages/spawnbox/src/vendor.ts
+ create mode 100644 packages/spawnbox/tsconfig.json
+
+diff --git a/.env.example b/.env.example
+index cc3781ab8..348159a4e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -87,6 +87,10 @@ BREZEL_ENVIRONMENT_REVISION=
+ 
+ # --- DigitalOcean MicroVMs (https://www.digitalocean.com/products/microvms) ---
+ DIGITAL_OCEAN_TOKEN=
++
++# --- Spawnbox (https://github.com/TulipFarm/spawnbox) ---
++SPAWNBOX_API_KEY=
++SPAWNBOX_URL=
+ # <<< end generated: provider-inputs-local
+ 
+ # Local authentication notes:
+diff --git a/.github/workflows/bench-smoke.yml b/.github/workflows/bench-smoke.yml
+index 1386fe2de..34f9f209c 100644
+--- a/.github/workflows/bench-smoke.yml
++++ b/.github/workflows/bench-smoke.yml
+@@ -25,6 +25,7 @@ on:
+           - 'freestyle'
+           - 'brezel'
+           - 'digitalocean'
++          - 'spawnbox'
+           # <<< end generated: provider-options
+       suite:
+         description: Suite to run
+diff --git a/.github/workflows/bench-suite.yml b/.github/workflows/bench-suite.yml
+index 4491aef8b..ba86bf6fe 100644
+--- a/.github/workflows/bench-suite.yml
++++ b/.github/workflows/bench-suite.yml
+@@ -145,6 +145,8 @@ jobs:
+           BREZEL_PROJECT_ID: ${{ contains(fromJSON(inputs.providers), 'brezel') && (env.BREZEL_PROJECT_ID || vars.BREZEL_PROJECT_ID || secrets.BREZEL_PROJECT_ID) || '' }}
+           BREZEL_ENVIRONMENT_REVISION: ${{ contains(fromJSON(inputs.providers), 'brezel') && (env.BREZEL_ENVIRONMENT_REVISION || vars.BREZEL_ENVIRONMENT_REVISION || secrets.BREZEL_ENVIRONMENT_REVISION) || '' }}
+           DIGITAL_OCEAN_TOKEN: ${{ contains(fromJSON(inputs.providers), 'digitalocean') && secrets.DIGITAL_OCEAN_TOKEN || '' }}
++          SPAWNBOX_API_KEY: ${{ contains(fromJSON(inputs.providers), 'spawnbox') && secrets.SPAWNBOX_API_KEY || '' }}
++          SPAWNBOX_URL: ${{ contains(fromJSON(inputs.providers), 'spawnbox') && (env.SPAWNBOX_URL || vars.SPAWNBOX_URL || secrets.SPAWNBOX_URL) || '' }}
+           # <<< end generated: provider-inputs-bench
+           # >>> generated: provider-runner-lifetime — bun run generate-provider-wiring
+           BENCH_RUNNER_LIFETIME_MINUTES: ${{ '' }}
+diff --git a/.github/workflows/toolchain-image.yml b/.github/workflows/toolchain-image.yml
+index 5352d3328..5c441577b 100644
+--- a/.github/workflows/toolchain-image.yml
++++ b/.github/workflows/toolchain-image.yml
+@@ -536,6 +536,8 @@ jobs:
+           BREZEL_PROJECT_ID: ${{ matrix.provider == 'brezel' && (env.BREZEL_PROJECT_ID || vars.BREZEL_PROJECT_ID || secrets.BREZEL_PROJECT_ID) || '' }}
+           BREZEL_ENVIRONMENT_REVISION: ${{ matrix.provider == 'brezel' && (env.BREZEL_ENVIRONMENT_REVISION || vars.BREZEL_ENVIRONMENT_REVISION || secrets.BREZEL_ENVIRONMENT_REVISION) || '' }}
+           DIGITAL_OCEAN_TOKEN: ${{ matrix.provider == 'digitalocean' && secrets.DIGITAL_OCEAN_TOKEN || '' }}
++          SPAWNBOX_API_KEY: ${{ matrix.provider == 'spawnbox' && secrets.SPAWNBOX_API_KEY || '' }}
++          SPAWNBOX_URL: ${{ matrix.provider == 'spawnbox' && (env.SPAWNBOX_URL || vars.SPAWNBOX_URL || secrets.SPAWNBOX_URL) || '' }}
+           # <<< end generated: provider-inputs-bake
+           VERCEL_CANDIDATE_IMAGE: ${{ steps.vercel-vcr.outcome == 'success' && steps.vercel-vcr.outputs.digest-ref || '' }}
+         run: |
+@@ -734,6 +736,8 @@ jobs:
+           BREZEL_PROJECT_ID: ${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'brezel') && (env.BREZEL_PROJECT_ID || vars.BREZEL_PROJECT_ID || secrets.BREZEL_PROJECT_ID) || '' }}
+           BREZEL_ENVIRONMENT_REVISION: ${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'brezel') && (env.BREZEL_ENVIRONMENT_REVISION || vars.BREZEL_ENVIRONMENT_REVISION || secrets.BREZEL_ENVIRONMENT_REVISION) || '' }}
+           DIGITAL_OCEAN_TOKEN: ${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'digitalocean') && secrets.DIGITAL_OCEAN_TOKEN || '' }}
++          SPAWNBOX_API_KEY: ${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'spawnbox') && secrets.SPAWNBOX_API_KEY || '' }}
++          SPAWNBOX_URL: ${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'spawnbox') && (env.SPAWNBOX_URL || vars.SPAWNBOX_URL || secrets.SPAWNBOX_URL) || '' }}
+           # <<< end generated: provider-inputs-promote
+           VERCEL_CANDIDATE_IMAGE: ${{ steps.vercel-vcr.outcome == 'success' && steps.vercel-vcr.outputs.digest-ref || '' }}
+         run: |
+diff --git a/apps/cli/src/bin/release-plan.test.ts b/apps/cli/src/bin/release-plan.test.ts
+index 061b4a47d..9cb308a84 100644
+--- a/apps/cli/src/bin/release-plan.test.ts
++++ b/apps/cli/src/bin/release-plan.test.ts
+@@ -81,6 +81,7 @@ describe("buildReleasePlan matrix", () => {
+ 			"freestyle",
+ 			"brezel",
+ 			"digitalocean",
++			"spawnbox",
+ 		]);
+ 	});
+ 
+@@ -137,7 +138,7 @@ describe("buildReleasePlan matrix", () => {
+ 		expect(plan.matrix.include.map((c) => c.provider)).toContain("boat");
+ 		expect(plan.required).toContain("blaxel");
+ 		expect(plan.required).not.toContain("boat");
+-		expect(Object.keys(RELEASE_UNSCOPABLE_PROVIDERS)).toEqual(["boat", "brezel"]);
++		expect(Object.keys(RELEASE_UNSCOPABLE_PROVIDERS)).toEqual(["boat", "brezel", "spawnbox"]);
+ 	});
+ 
+ 	// Everything keys off `partial`, never "did the operator type a list" — otherwise spelling out the
+diff --git a/apps/cli/src/bin/release-plan.ts b/apps/cli/src/bin/release-plan.ts
+index 76c7bd189..f94541444 100644
+--- a/apps/cli/src/bin/release-plan.ts
++++ b/apps/cli/src/bin/release-plan.ts
+@@ -69,6 +69,8 @@ export const RELEASE_UNSCOPABLE_PROVIDERS: Readonly<Partial<Record<ProviderId, s
+ 	boat: STOCK_IMAGE_UNSCOPABLE,
+ 	brezel:
+ 		"it boots an externally prepared environment revision that this repository cannot build or publish; credentialed validation alone cannot produce a scoped backfill",
++	spawnbox:
++		"it boots a template the operator builds on their own host from the image; this repository cannot build or publish it, so credentialed validation alone cannot produce a scoped backfill",
+ };
+ 
+ const MIRRORED_CANDIDATE_REFS = {
+diff --git a/apps/cli/src/lib/bake/validate.ts b/apps/cli/src/lib/bake/validate.ts
+index ac29a94c0..cb2c4699e 100644
+--- a/apps/cli/src/lib/bake/validate.ts
++++ b/apps/cli/src/lib/bake/validate.ts
+@@ -95,6 +95,8 @@ function candidateLaunch(id: ProviderId, refs: CandidateRefs): CandidateLaunch {
+ 		// The native SDK boots an arbitrary OCI image directly; there is no template to bake.
+ 		case "digitalocean":
+ 		// MicroVMs boot `source.oci_ref` directly; there is no template to bake.
++		case "spawnbox":
++		// The operator builds a template from the candidate image; the adapter boots it by the image name.
+ 		case "tama":
+ 			// `tama new --image` pulls an arbitrary OCI ref at create time, so the candidate boots the same
+ 			// way the published version does; there is no provider-side artifact.
+diff --git a/apps/cli/src/lib/driver-run.test.ts b/apps/cli/src/lib/driver-run.test.ts
+index 62f3ea120..7e65f894c 100644
+--- a/apps/cli/src/lib/driver-run.test.ts
++++ b/apps/cli/src/lib/driver-run.test.ts
+@@ -104,6 +104,7 @@ describe("bench-suite driver vs legacy selection (Phase A unit 1)", () => {
+ 			"namespace",
+ 			"novita",
+ 			"runcloud",
++			"spawnbox",
+ 			"tama",
+ 			"vercel",
+ 		]);
+diff --git a/bun.lock b/bun.lock
+index 073a15a23..b8b0036ea 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -178,6 +178,7 @@
+         "@sandbox-benchmarks/namespace": "workspace:*",
+         "@sandbox-benchmarks/novita": "workspace:*",
+         "@sandbox-benchmarks/runcloud": "workspace:*",
++        "@sandbox-benchmarks/spawnbox": "workspace:*",
+         "@sandbox-benchmarks/tama": "workspace:*",
+         "@sandbox-benchmarks/vercel": "workspace:*",
+       },
+@@ -378,6 +379,20 @@
+         "typescript": "catalog:",
+       },
+     },
++    "packages/spawnbox": {
++      "name": "@sandbox-benchmarks/spawnbox",
++      "version": "0.0.0",
++      "dependencies": {
++        "@sandbox-benchmarks/driver": "workspace:*",
++        "@sandbox-benchmarks/schema": "workspace:*",
++        "arktype": "catalog:",
++      },
++      "devDependencies": {
++        "@repo/tsconfig": "workspace:*",
++        "@types/bun": "catalog:",
++        "typescript": "catalog:",
++      },
++    },
+     "packages/tama": {
+       "name": "@sandbox-benchmarks/tama",
+       "version": "0.0.0",
+@@ -1030,6 +1045,8 @@
+ 
+     "@sandbox-benchmarks/schema": ["@sandbox-benchmarks/schema@workspace:packages/schema"],
+ 
++    "@sandbox-benchmarks/spawnbox": ["@sandbox-benchmarks/spawnbox@workspace:packages/spawnbox"],
++
+     "@sandbox-benchmarks/tama": ["@sandbox-benchmarks/tama@workspace:packages/tama"],
+ 
+     "@sandbox-benchmarks/templates": ["@sandbox-benchmarks/templates@workspace:packages/templates"],
+diff --git a/docs/ci-secrets.md b/docs/ci-secrets.md
+index 598fbb3fc..cdaee5513 100644
+--- a/docs/ci-secrets.md
++++ b/docs/ci-secrets.md
+@@ -239,6 +239,7 @@ Do this in the GitHub UI (Settings → Environments / Rules / Actions), then del
+    | `FREESTYLE_API_KEY` | Freestyle provider runtime and validation |
+    | `BREZEL_API_KEY` | Brezel provider runtime and validation |
+    | `DIGITAL_OCEAN_TOKEN` | DigitalOcean MicroVMs provider runtime and validation |
++   | `SPAWNBOX_API_KEY` | Spawnbox provider runtime and validation |
+    <!-- <<< end generated: provider-secrets -->
+ 
+    For Boat, a key created with the `ci` preset is insufficient: that preset omits
+@@ -305,6 +306,7 @@ Do this in the GitHub UI (Settings → Environments / Rules / Actions), then del
+    | `BREZEL_API_URL` | Brezel | — |
+    | `BREZEL_PROJECT_ID` | Brezel | — |
+    | `BREZEL_ENVIRONMENT_REVISION` | Brezel | — |
++   | `SPAWNBOX_URL` | Spawnbox | — |
+    <!-- <<< end generated: provider-variables -->
+ 
+    Optional values with a declared provider default use it when unset. The two Vercel namespace
+diff --git a/packages/drivers/package.json b/packages/drivers/package.json
+index ea9ba8e6a..06776e92f 100644
+--- a/packages/drivers/package.json
++++ b/packages/drivers/package.json
+@@ -27,6 +27,7 @@
+     "@sandbox-benchmarks/namespace": "workspace:*",
+     "@sandbox-benchmarks/novita": "workspace:*",
+     "@sandbox-benchmarks/runcloud": "workspace:*",
++    "@sandbox-benchmarks/spawnbox": "workspace:*",
+     "@sandbox-benchmarks/tama": "workspace:*",
+     "@sandbox-benchmarks/vercel": "workspace:*"
+   },
+diff --git a/packages/drivers/src/index.test.ts b/packages/drivers/src/index.test.ts
+index 5dab721ac..c13fb1ec6 100644
+--- a/packages/drivers/src/index.test.ts
++++ b/packages/drivers/src/index.test.ts
+@@ -29,6 +29,7 @@ describe("generated driver loader", () => {
+ 			"freestyle",
+ 			"brezel",
+ 			"digitalocean",
++			"spawnbox",
+ 		]);
+ 		expect(Object.values(DRIVERS).every((load) => typeof load === "function")).toBe(true);
+ 		expect(Object.isFrozen(DRIVERS)).toBe(true);
+diff --git a/packages/drivers/src/index.ts b/packages/drivers/src/index.ts
+index 432b1ce7a..dbf420758 100644
+--- a/packages/drivers/src/index.ts
++++ b/packages/drivers/src/index.ts
+@@ -23,6 +23,7 @@ export interface DriverModuleMap {
+ 	freestyle: typeof import("@sandbox-benchmarks/freestyle").default;
+ 	brezel: typeof import("@sandbox-benchmarks/brezel").default;
+ 	digitalocean: typeof import("@sandbox-benchmarks/digitalocean").default;
++	spawnbox: typeof import("@sandbox-benchmarks/spawnbox").default;
+ }
+ 
+ type Assert<Condition extends true> = Condition;
+@@ -58,6 +59,7 @@ export const DRIVERS: {
+ 	freestyle: () => import("@sandbox-benchmarks/freestyle").then((module) => module.default),
+ 	brezel: () => import("@sandbox-benchmarks/brezel").then((module) => module.default),
+ 	digitalocean: () => import("@sandbox-benchmarks/digitalocean").then((module) => module.default),
++	spawnbox: () => import("@sandbox-benchmarks/spawnbox").then((module) => module.default),
+ });
+ 
+ export const loadDriverModule = <P extends DriverProviderId>(id: P): Promise<DriverModuleMap[P]> =>
+diff --git a/packages/providers/src/lib/adapters.ts b/packages/providers/src/lib/adapters.ts
+index ed652ce64..ce7928be7 100644
+--- a/packages/providers/src/lib/adapters.ts
++++ b/packages/providers/src/lib/adapters.ts
+@@ -33,6 +33,7 @@ export const MIGRATED_DRIVER_IDS = [
+ 	"freestyle",
+ 	"brezel",
+ 	"digitalocean",
++	"spawnbox",
+ ] as const satisfies readonly ProviderId[];
+ 
+ /** A schema id served by a registered DriverModule. Derived from the list, so the two cannot drift. */
+diff --git a/packages/schema/scripts/generate-provider-wiring.test.ts b/packages/schema/scripts/generate-provider-wiring.test.ts
+index 4b1d3a1e1..3abf87b40 100644
+--- a/packages/schema/scripts/generate-provider-wiring.test.ts
++++ b/packages/schema/scripts/generate-provider-wiring.test.ts
+@@ -272,6 +272,7 @@ describe("provider wiring projections", () => {
+ 			"freestyle",
+ 			"brezel",
+ 			"digitalocean",
++			"spawnbox",
+ 		]);
+ 		expect([...PROVIDER_IDS].filter((id) => fleet.waivers[id] !== undefined)).toEqual([]);
+ 
+diff --git a/packages/schema/scripts/generate-provider-wiring.ts b/packages/schema/scripts/generate-provider-wiring.ts
+index c020ddafc..64336eba1 100644
+--- a/packages/schema/scripts/generate-provider-wiring.ts
++++ b/packages/schema/scripts/generate-provider-wiring.ts
+@@ -518,6 +518,8 @@ export function renderDriversProvenance(root = REPO_ROOT): Map<string, string> {
+ 		["BREZEL", REGISTRY.brezel.sdkPackage, catalogVersion(catalog, REGISTRY.brezel.sdkPackage)],
+ 		// No client library covers MicroVMs yet; the adapter targets the documented v2 REST API.
+ 		["DIGITALOCEAN", REGISTRY.digitalocean.sdkPackage, "v2"],
++		// No client library is published; the adapter targets the documented v1 HTTP API.
++		["SPAWNBOX", REGISTRY.spawnbox.sdkPackage, "v1"],
+ 	] as const;
+ 	const packages = new Set(
+ 		driverFleetProjection(root).moduleIds.map((id) => driverModuleLocation(id).directory),
+diff --git a/packages/schema/src/provider-ids.ts b/packages/schema/src/provider-ids.ts
+index cf71c7b5c..812bf743f 100644
+--- a/packages/schema/src/provider-ids.ts
++++ b/packages/schema/src/provider-ids.ts
+@@ -22,6 +22,7 @@ export const PROVIDER_IDS = [
+ 	"freestyle",
+ 	"brezel",
+ 	"digitalocean",
++	"spawnbox",
+ ] as const;
+ 
+ export type ProviderId = (typeof PROVIDER_IDS)[number];
+diff --git a/packages/schema/src/provider-meta.test.ts b/packages/schema/src/provider-meta.test.ts
+index 1a332c264..b1aaad09a 100644
+--- a/packages/schema/src/provider-meta.test.ts
++++ b/packages/schema/src/provider-meta.test.ts
+@@ -32,6 +32,7 @@ const REQUIRED_INPUTS = {
+ 	freestyle: ["FREESTYLE_API_KEY"],
+ 	brezel: ["BREZEL_API_KEY", "BREZEL_API_URL", "BREZEL_PROJECT_ID", "BREZEL_ENVIRONMENT_REVISION"],
+ 	digitalocean: ["DIGITAL_OCEAN_TOKEN"],
++	spawnbox: ["SPAWNBOX_API_KEY", "SPAWNBOX_URL"],
+ } as const satisfies Record<ProviderId, readonly string[]>;
+ 
+ const ARTIFACT_KINDS = {
+@@ -51,6 +52,7 @@ const ARTIFACT_KINDS = {
+ 	freestyle: "baked",
+ 	brezel: "none",
+ 	digitalocean: "image",
++	spawnbox: "image",
+ } as const satisfies Record<ProviderId, (typeof REGISTRY)[ProviderId]["artifact"]["kind"]>;
+ 
+ const BAKED = {
+diff --git a/packages/schema/src/provider-meta/index.ts b/packages/schema/src/provider-meta/index.ts
+index b02ad2b65..f5f4e6ae5 100644
+--- a/packages/schema/src/provider-meta/index.ts
++++ b/packages/schema/src/provider-meta/index.ts
+@@ -15,6 +15,7 @@ import modal_vm from "./modal-vm.ts";
+ import namespace from "./namespace.ts";
+ import novita from "./novita.ts";
+ import runcloud from "./runcloud.ts";
++import spawnbox from "./spawnbox.ts";
+ import tama from "./tama.ts";
+ import vercel from "./vercel.ts";
+ 
+@@ -35,6 +36,7 @@ const MODULES = {
+ 	freestyle: freestyle,
+ 	brezel: brezel,
+ 	digitalocean: digitalocean,
++	spawnbox: spawnbox,
+ } as const satisfies { [P in ProviderId]: ProviderMetaModule<P> };
+ 
+ export const REGISTRY = {
+@@ -54,6 +56,7 @@ export const REGISTRY = {
+ 	freestyle: MODULES.freestyle.meta,
+ 	brezel: MODULES.brezel.meta,
+ 	digitalocean: MODULES.digitalocean.meta,
++	spawnbox: MODULES.spawnbox.meta,
+ } as const satisfies Record<ProviderId, ProviderMetaSource>;
+ 
+ type IdsWithArtifact<K extends ProviderArtifact["kind"]> = {
+diff --git a/packages/schema/src/provider-meta/spawnbox.ts b/packages/schema/src/provider-meta/spawnbox.ts
+new file mode 100644
+index 000000000..c684d32d9
+--- /dev/null
++++ b/packages/schema/src/provider-meta/spawnbox.ts
+@@ -0,0 +1,37 @@
++import { defineProviderMeta } from "../provider-meta.ts";
++
++export default defineProviderMeta("spawnbox", {
++	displayName: "Spawnbox",
++	vendor: "TulipFarm",
++	website: "https://github.com/TulipFarm/spawnbox",
++	// No client library is published; the adapter targets the documented `/v1` HTTP API.
++	sdkPackage: "Spawnbox HTTP API",
++	// The operator builds a Spawnbox template whose `base` is the shared toolchain image; the adapter
++	// boots that template and proves its `base` is exactly the resolved image ref.
++	artifact: { kind: "image" },
++	inputs: ["SPAWNBOX_API_KEY", { name: "SPAWNBOX_URL", source: { kind: "variable" } }],
++	isolation: {
++		class: "microVM",
++		technology: "Firecracker microVM",
++		notes:
++			"Self-hosted. Each sandbox is a Firecracker microVM restored from a template snapshot, with its own guest kernel. On a host without KVM, Spawnbox falls back to gVisor; a benchmark host must have KVM.",
++	},
++	pricing: {
++		model: "unavailable",
++		reason: "self_hosted",
++		notes:
++			"Spawnbox is open-source and self-hosted, so cost depends on the operator's host, storage, and network rather than a published per-sandbox rate.",
++	},
++	maturity: {
++		status: "beta",
++		notes:
++			"HTTP API driver for create, command execution, files, inventory, ambiguous-create recovery by label, and teardown. The endpoint is operator-run: results depend on the host it runs on.",
++	},
++	// The template pins 4 vCPU / 8 GiB / 40 GiB; a create request cannot change it.
++	specPinning: "fixed",
++	transport: {
++		streaming: false,
++		syncCapMs: 60_000,
++		detachedPoll: true,
++	},
++});
+diff --git a/packages/schema/src/providers.test.ts b/packages/schema/src/providers.test.ts
+index 47fcb96f1..2bc2d6811 100644
+--- a/packages/schema/src/providers.test.ts
++++ b/packages/schema/src/providers.test.ts
+@@ -78,6 +78,7 @@ describe("@sandbox-benchmarks/schema providers", () => {
+ 			"namespace",
+ 			"novita",
+ 			"runcloud",
++			"spawnbox",
+ 			"tama",
+ 			"vercel",
+ 		]);
+diff --git a/packages/spawnbox/README.md b/packages/spawnbox/README.md
+new file mode 100644
+index 000000000..851f41c69
+--- /dev/null
++++ b/packages/spawnbox/README.md
+@@ -0,0 +1,36 @@
++# @sandbox-benchmarks/spawnbox
++
++Driver for [Spawnbox](https://github.com/TulipFarm/spawnbox), an open-source, self-hosted sandbox
++server that runs each sandbox as a Firecracker microVM. The adapter speaks Spawnbox's documented
++`/v1` HTTP API; no client library is used.
++
++## Inputs
++
++| Variable           | Kind     | Meaning                                                    |
++| ------------------ | -------- | ---------------------------------------------------------- |
++| `SPAWNBOX_API_KEY` | secret   | An organization key (`sbx_org_...`) for the Spawnbox host. |
++| `SPAWNBOX_URL`     | variable | The API base URL, such as `https://spawnbox.example:8443`. |
++
++## Preparing the host
++
++Spawnbox sizes a sandbox by its template, so the operator builds one template from the toolchain
++image at the target shape before a run. The adapter derives the template name from the image ref:
++`ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8` becomes `sandbox-benchmarks-toolchain-v8`.
++
++```sh
++curl -fsS -X POST "$SPAWNBOX_URL/v1/templates" \
++  -H "Authorization: Bearer $SPAWNBOX_API_KEY" -H 'Content-Type: application/json' \
++  -d '{"name":"sandbox-benchmarks-toolchain-v8",
++       "base":"ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8",
++       "resources":{"vcpus":4,"memory_mib":8192,"disk_gib":42}}'
++```
++
++Wait until `GET /v1/templates/sandbox-benchmarks-toolchain-v8` reports a `latest_build.state` of
++`ready`. The disk is a little larger than the 40 GB target so the guest filesystem still reports
++at least 40 GiB after its own metadata.
++
++Before returning a session, the adapter checks that the template's `base` is exactly the resolved
++image ref and that it pins 4 vCPU and 8 GiB. The kit then checks the guest's disk with `df`.
++
++Run the host with KVM, so sandboxes are Firecracker microVMs rather than the gVisor fallback, and
++with enough capacity for the suite's concurrency without memory overcommit.
+diff --git a/packages/spawnbox/package.json b/packages/spawnbox/package.json
+new file mode 100644
+index 000000000..08e3f2912
+--- /dev/null
++++ b/packages/spawnbox/package.json
+@@ -0,0 +1,26 @@
++{
++  "name": "@sandbox-benchmarks/spawnbox",
++  "version": "0.0.0",
++  "private": true,
++  "description": "Spawnbox sandbox integration for driverkit.",
++  "type": "module",
++  "sideEffects": false,
++  "exports": {
++    ".": "./src/index.ts",
++    "./package.json": "./package.json"
++  },
++  "scripts": {
++    "test": "bun test",
++    "typecheck": "tsc --noEmit"
++  },
++  "dependencies": {
++    "@sandbox-benchmarks/driver": "workspace:*",
++    "@sandbox-benchmarks/schema": "workspace:*",
++    "arktype": "catalog:"
++  },
++  "devDependencies": {
++    "@repo/tsconfig": "workspace:*",
++    "@types/bun": "catalog:",
++    "typescript": "catalog:"
++  }
++}
+diff --git a/packages/spawnbox/src/index.ts b/packages/spawnbox/src/index.ts
+new file mode 100644
+index 000000000..a128063b0
+--- /dev/null
++++ b/packages/spawnbox/src/index.ts
+@@ -0,0 +1,26 @@
++// The Spawnbox DriverModule: the kit's driver over the adapter, bound to the real transport here and
++// nowhere else. Tests lower the same module over a fake router through `vendorDriver`.
++
++import { defineVendorDriver, pinned } from "@sandbox-benchmarks/driver/vendor";
++import { SPAWNBOX_PROVENANCE } from "./provenance.ts";
++import {
++	CONTROL_TIMEOUT_MS,
++	SPAWNBOX_MARKER_LABEL,
++	SPAWNBOX_SANDBOX_ID,
++	spawnboxVendor,
++} from "./vendor.ts";
++
++export { SPAWNBOX_PROVENANCE, SPAWNBOX_SANDBOX_ID };
++
++export default defineVendorDriver("spawnbox", {
++	provenance: SPAWNBOX_PROVENANCE,
++	sandboxId: SPAWNBOX_SANDBOX_ID,
++	// The template pins 4 vCPU / 8 GiB (`prepare` proves it); disk is proven after boot with `df`.
++	coverage: pinned(4, 8),
++	timing: { controlTimeoutMs: CONTROL_TIMEOUT_MS },
++	// Each create carries its marker as a label; listings echo it, so `find` filters on it.
++	markerKey: SPAWNBOX_MARKER_LABEL,
++	// A create whose response was lost may still finish restoring; an empty listing proves nothing yet.
++	recovery: { provesAbsence: false },
++	vendor: (context) => spawnboxVendor(context, globalThis.fetch),
++});
+diff --git a/packages/spawnbox/src/provenance.ts b/packages/spawnbox/src/provenance.ts
+new file mode 100644
+index 000000000..fc032db4f
+--- /dev/null
++++ b/packages/spawnbox/src/provenance.ts
+@@ -0,0 +1,7 @@
++// GENERATED by packages/schema/scripts/generate-provider-wiring.ts. Do not edit.
++// Versions follow the root SDK catalog or checksum-pinned CLI setup action.
++
++export const SPAWNBOX_PROVENANCE = Object.freeze({
++	packageName: "Spawnbox HTTP API",
++	version: "v1",
++});
+diff --git a/packages/spawnbox/src/vendor.integration.test.ts b/packages/spawnbox/src/vendor.integration.test.ts
+new file mode 100644
+index 000000000..66eaadb26
+--- /dev/null
++++ b/packages/spawnbox/src/vendor.integration.test.ts
+@@ -0,0 +1,162 @@
++// Spawnbox tested at the vendor seam: the adapter's translation, the port contract over a fake REST
++// router, and sessions through the package's own module. Kit behaviour is tested in the driver package.
++
++import { describe, expect, test } from "bun:test";
++import type { CreateRequest, DriverContext } from "@sandbox-benchmarks/driver";
++import type { VendorTiming } from "@sandbox-benchmarks/driver/vendor";
++import { restStub, vendorContract, vendorDriver } from "@sandbox-benchmarks/driver/vendor/testing";
++import { TARGET_SPEC } from "@sandbox-benchmarks/schema/target-spec";
++import spawnbox from "./index.ts";
++import {
++	SPAWNBOX_MARKER_LABEL,
++	spawnboxPhase,
++	spawnboxTemplateName,
++	spawnboxVendor,
++} from "./vendor.ts";
++
++const IMAGE = "ghcr.io/starslingdev/sandbox-benchmarks-toolchain:v8";
++const TEMPLATE = "sandbox-benchmarks-toolchain-v8";
++const context: DriverContext<"spawnbox"> = {
++	env: { SPAWNBOX_API_KEY: "sbx_org_test", SPAWNBOX_URL: "http://spawnbox.test/" },
++	artifact: { kind: "image" },
++	resolvedArtifact: { kind: "image", ref: IMAGE },
++};
++const request: CreateRequest = {
++	spec: TARGET_SPEC,
++	artifact: { kind: "image", ref: IMAGE },
++	deadlineMs: 300_000,
++};
++
++const json = (value: unknown, status = 200) => Response.json(value, { status });
++const notFound = () => json({ error: { code: "not_found", message: "no such sandbox" } }, 404);
++
++interface Row {
++	readonly id: string;
++	state: string;
++	template: string;
++	labels: Record<string, string>;
++}
++
++/** A fake `/v1` API: creates answer `running`; a DELETE leaves a `deleted` record, as Spawnbox does. */
++function spawnboxServer(
++	options: {
++		readonly base?: string;
++		readonly resources?: { vcpus: number; memory_mib: number; disk_gib: number };
++		readonly truncate?: boolean;
++	} = {},
++) {
++	const view = ({ id, state, template, labels }: Row) => ({ id, state, template, labels });
++	return restStub<Row>(
++		{
++			"POST /v1/sandboxes": ({ body, add }) =>
++				json(
++					view(add({ state: "running", template: body.template, labels: body.labels ?? {} })),
++					201,
++				),
++			"GET /v1/sandboxes": ({ rows, url }) => {
++				const all = [...rows.values()];
++				const start = Number(url.searchParams.get("cursor") ?? 0);
++				const limit = 1;
++				const next = start + limit < all.length ? String(start + limit) : null;
++				return { sandboxes: all.slice(start, start + limit).map(view), next_cursor: next };
++			},
++			"GET /v1/sandboxes/:id": ({ row }) => view(row),
++			"DELETE /v1/sandboxes/:id": ({ row }) => {
++				row.state = "deleted";
++				return undefined;
++			},
++			"POST /v1/sandboxes/:id/exec": ({ body, run }) => {
++				if (body.cmd === "fixture")
++					return { stdout: "out\n", stderr: "err\n", exit_code: 7, timed_out: false };
++				const { stdout, stderr, exitCode } = run(body.cmd);
++				return {
++					stdout,
++					stderr,
++					exit_code: exitCode,
++					...(options.truncate && { stdout_truncated: true }),
++				};
++			},
++			"GET /v1/sandboxes/:id/files": ({ url, files }) => {
++				const text = files.get(url.searchParams.get("path") ?? "");
++				return text === undefined ? notFound() : new Response(text);
++			},
++			"PUT /v1/sandboxes/:id/files": ({ url, files, body }) => {
++				files.set(url.searchParams.get("path") ?? "", String(body));
++				return undefined;
++			},
++			"GET /v1/templates/:name": ({ params }) =>
++				params.name === TEMPLATE
++					? {
++							name: TEMPLATE,
++							base: options.base ?? IMAGE,
++							resources: options.resources ?? { vcpus: 4, memory_mib: 8192, disk_gib: 40 },
++							current_build: "bld_1",
++						}
++					: notFound(),
++		},
++		{ newId: (n) => `sbx_${n}`, missing: notFound },
++	);
++}
++
++const FAST: Partial<VendorTiming> = { pollMs: 0, readyTimeoutMs: 500, deleteTimeoutMs: 500 };
++const vendorOver = (server: ReturnType<typeof spawnboxServer>) =>
++	spawnboxVendor(context, server.fetch);
++const driverOver = (server: ReturnType<typeof spawnboxServer>) =>
++	vendorDriver(spawnbox, context, { vendor: vendorOver(server), timing: FAST });
++
++vendorContract("spawnbox adapter", spawnbox, () => vendorOver(spawnboxServer()));
++
++test("the template name is derived from the image ref within Spawnbox's name rules", () => {
++	expect(spawnboxTemplateName(IMAGE)).toBe(TEMPLATE);
++	expect(spawnboxTemplateName("ghcr.io/org/Toolchain:sha-abc@sha256:00")).toBe("toolchain-sha-abc");
++	expect(spawnboxTemplateName("ghcr.io/org/9tool:v1")).toBe("tool-v1");
++});
++
++test("a paused sandbox resumes on its next call, and a deleted record is gone", () => {
++	expect(spawnboxPhase("paused")).toBe("ready");
++	expect(spawnboxPhase("starting")).toBe("pending");
++	expect(spawnboxPhase("deleted")).toBe("gone");
++});
++
++describe("Spawnbox end to end through its module", () => {
++	test("a session boots the image's template as root, executes, and is deleted", async () => {
++		const server = spawnboxServer();
++		const session = await driverOver(server).create(request);
++		const create = server.calls.find(
++			(call) => call.method === "POST" && call.path === "/v1/sandboxes",
++		);
++		expect(create?.headers.get("authorization")).toBe("Bearer sbx_org_test");
++		expect(create?.body).toMatchObject({ template: TEMPLATE, idle_pause_s: 0 });
++		const labels = (create?.body as { labels: Record<string, string> }).labels;
++		expect(labels[SPAWNBOX_MARKER_LABEL]).toMatch(/^benchmark-[0-9a-f-]{36}$/);
++
++		const result = await session.exec("fixture");
++		expect(result.exit).toEqual({ kind: "exited", code: 7 });
++		expect([result.stdout, result.stderr]).toEqual(["out\n", "err\n"]);
++		const exec = server.calls.find((call) => call.path.endsWith("/exec"));
++		expect(exec?.body).toMatchObject({ user: "root" });
++		await session.destroy();
++		expect([...server.rows.values()].map((row) => row.state)).toEqual(["deleted"]);
++	});
++
++	test("a template built from another image is refused and torn down", async () => {
++		const server = spawnboxServer({ base: "debian:bookworm" });
++		await expect(driverOver(server).create(request)).rejects.toThrow();
++		expect([...server.rows.values()].map((row) => row.state)).toEqual(["deleted"]);
++	});
++
++	test("a template of another shape is refused", async () => {
++		const server = spawnboxServer({ resources: { vcpus: 2, memory_mib: 4096, disk_gib: 40 } });
++		await expect(driverOver(server).create(request)).rejects.toThrow();
++		expect([...server.rows.values()].map((row) => row.state)).toEqual(["deleted"]);
++	});
++
++	test("truncated output is never returned as a result", async () => {
++		const vendor = vendorOver(spawnboxServer({ truncate: true }));
++		const { raw } = await vendor.control.create(
++			{ request, marker: "benchmark-00000000-0000-4000-8000-000000000001" },
++			{ signal: new AbortController().signal },
++		);
++		await expect(vendor.data.exec(raw, "echo hi")).rejects.toThrow("truncated");
++	});
++});
+diff --git a/packages/spawnbox/src/vendor.ts b/packages/spawnbox/src/vendor.ts
+new file mode 100644
+index 000000000..83c7f5c75
+--- /dev/null
++++ b/packages/spawnbox/src/vendor.ts
+@@ -0,0 +1,293 @@
++// Spawnbox's vendor adapter: translation only, over the documented `/v1` HTTP API (no client
++// library is published). Readiness, cleanup confirmation, recovery, inventory and the disk proof
++// live in the driver kit.
++//
++// Spawnbox sizes a sandbox by its template, not by the create request. The operator builds one
++// template from the shared toolchain image at the target shape (see the package README); the
++// adapter boots it by a name derived from the image ref and, before the session is returned,
++// proves the template's `base` is that ref and its resources are the requested shape.
++
++import type { CreateRequest, DriverContext } from "@sandbox-benchmarks/driver";
++import type { Phase, Vendor, VendorRecord } from "@sandbox-benchmarks/driver/vendor";
++import {
++	bounded,
++	httpClassifiers,
++	httpStatus,
++	LEAK_EXPIRY_MS,
++} from "@sandbox-benchmarks/driver/vendor";
++import { type } from "arktype";
++
++export const SPAWNBOX_SANDBOX_ID = type(/^sbx_[a-z0-9]+$/);
++/** The label a create carries its ownership marker under; listings echo labels back. */
++export const SPAWNBOX_MARKER_LABEL = "benchmark-marker";
++/** The bound on one control request. A create restores a snapshot and answers when it runs. */
++export const CONTROL_TIMEOUT_MS = 120_000;
++/** Server-side bound on one synchronous command, past the harness's 60 s synchronous cap. */
++const EXEC_TIMEOUT_S = 300;
++const EXEC_REQUEST_TIMEOUT_MS = (EXEC_TIMEOUT_S + 30) * 1000;
++const PAGE_LIMIT = 200;
++/** Commands run as root, the toolchain image's own user, as on the other image-booting providers. */
++const RUN_AS = "root";
++
++/**
++ * The template the operator built from `imageRef`: its last path segment and tag, lowercased, with
++ * every other character a hyphen (`ghcr.io/org/sandbox-benchmarks-toolchain:v8` →
++ * `sandbox-benchmarks-toolchain-v8`). Spawnbox names are `a-z`, `0-9` and `-`, starting with a letter.
++ */
++export function spawnboxTemplateName(imageRef: string): string {
++	const last = imageRef.split("/").at(-1) ?? imageRef;
++	const name = last
++		.split("@")[0]
++		?.toLowerCase()
++		.replace(/[^a-z0-9]+/g, "-")
++		.replace(/^[^a-z]+|-+$/g, "");
++	if (!name) throw new Error(`cannot derive a Spawnbox template name from ${imageRef}`);
++	return name.slice(0, 63).replace(/-+$/, "");
++}
++
++const sandbox = type({
++	id: SPAWNBOX_SANDBOX_ID,
++	state: "string >= 1",
++	template: "string",
++	labels: type({ "[string]": "string" }),
++}).onUndeclaredKey("ignore");
++type SpawnboxSandbox = typeof sandbox.infer;
++const page = type({
++	sandboxes: sandbox.array(),
++	"next_cursor?": "string | null",
++}).onUndeclaredKey("ignore");
++const template = type({
++	name: "string",
++	"base?": "string | null",
++	resources: type({
++		vcpus: "number",
++		memory_mib: "number",
++		disk_gib: "number",
++	}).onUndeclaredKey("ignore"),
++	"current_build?": "string | null",
++}).onUndeclaredKey("ignore");
++const execResult = type({
++	stdout: "string",
++	stderr: "string",
++	"exit_code?": "number | null",
++	"signal?": "number | string | null",
++	"timed_out?": "boolean",
++	"stdout_truncated?": "boolean",
++	"stderr_truncated?": "boolean",
++}).onUndeclaredKey("ignore");
++const errorBody = type({
++	error: type({ "code?": "string", "message?": "string" }).onUndeclaredKey("ignore"),
++}).onUndeclaredKey("ignore");
++
++/** A non-2xx answer, carrying Spawnbox's `{error: {code, message}}` body. */
++export class SpawnboxError extends Error {
++	constructor(
++		readonly status: number,
++		readonly code: string | undefined,
++		message: string,
++	) {
++		super(`Spawnbox ${status}${code ? ` ${code}` : ""}: ${message}`);
++		this.name = "SpawnboxError";
++	}
++}
++const status = httpStatus(SpawnboxError, (error) => error.status);
++const classifiers = httpClassifiers(status);
++
++/**
++ * A paused sandbox keeps its memory and disk and the next call resumes it, so it is `ready`. A
++ * `cold` sandbox exists only for persistent sandboxes, which the benchmark never creates.
++ */
++export function spawnboxPhase(state: string): Phase {
++	switch (state) {
++		case "running":
++		case "paused":
++		case "cold":
++			return "ready";
++		case "deleted":
++			return "gone";
++		case "failed":
++			return "failed";
++		default:
++			return "pending";
++	}
++}
++
++function record(row: SpawnboxSandbox): VendorRecord<SpawnboxSandbox> {
++	const marker = row.labels[SPAWNBOX_MARKER_LABEL];
++	return {
++		id: row.id,
++		phase: spawnboxPhase(row.state),
++		...(marker && { marker }),
++		raw: row,
++	};
++}
++
++/** The adapter over one transport: production binds `globalThis.fetch`, tests a fake router. */
++export function spawnboxVendor(
++	{ env, resolvedArtifact }: Pick<DriverContext<"spawnbox">, "env" | "resolvedArtifact">,
++	transport: typeof globalThis.fetch,
++): Vendor<SpawnboxSandbox, SpawnboxSandbox> {
++	if (resolvedArtifact.kind !== "image")
++		throw new Error("Spawnbox boots a template built from the resolved toolchain image");
++	const imageRef = resolvedArtifact.ref;
++	const templateName = spawnboxTemplateName(imageRef);
++	const base = `${env.SPAWNBOX_URL.replace(/\/+$/, "")}/v1`;
++
++	const request = (
++		method: string,
++		path: string,
++		options: { body?: unknown; raw?: string; signal?: AbortSignal; timeoutMs?: number } = {},
++	): Promise<unknown> =>
++		bounded(options.signal, options.timeoutMs ?? CONTROL_TIMEOUT_MS, async (within) => {
++			const body =
++				options.raw ?? (options.body === undefined ? undefined : JSON.stringify(options.body));
++			const response = await transport(`${base}${path}`, {
++				method,
++				headers: {
++					Authorization: `Bearer ${env.SPAWNBOX_API_KEY}`,
++					...(options.body !== undefined && { "Content-Type": "application/json" }),
++				},
++				...(body !== undefined && { body }),
++				signal: within,
++			});
++			const text = await response.text();
++			if (response.ok) {
++				if (!text) return undefined;
++				try {
++					return JSON.parse(text);
++				} catch {
++					return text;
++				}
++			}
++			let parsed: unknown;
++			try {
++				parsed = JSON.parse(text);
++			} catch {
++				parsed = undefined;
++			}
++			const error = errorBody(parsed);
++			const { code, message } = error instanceof type.errors ? {} : error.error;
++			throw new SpawnboxError(
++				response.status,
++				code,
++				message ?? (text.slice(0, 200) || response.statusText),
++			);
++		});
++
++	const listPage = async (cursor: string | undefined, signal: AbortSignal) => {
++		const listed = page.assert(
++			await request(
++				"GET",
++				`/sandboxes?limit=${PAGE_LIMIT}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
++				{ signal },
++			),
++		);
++		return {
++			records: listed.sandboxes.map(record),
++			...(listed.next_cursor ? { next: listed.next_cursor } : {}),
++		};
++	};
++
++	const filePath = (path: string) =>
++		`/files?path=${encodeURIComponent(path)}&user=${encodeURIComponent(RUN_AS)}`;
++
++	return {
++		control: {
++			// The create answers once the sandbox runs (a snapshot restore), so the response proves
++			// readiness. The lifetime is a backstop for a sandbox every teardown missed.
++			create: async ({ marker }, { signal }) =>
++				record(
++					sandbox.assert(
++						await request("POST", "/sandboxes", {
++							body: {
++								template: templateName,
++								timeout_s: LEAK_EXPIRY_MS / 1000,
++								idle_pause_s: 0,
++								labels: { [SPAWNBOX_MARKER_LABEL]: marker },
++							},
++							signal,
++						}),
++					),
++				),
++			get: async (id, { signal }) =>
++				record(sandbox.assert(await request("GET", `/sandboxes/${id}`, { signal }))),
++			// A 204 stops the VM before it answers; the kit still reads until the record is `deleted`.
++			remove: async (id, { signal }) => {
++				await request("DELETE", `/sandboxes/${id}`, { signal });
++				return "accepted";
++			},
++			page: (cursor, { signal }) => listPage(cursor, signal),
++			// Spawnbox has no label filter: a lookup pages the account and keeps the marker's rows.
++			find: async (marker, cursor, { signal }) => {
++				const listed = await listPage(cursor, signal);
++				return { ...listed, records: listed.records.filter((row) => row.marker === marker) };
++			},
++			...classifiers,
++			// A request that reached no HTTP status (a dropped connection, the request's own bound) is
++			// asked again; a caller's abort is neither.
++			transient: (error) =>
++				status(error) === undefined
++					? error instanceof TypeError || (error instanceof Error && error.name === "TimeoutError")
++					: classifiers.transient(error),
++		},
++		data: {
++			attach: ({ raw }) => raw,
++			// The sandbox must come from the template built from exactly this image, at the requested shape.
++			prepare: async ({ record: { raw } }, { spec }: CreateRequest, { signal }) => {
++				if (raw.template !== templateName)
++					return {
++						status: "unsupported",
++						detail: `sandbox runs template ${raw.template}, not ${templateName}`,
++					};
++				const built = template.assert(
++					await request("GET", `/templates/${templateName}`, { signal }),
++				);
++				if (built.base !== imageRef)
++					return {
++						status: "unsupported",
++						detail: `template ${templateName} was built from ${built.base ?? "the Debian base"}, not ${imageRef}`,
++					};
++				const { vcpus, memory_mib, disk_gib } = built.resources;
++				if (
++					vcpus !== spec.vcpus ||
++					memory_mib !== spec.memoryGb * 1024 ||
++					(spec.diskGb !== undefined && disk_gib < spec.diskGb)
++				)
++					return {
++						status: "unsupported",
++						detail: `template ${templateName} is ${vcpus} vCPU / ${memory_mib} MiB / ${disk_gib} GiB, not ${spec.vcpus} vCPU / ${spec.memoryGb * 1024} MiB / ${spec.diskGb ?? "any"} GiB`,
++					};
++				return { status: "honored", reportedArtifact: { kind: "image", ref: imageRef } };
++			},
++			exec: async (native, command, options) => {
++				const result = execResult.assert(
++					await request("POST", `/sandboxes/${native.id}/exec`, {
++						body: { cmd: command, user: RUN_AS, timeout_s: EXEC_TIMEOUT_S },
++						...(options?.signal && { signal: options.signal }),
++						timeoutMs: EXEC_REQUEST_TIMEOUT_MS,
++					}),
++				);
++				// The vendor port has no truncation or timeout field, so neither may pass as a result.
++				if (result.stdout_truncated || result.stderr_truncated)
++					throw new Error("Spawnbox exec output exceeded its 1 MiB limit and was truncated");
++				if (result.timed_out)
++					throw new Error(`Spawnbox exec exceeded its ${EXEC_TIMEOUT_S}s server-side timeout`);
++				return {
++					...(typeof result.exit_code === "number" && { exitCode: result.exit_code }),
++					stdout: result.stdout,
++					stderr: result.stderr,
++				};
++			},
++			files: {
++				read: async (native, path) => {
++					const body = await request("GET", `/sandboxes/${native.id}${filePath(path)}`);
++					if (typeof body !== "string") throw new Error(`Spawnbox path ${path} is not a file`);
++					return body;
++				},
++				write: async (native, path, text) => {
++					await request("PUT", `/sandboxes/${native.id}${filePath(path)}`, { raw: text });
++				},
++			},
++		},
++	};
++}
+diff --git a/packages/spawnbox/tsconfig.json b/packages/spawnbox/tsconfig.json
+new file mode 100644
+index 000000000..698c9b4d2
+--- /dev/null
++++ b/packages/spawnbox/tsconfig.json
+@@ -0,0 +1,4 @@
++{
++  "extends": "@repo/tsconfig/library.json",
++  "include": ["src"]
++}
+diff --git a/scripts/setup-privileged-environment.sh b/scripts/setup-privileged-environment.sh
+index 2f6805530..0d171f4a3 100755
+--- a/scripts/setup-privileged-environment.sh
++++ b/scripts/setup-privileged-environment.sh
+@@ -59,7 +59,7 @@ echo "Secret checklist:"
+ echo "  E2B_API_KEY, DAYTONA_API_KEY, BL_API_KEY, BL_WORKSPACE"
+ echo "  MSB_API_KEY, MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, NOVITA_API_KEY"
+ echo "  RUN_CLOUD_API_KEY, TAMA_TOKEN, BOAT_API_KEY, FREESTYLE_API_KEY"
+-echo "  BREZEL_API_KEY, DIGITAL_OCEAN_TOKEN"
++echo "  BREZEL_API_KEY, DIGITAL_OCEAN_TOKEN, SPAWNBOX_API_KEY"
+ # <<< end generated: provider-secret-checklist
+ echo "  VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID (Vercel bootstrap)"
+ echo
+-- 
+2.54.0 (Apple Git-157)
+

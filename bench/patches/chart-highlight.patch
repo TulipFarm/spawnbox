@@ -1,0 +1,41 @@
+diff --git a/packages/figures/src/chart/template.ts b/packages/figures/src/chart/template.ts
+index b8cedcfd0..0a0fa30c6 100644
+--- a/packages/figures/src/chart/template.ts
++++ b/packages/figures/src/chart/template.ts
+@@ -238,7 +238,7 @@ export function chartDocument(parts: {
+ <title>${escapeHtml(parts.title)}</title>
+ <style>
+ ${fontFaceCss()}
+-${BASE_STYLE}${parts.style}</style>
++${BASE_STYLE}${parts.style}${HIGHLIGHT_STYLE}</style>
+ </head>
+ <body>
+ <main class="figure">
+@@ -246,7 +246,7 @@ ${BASE_STYLE}${parts.style}</style>
+ <p class="summary">${escapeHtml(parts.summary)}</p>
+ <p class="note">${parts.noteHtml}</p>
+ <section>
+-${parts.rows.join("\n")}
++${highlightRows(parts.rows).join("\n")}
+ </section>
+ <ul class="legend">${parts.legendItems.join("")}<li class="legend-note">${escapeHtml(parts.legendNote)}</li></ul>
+ </main>
+@@ -254,3 +254,18 @@ ${parts.rows.join("\n")}
+ </html>
+ `;
+ }
++
++// Local only: HIGHLIGHT_PROVIDER=Spawnbox marks that provider's row.
++const HIGHLIGHT = process.env.HIGHLIGHT_PROVIDER;
++const HIGHLIGHT_STYLE = HIGHLIGHT
++	? `.row.hl { background: #fff1e6; box-shadow: 0 0 0 8px #fff1e6, 0 0 0 10px #f97316; border-radius: 4px; }
++.row.hl .provider-title { color: #c2410c; font-weight: 700; }
++.row.hl .fill { background: #f97316 !important; }
++.row.hl .total { color: #c2410c; }
++`
++	: "";
++function highlightRows(rows: readonly string[]): readonly string[] {
++	if (!HIGHLIGHT) return rows;
++	const marker = `<span class="provider-title">${escapeHtml(HIGHLIGHT)}</span>`;
++	return rows.map((r) => (r.includes(marker) ? r.replace('<div class="row', '<div class="row hl') : r));
++}
