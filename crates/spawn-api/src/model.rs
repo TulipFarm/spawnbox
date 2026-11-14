@@ -1219,11 +1219,26 @@ pub enum Code {
     Cold,
     /// A change to where a secret's value goes must send the value.
     ValueRequired,
+    /// A forwarded request reached a host that does not run that
+    /// generation of the sandbox. Only between hosts of a fleet.
+    StaleRoute,
+    /// The sandbox is paused and the request asked not to wake it.
+    SandboxPaused,
+    /// Too many wakes run on this host; the request can be repeated.
+    WakeBusy,
+    /// The sandbox has too many forwarded requests in flight.
+    TooManyRequests,
+    /// The port does not take traffic yet.
+    NotReady,
+    /// The app did not answer in time.
+    UpstreamTimeout,
+    /// Nothing answers on the port.
+    UpstreamUnreachable,
     Internal,
 }
 
 impl Code {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 22] = [
         Self::InvalidRequest,
         Self::Unauthorized,
         Self::NotFound,
@@ -1238,6 +1253,13 @@ impl Code {
         Self::Rebuilding,
         Self::Cold,
         Self::ValueRequired,
+        Self::StaleRoute,
+        Self::SandboxPaused,
+        Self::WakeBusy,
+        Self::TooManyRequests,
+        Self::NotReady,
+        Self::UpstreamTimeout,
+        Self::UpstreamUnreachable,
         Self::Internal,
     ];
 
@@ -1262,6 +1284,13 @@ impl Code {
             Self::Rebuilding => "rebuilding",
             Self::Cold => "sandbox_cold",
             Self::ValueRequired => "value_required",
+            Self::StaleRoute => "stale_route",
+            Self::SandboxPaused => "sandbox_paused",
+            Self::WakeBusy => "wake_busy",
+            Self::TooManyRequests => "too_many_requests",
+            Self::NotReady => "not_ready",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::UpstreamUnreachable => "upstream_unreachable",
             Self::Internal => "internal",
         }
     }
@@ -1272,14 +1301,30 @@ impl Code {
             Self::Unauthorized => 401,
             Self::NotFound => 404,
             Self::Forbidden => 403,
-            Self::Conflict | Self::ProtectedEnv | Self::BuildFailed => 409,
+            Self::Conflict | Self::ProtectedEnv | Self::BuildFailed | Self::StaleRoute => 409,
             Self::QuotaExceeded => 429,
             Self::NoCapacity
             | Self::NodeUnreachable
             | Self::VolumeUnavailable
             | Self::Rebuilding
-            | Self::Cold => 503,
+            | Self::Cold
+            | Self::SandboxPaused
+            | Self::WakeBusy
+            | Self::TooManyRequests
+            | Self::NotReady => 503,
+            Self::UpstreamUnreachable => 502,
+            Self::UpstreamTimeout => 504,
             Self::Internal => 500,
+        }
+    }
+
+    /// Seconds a client should wait before it repeats the call.
+    pub fn retry_after_s(self) -> Option<&'static str> {
+        match self {
+            Self::NoCapacity => Some("30"),
+            Self::WakeBusy => Some("5"),
+            Self::TooManyRequests => Some("1"),
+            _ => None,
         }
     }
 
@@ -1293,6 +1338,10 @@ impl Code {
                 | Self::Cold
                 | Self::Internal
                 | Self::QuotaExceeded
+                | Self::StaleRoute
+                | Self::WakeBusy
+                | Self::TooManyRequests
+                | Self::NotReady
         )
     }
 }

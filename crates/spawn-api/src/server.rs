@@ -253,6 +253,31 @@ pub struct Args {
     /// PEM private key for `--preview-tls-cert`.
     #[arg(long, requires = "preview_tls_cert")]
     preview_tls_key: Option<PathBuf>,
+    /// Address of the forward listener for trusted HTTP gateways. Off
+    /// unless set. Gateways send `X-Spawnbox-Key` and `X-Spawnbox-Target`.
+    #[arg(long)]
+    forward_listen: Option<SocketAddr>,
+    /// PEM certificate chain for HTTPS on `--forward-listen`.
+    #[arg(long, requires_all = ["forward_listen", "forward_tls_key"])]
+    forward_tls_cert: Option<PathBuf>,
+    /// PEM private key for `--forward-tls-cert`.
+    #[arg(long, requires = "forward_tls_cert")]
+    forward_tls_key: Option<PathBuf>,
+    /// Wakes for forwarded requests that run at once on this host.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
+    forward_max_wakes: u32,
+    /// Seconds a forwarded request waits for a wake slot before `503
+    /// wake_busy`.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=300))]
+    forward_wake_queue_s: u64,
+    /// Forwarded requests and upgraded connections per sandbox before
+    /// `503 too_many_requests`.
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+    forward_max_in_flight: u32,
+    /// The longest `X-Spawnbox-Timeout-Ms` a gateway may ask for, in
+    /// seconds.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    forward_max_response_s: u64,
     /// Preview URL of a port; `{label}` becomes `<port>-<sandbox>`. With an
     /// https:// URL, token cookies are marked Secure.
     #[arg(long, default_value = "http://{label}.localhost:8081", value_parser = parse_preview_url)]
@@ -462,6 +487,7 @@ pub struct App {
     pub role: Role,
     /// Signs and checks browser session tokens.
     pub sessions: crate::session::Sessions,
+    pub gateway: crate::gateway::Gateway,
 }
 
 pub type AppState = Arc<App>;
@@ -901,6 +927,12 @@ async fn run(
         preview_url: args.preview_url.clone(),
         sessions,
         role,
+        gateway: crate::gateway::Gateway::new(crate::gateway::Settings {
+            max_wakes: usize::try_from(args.forward_max_wakes)?,
+            wake_queue: Duration::from_secs(args.forward_wake_queue_s),
+            max_in_flight: args.forward_max_in_flight,
+            max_response: Duration::from_secs(args.forward_max_response_s),
+        }),
     });
     let paused = app
         .sandboxes
@@ -1031,6 +1063,23 @@ async fn run(
                     eprintln!("preview listener: {error}");
                 }
             }));
+            if let Some(addr) = args.forward_listen {
+                let listener = tls::Bound::bind(
+                    addr,
+                    tls_files(args.forward_tls_cert.clone(), args.forward_tls_key.clone()),
+                )
+                .await?;
+                eprintln!("forward listener on {}", listener.url(addr));
+                let forwards = listener.serve(
+                    crate::gateway::router(Arc::clone(&app)),
+                    std::future::pending(),
+                );
+                background.push(tokio::spawn(async move {
+                    if let Err(error) = forwards.await {
+                        eprintln!("forward listener: {error}");
+                    }
+                }));
+            }
             if let (Role::Primary(p), Some(addr)) = (&app.role, args.fleet_listen) {
                 let listener = tls::Listener::bind(addr, p.server_config()?).await?;
                 eprintln!(
@@ -1360,9 +1409,6 @@ pub fn router(app: AppState) -> Router {
         .with_state(app)
 }
 
-/// `Retry-After` of a `no_capacity` reply.
-const NO_CAPACITY_RETRY_S: &str = "30";
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let request_id = ids::new_id("req").unwrap_or_default();
@@ -1376,11 +1422,10 @@ impl IntoResponse for ApiError {
         let status = StatusCode::from_u16(self.code.http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = (status, Json(self.body(&request_id))).into_response();
-        if self.code == Code::NoCapacity {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static(NO_CAPACITY_RETRY_S),
-            );
+        if let Some(seconds) = self.code.retry_after_s() {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static(seconds));
         }
         response
     }

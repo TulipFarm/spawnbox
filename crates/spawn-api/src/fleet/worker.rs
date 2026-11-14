@@ -435,6 +435,7 @@ async fn only_primary(req: Request, next: Next) -> Response {
 pub fn router(app: AppState) -> Router {
     let api = crate::server::router(Arc::clone(&app));
     let preview = crate::preview::router(Arc::clone(&app));
+    let gateway = crate::gateway::router(Arc::clone(&app));
     let fallback_app = Arc::clone(&app);
     Router::new()
         .route("/fleet/v1/sync", post(sync_now))
@@ -464,14 +465,10 @@ pub fn router(app: AppState) -> Router {
             let allowed = peer.is(pki::PRIMARY)
                 || worker_of(&fallback_app).is_ok_and(|w| w.is_edge(&peer, req.headers()));
             req.headers_mut().remove(NODE_HEADER);
-            let to_preview = req
-                .headers()
-                .get(ROUTE_HEADER)
-                .is_some_and(|v| v.as_bytes() == b"preview");
-            let router = if to_preview {
-                preview.clone()
-            } else {
-                api.clone()
+            let router = match req.headers().get(ROUTE_HEADER).map(|v| v.as_bytes()) {
+                Some(b"preview") => preview.clone(),
+                Some(b"forward") => gateway.clone(),
+                _ => api.clone(),
             };
             async move {
                 if !allowed {

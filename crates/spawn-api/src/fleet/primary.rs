@@ -262,10 +262,12 @@ fn worker(app: &App, peer: &Peer, headers: &HeaderMap) -> Result<NodeRow, ApiErr
 }
 
 /// The fleet listener. Workers and edges call its fleet routes; edges also
-/// send clients' API and preview calls, which the fallback serves.
+/// send clients' API, preview and forwarded calls, which the fallback
+/// serves.
 pub fn router(app: AppState) -> Router {
     let api = crate::server::router(Arc::clone(&app));
     let preview = crate::preview::router(Arc::clone(&app));
+    let gateway = crate::gateway::router(Arc::clone(&app));
     let edge_app = Arc::clone(&app);
     Router::new()
         .route("/fleet/v1/join", post(join))
@@ -277,7 +279,12 @@ pub fn router(app: AppState) -> Router {
         .route("/fleet/v1/routes", post(routes))
         .route_layer(DefaultBodyLimit::max(MAX_FLEET_BODY))
         .fallback(move |mut req: Request| {
-            let (app, api, preview) = (Arc::clone(&edge_app), api.clone(), preview.clone());
+            let (app, api, preview, gateway) = (
+                Arc::clone(&edge_app),
+                api.clone(),
+                preview.clone(),
+                gateway.clone(),
+            );
             async move {
                 let peer = req
                     .extensions()
@@ -290,13 +297,13 @@ pub fn router(app: AppState) -> Router {
                 if let Err(error) = fleet_node(&app, &peer, req.headers(), node_kind::EDGE) {
                     return error.into_response();
                 }
-                let to_preview = req
-                    .headers()
-                    .get(ROUTE_HEADER)
-                    .is_some_and(|v| v.as_bytes() == b"preview");
-                req.headers_mut().remove(ROUTE_HEADER);
+                let route = req.headers_mut().remove(ROUTE_HEADER);
                 req.headers_mut().remove(NODE_HEADER);
-                let router = if to_preview { preview } else { api };
+                let router = match route.as_ref().map(HeaderValue::as_bytes) {
+                    Some(b"preview") => preview,
+                    Some(b"forward") => gateway,
+                    _ => api,
+                };
                 match router.oneshot(req).await {
                     Ok(resp) => resp,
                     Err(never) => match never {},

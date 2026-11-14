@@ -26,16 +26,20 @@ use tonic::{Code as GrpcCode, Streaming};
 use crate::events::Origin;
 use crate::model::{ApiError, Code, rfc3339_ms};
 use crate::ports::{self, Access, COOKIE, Publish, TOKEN_PARAM};
-use crate::runtime::{Busy, Published, now_ms};
+use crate::runtime::{Published, now_ms};
 use crate::server::{App, AppState, parse};
 use crate::session;
 use crate::tenancy::{Caller, Scope};
 
 const BUFFER: usize = 64 * 1024;
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn port_view(app: &AppState, id: &str, port: u16, published: &Published) -> Value {
-    let mut url = ports::url(&app.preview_url, id, port);
     let mut view = json!({ "port": port, "access": published.access });
+    if published.access == Access::Gateway {
+        return view;
+    }
+    let mut url = ports::url(&app.preview_url, id, port);
     if let Some((token, expires_at)) = &published.token {
         url = format!("{url}/?{TOKEN_PARAM}={token}");
         view["token_expires_at"] = json!(rfc3339_ms(*expires_at));
@@ -103,14 +107,18 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
     if let Some(node) = crate::fleet::primary::node_of(&app, &id) {
         return crate::fleet::primary::forward(&app, &node, req, Some("preview")).await;
     }
-    let Some(published) = app.sandboxes.published(&id, port) else {
+    let Some(published) = app
+        .sandboxes
+        .published(&id, port)
+        .filter(|p| p.access != Access::Gateway)
+    else {
         return plain(StatusCode::NOT_FOUND, "no published port at this address");
     };
     let https = app.preview_url.starts_with("https://");
     // Taken on every port, so a sandbox's apps never see a session token.
     let session_cookie = take_cookie(&mut req, session::COOKIE);
     match published.access {
-        Access::Public => {}
+        Access::Public | Access::Gateway => {}
         Access::Private => {
             if let Some(response) = private_access(&app, &mut req, &id, port, session_cookie, https)
             {
@@ -164,9 +172,9 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
     }
     let proto = if https { "https" } else { "http" };
     scrub(&mut req, |token| app.sessions.signed(token));
-    forward(opened.channel, opened.busy, port, req, &host, proto)
+    forward(opened.channel, opened.busy, port, req, Some((&host, proto)))
         .await
-        .unwrap_or_else(|message| plain(StatusCode::BAD_GATEWAY, &message))
+        .unwrap_or_else(|error| plain(StatusCode::BAD_GATEWAY, &error.message))
 }
 
 /// A private port takes an API key with `sandboxes:read`, or a browser
@@ -378,16 +386,11 @@ fn take_cookie(req: &mut Request, name: &str) -> Option<String> {
     found
 }
 
-/// Sends one request to the guest port over a fresh tunnel. Upgraded
-/// connections (WebSocket) are spliced through the same tunnel.
-async fn forward(
+/// Opens a tunnel to `port` in the guest.
+async fn dial(
     channel: Channel,
-    busy: Busy,
     port: u16,
-    mut req: Request,
-    host: &str,
-    proto: &'static str,
-) -> Result<Response, String> {
+) -> Result<(mpsc::Sender<PortInput>, Streaming<PortOutput>), ApiError> {
     let (tx, rx) = mpsc::channel(16);
     let open = PortInput {
         input: Some(Input::Open(PortOpen {
@@ -395,25 +398,54 @@ async fn forward(
         })),
     };
     let _ = tx.send(open).await;
-    let output = PortsClient::new(channel)
-        .dial(ReceiverStream::new(rx))
-        .await
+    let dialed = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        PortsClient::new(channel).dial(ReceiverStream::new(rx)),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            Code::UpstreamUnreachable,
+            format!("port {port} did not open in {} s", DIAL_TIMEOUT.as_secs()),
+        )
+    })?;
+    let output = dialed
         .map_err(|status| match status.code() {
-            GrpcCode::Unavailable => format!("nothing listens on port {port}"),
-            _ => format!("guest agent: {}", status.message()),
+            GrpcCode::Unavailable => ApiError::new(
+                Code::UpstreamUnreachable,
+                format!("nothing listens on port {port}"),
+            ),
+            _ => ApiError::internal(format!("guest agent: {}", status.message())),
         })?
         .into_inner();
+    Ok((tx, output))
+}
+
+/// Sends one request to the guest port over a fresh tunnel. Upgraded
+/// connections (WebSocket) are spliced through the same tunnel. `hold` is
+/// kept until the response and any upgraded connection are done.
+/// `forwarded` is the host and scheme to put in `X-Forwarded-*`.
+pub(crate) async fn forward(
+    channel: Channel,
+    hold: impl Send + 'static,
+    port: u16,
+    mut req: Request,
+    forwarded: Option<(&str, &'static str)>,
+) -> Result<Response, ApiError> {
+    let (tx, output) = dial(channel, port).await?;
     let (ours, theirs) = tokio::io::duplex(BUFFER);
     // The tunnel, and so the sandbox, is busy until the response and any
     // upgraded connection are done.
     tokio::spawn(async move {
-        let _busy = busy;
+        let _hold = hold;
         pump(theirs, tx, output).await;
     });
 
+    let unreachable =
+        |e: hyper::Error| ApiError::new(Code::UpstreamUnreachable, format!("port {port}: {e}"));
     let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(ours))
         .await
-        .map_err(|e| format!("connect to port {port}: {e}"))?;
+        .map_err(unreachable)?;
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
@@ -428,16 +460,15 @@ async fn forward(
         .cloned()
         .unwrap_or_else(|| PathAndQuery::from_static("/"));
     *req.uri_mut() = path.into();
-    let headers = req.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(host) {
-        headers.insert("x-forwarded-host", value);
+    if let Some((host, proto)) = forwarded {
+        let headers = req.headers_mut();
+        if let Ok(value) = HeaderValue::from_str(host) {
+            headers.insert("x-forwarded-host", value);
+        }
+        headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
     }
-    headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
 
-    let mut response = sender
-        .send_request(req)
-        .await
-        .map_err(|e| format!("port {port}: {e}"))?;
+    let mut response = sender.send_request(req).await.map_err(unreachable)?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(client_upgrade) = client_upgrade
     {

@@ -691,6 +691,27 @@ Traffic reaches the app through vsock, not the VM's network, so apps
 bound to `localhost` work and no sandbox address is exposed. HTTP/1.1 and
 WebSockets are forwarded.
 
+### Forward listener
+
+```mermaid
+flowchart LR
+    gw["Your gateway"] -->|"X-Spawnbox-Key<br/>X-Spawnbox-Target: sbx_ID:PORT"| fl["Forward listener<br/>(primary or edge)"]
+    fl -->|"auth, wake limit,<br/>in-flight limit"| fl
+    fl -->|"x-spawnbox-route: forward<br/>expected generation"| w["Worker that runs the sandbox"]
+    w -->|"Ports.Dial over vsock"| g["spawn-guest"]
+```
+
+The forward listener is a second way into the same vsock tunnel, for an
+HTTP gateway that owns its host names and logins. The gateway names the
+sandbox and port in headers instead of a host name. The listener checks
+the key (cached for 5 s), wakes the sandbox within a per-host wake limit,
+counts requests per sandbox, and forwards. The primary sends a request to
+a worker with the generation it expects. The worker answers
+`409 stale_route` if it does not run that generation, and the sender
+tries once more after it looks up the sandbox again. Edges have no
+database, so a worker's `stale_route` is how an edge learns that its
+routing table is out of date.
+
 ## Tenants, keys and quotas
 
 ```mermaid

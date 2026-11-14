@@ -305,6 +305,12 @@ pub struct Busy {
     generation: i64,
 }
 
+impl Busy {
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+}
+
 impl Drop for Busy {
     fn drop(&mut self) {
         let mut inner = lock(&self.inner);
@@ -2603,6 +2609,11 @@ impl Sandboxes {
             json!({ "port": port }),
         );
         Ok(())
+    }
+
+    /// The generation of the VM this host runs or holds paused for `id`.
+    pub fn generation(&self, id: &str) -> Option<i64> {
+        self.inner().records.get(id).map(|record| record.generation)
     }
 
     /// The access of a published port, for the preview proxy.

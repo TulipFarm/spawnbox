@@ -27,7 +27,7 @@ use super::{NODE_HEADER, ROUTE_HEADER, Routes};
 use crate::db::node_kind;
 use crate::ids;
 use crate::model::{ApiError, Code};
-use crate::{ports, server, tls};
+use crate::{gateway, ports, server, tls};
 
 const POLL_EVERY: Duration = Duration::from_secs(1);
 const MAX_ROUTES: usize = 64 * 1024 * 1024;
@@ -71,6 +71,16 @@ pub struct Args {
     /// PEM private key for `--preview-tls-cert`.
     #[arg(long, requires = "preview_tls_cert")]
     preview_tls_key: Option<PathBuf>,
+    /// Address of the forward listener for trusted HTTP gateways. Off
+    /// unless set. The host that runs the sandbox checks the key.
+    #[arg(long)]
+    forward_listen: Option<SocketAddr>,
+    /// PEM certificate chain for HTTPS on `--forward-listen`.
+    #[arg(long, requires_all = ["forward_listen", "forward_tls_key"])]
+    forward_tls_cert: Option<PathBuf>,
+    /// PEM private key for `--forward-tls-cert`.
+    #[arg(long, requires = "forward_tls_cert")]
+    forward_tls_key: Option<PathBuf>,
 }
 
 /// Where each sandbox runs, as the primary said last.
@@ -291,6 +301,37 @@ async fn preview(State(edge): State<EdgeState>, req: Request) -> Response {
     }
 }
 
+/// A gateway's request, sent to the host that runs the sandbox, which
+/// checks the key. If that host no longer runs it, the primary gets the
+/// request once more.
+async fn forward(State(edge): State<EdgeState>, req: Request) -> Response {
+    let sandbox = req
+        .headers()
+        .get(gateway::TARGET)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|text| gateway::Target::parse(text).ok())
+        .map(|gateway::Target::Port { sandbox, .. }| sandbox);
+    let (req, again) = match gateway::replayable(req).await {
+        Ok(split) => split,
+        Err(error) => return gateway::refusal(error),
+    };
+    let target = edge.target(sandbox.as_deref());
+    let mut response = match edge.send(target, req, Some("forward")).await {
+        Ok(response) => response,
+        Err(error) => return gateway::refusal(error),
+    };
+    if gateway::is_stale(&response)
+        && let Some(again) = again
+    {
+        response = match edge.send(Target::Primary, again, Some("forward")).await {
+            Ok(response) => response,
+            Err(error) => return gateway::refusal(error),
+        };
+    }
+    gateway::mark_fleet_error(&mut response);
+    response
+}
+
 /// Loads the edge's identity, or joins the fleet as an edge.
 async fn start(args: &Args, data: &Path) -> Result<Edge> {
     let dir = data.join("fleet").join("edge");
@@ -355,6 +396,26 @@ pub async fn run(args: Args) -> Result<()> {
             eprintln!("preview listener: {error}");
         }
     });
+    let mut forwards = None;
+    if let Some(addr) = args.forward_listen {
+        let listener = tls::Bound::bind(
+            addr,
+            server::tls_files(args.forward_tls_cert, args.forward_tls_key),
+        )
+        .await?;
+        eprintln!("forward listener on {}", listener.url(addr));
+        let served = listener.serve(
+            Router::new()
+                .fallback(forward)
+                .with_state(Arc::clone(&edge)),
+            std::future::pending(),
+        );
+        forwards = Some(tokio::spawn(async move {
+            if let Err(error) = served.await {
+                eprintln!("forward listener: {error}");
+            }
+        }));
+    }
     let listener =
         tls::Bound::bind(args.listen, server::tls_files(args.tls_cert, args.tls_key)).await?;
     eprintln!("listening on {}", listener.url(args.listen));
@@ -365,6 +426,9 @@ pub async fn run(args: Args) -> Result<()> {
     let served = listener.serve(routes, server::shutdown_signal()).await;
     poller.abort();
     previews.abort();
+    if let Some(forwards) = forwards {
+        forwards.abort();
+    }
     served.map_err(|e| anyhow!(e)).context("serve HTTP")
 }
 
