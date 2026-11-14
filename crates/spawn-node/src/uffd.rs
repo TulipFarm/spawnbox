@@ -7,7 +7,8 @@
 //! until the handler copies data in. The handler copies the whole part
 //! that holds the page, so nearby touches do not fault again.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{IoSliceMut, Read};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -28,8 +29,12 @@ use tokio::sync::oneshot;
 /// How long a fault may wait for its part before the VM is stopped.
 pub const PART_WAIT: Duration = Duration::from_secs(30);
 const PAGE: u64 = 4096;
+/// A hugetlbfs page, when Firecracker backs guest memory with them.
+const HUGE_PAGE: u64 = 2 * 1024 * 1024;
 /// How long Firecracker has to connect after the pager starts.
 const CONNECT_WAIT: Duration = Duration::from_secs(30);
+/// How long a fault waits for the guest's memory to stop changing.
+const SETTLE_WAIT: Duration = Duration::from_secs(5);
 const EVENT_PAGEFAULT: u8 = 0x12;
 const EVENT_REMOVE: u8 = 0x15;
 const MSG_BYTES: usize = 32;
@@ -42,16 +47,29 @@ pub trait PageSource: Send + Sync + 'static {
     /// is as long as the part. False if the part is only zeros; `buf` is
     /// not changed then.
     fn read(&self, i: u32, buf: &mut [u8], timeout: Duration) -> Result<bool>;
+    /// Whether the pager should copy parts in before the guest touches
+    /// them, while it has no faults to serve. Every part must then be
+    /// readable without waiting.
+    fn copy_ahead(&self) -> bool {
+        false
+    }
 }
 
 /// A complete memory file.
-pub struct LocalFile(File);
+pub struct LocalFile(File, bool);
 
 impl LocalFile {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self(
             File::open(path).with_context(|| format!("open {}", path.display()))?,
+            false,
         ))
+    }
+
+    /// Lets the pager copy all of it in, not only what the guest touches.
+    #[must_use]
+    pub fn copy_ahead(self) -> Self {
+        Self(self.0, true)
     }
 }
 
@@ -64,6 +82,10 @@ impl PageSource for LocalFile {
         self.0
             .read_exact_at(buf, u64::from(i) * self.part_bytes())?;
         Ok(true)
+    }
+
+    fn copy_ahead(&self) -> bool {
+        self.1
     }
 }
 
@@ -136,6 +158,42 @@ struct Region {
     offset: u64,
 }
 
+/// The userfaultfd, and what `fill` needs to know about the guest's
+/// memory.
+struct Mem {
+    uffd: File,
+    fd: RawFd,
+    /// Events read but not handled yet.
+    queue: RefCell<VecDeque<[u8; MSG_BYTES]>>,
+    /// `PAGE` or `HUGE_PAGE`; the same for every region.
+    page: u64,
+    /// One page of zeros, for huge pages: the kernel has no zero page for
+    /// them.
+    zeros: Vec<u8>,
+}
+
+impl Mem {
+    /// Queues the events that are waiting, without blocking. False once
+    /// Firecracker has gone away.
+    fn read_events(&self) -> Result<bool> {
+        let mut events = [0u8; MSG_BYTES * 16];
+        loop {
+            match (&self.uffd).read(&mut events) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    let mut queue = self.queue.borrow_mut();
+                    queue.extend(events[..n].as_chunks::<MSG_BYTES>().0.iter().copied());
+                    if n < events.len() {
+                        return Ok(true);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 fn serve(
     listener: &UnixListener,
     source: &dyn PageSource,
@@ -159,45 +217,110 @@ fn serve(
     };
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let (regions, uffd) = handshake(stream.as_raw_fd())?;
+    let (regions, page, uffd) = handshake(stream.as_raw_fd())?;
     // Firecracker keeps its end open; so does this, until the VM is gone.
     let _stream = stream;
-    let mut uffd = File::from(uffd);
+    let uffd = File::from(uffd);
     let size = regions.iter().map(|r| r.offset + r.size).max().unwrap_or(0);
     let part = source.part_bytes();
-    if part == 0 || !part.is_multiple_of(PAGE) {
-        bail!("bad part size {part}");
+    if part == 0 || !part.is_multiple_of(page) {
+        bail!("part size {part} is not a multiple of the {page}-byte page");
     }
+    let mem = Mem {
+        fd: uffd.as_raw_fd(),
+        uffd,
+        queue: RefCell::default(),
+        page,
+        zeros: if page == PAGE {
+            Vec::new()
+        } else {
+            vec![0; usize::try_from(page)?]
+        },
+    };
     let mut done = vec![false; usize::try_from(size.div_ceil(part))?];
     let mut removed = Removed::default();
     let mut buf = vec![0; usize::try_from(part)?];
-    let mut events = [0u8; MSG_BYTES * 16];
+    // The next part to copy in before the guest touches it.
+    let mut ahead = source.copy_ahead().then_some(0usize);
+    // Copies part `i` into guest memory. Unless `wait`, gives up with
+    // `false` when it would wait for the part or for memory to settle.
+    let mut copy = |i: usize, wait: bool| -> Result<bool> {
+        let index = u32::try_from(i)?;
+        let timeout = if wait { PART_WAIT } else { Duration::ZERO };
+        let start = u64::from(index) * part;
+        let len = usize::try_from(part.min(size - start))?;
+        let data = source
+            .read(index, &mut buf[..len], timeout)
+            .with_context(|| format!("memory part {index} is not available"))?;
+        for r in &regions {
+            let from = start.max(r.offset);
+            let to = (start + len as u64).min(r.offset + r.size);
+            if from >= to {
+                continue;
+            }
+            let dst = r.base + (from - r.offset);
+            let src = if data {
+                let at = usize::try_from(from - start)?;
+                Some(&buf[at..at + usize::try_from(to - from)?])
+            } else {
+                None
+            };
+            if !fill(&mem, dst, to - from, src, wait)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    // Set while copying ahead waits for memory to settle.
+    let mut backoff = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let mut fds = [PollFd::new(uffd.as_fd(), PollFlags::POLLIN)];
-        poll(&mut fds, PollTimeout::from(100u16))?;
-        let revents = fds[0].revents().unwrap_or(PollFlags::empty());
-        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            return Ok(());
+        if mem.queue.borrow().is_empty() {
+            let mut fds = [PollFd::new(mem.uffd.as_fd(), PollFlags::POLLIN)];
+            // While parts are left to copy ahead, only check for events.
+            let wait = match (ahead, backoff) {
+                (Some(_), false) => 0u16,
+                (Some(_), true) => 1,
+                (None, _) => 100,
+            };
+            poll(&mut fds, PollTimeout::from(wait))?;
+            let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                return Ok(());
+            }
+            if !mem.read_events()? {
+                return Ok(());
+            }
         }
-        let n = match uffd.read(&mut events) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(error.into()),
-        };
-        for msg in events[..n].as_chunks::<MSG_BYTES>().0 {
+        if mem.queue.borrow().is_empty()
+            && let Some(i) = ahead
+        {
+            // Parts the guest gave back stay empty until it touches them.
+            if !done[i] && !removed.overlaps(&regions, u64::try_from(i)? * part, part) {
+                backoff = !copy(i, false)?;
+                if backoff {
+                    // Try the part again after reading what changed.
+                    continue;
+                }
+                done[i] = true;
+            }
+            ahead = (i + 1 < done.len()).then_some(i + 1);
+            continue;
+        }
+        loop {
+            let Some(msg) = mem.queue.borrow_mut().pop_front() else {
+                break;
+            };
             let word =
                 |at: usize| u64::from_le_bytes(msg[at..at + 8].try_into().unwrap_or_default());
             match msg[0] {
                 EVENT_PAGEFAULT => {
-                    let page = word(16) & !(PAGE - 1);
-                    let fd = uffd.as_raw_fd();
+                    let page = word(16) & !(mem.page - 1);
                     if removed.contains(page) {
                         // The guest gave the page back; it reads as zeros.
-                        fill(fd, page, PAGE, None)?;
+                        fill(&mem, page, mem.page, None, true)?;
                         continue;
                     }
                     let offset = regions
@@ -208,35 +331,15 @@ fn serve(
                     let i = usize::try_from(offset / part)?;
                     if done[i] {
                         // Faulted again before the copy woke it.
-                        wake(fd, page, PAGE)?;
+                        wake(mem.fd, page, mem.page)?;
                         continue;
                     }
-                    let index = u32::try_from(i)?;
-                    let start = u64::from(index) * part;
-                    let len = usize::try_from(part.min(size - start))?;
-                    let data = source
-                        .read(index, &mut buf[..len], PART_WAIT)
-                        .with_context(|| format!("memory part {index} is not available"))?;
-                    for r in &regions {
-                        let from = start.max(r.offset);
-                        let to = (start + len as u64).min(r.offset + r.size);
-                        if from >= to {
-                            continue;
-                        }
-                        let dst = r.base + (from - r.offset);
-                        let src = if data {
-                            let at = usize::try_from(from - start)?;
-                            Some(&buf[at..at + usize::try_from(to - from)?])
-                        } else {
-                            None
-                        };
-                        fill(fd, dst, to - from, src)?;
-                    }
+                    copy(i, true)?;
                     done[i] = true;
                     touched
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(index);
+                        .push(u32::try_from(i)?);
                 }
                 EVENT_REMOVE => removed.add(word(8), word(16)),
                 // Firecracker uses no other events.
@@ -269,6 +372,22 @@ impl Removed {
         self.0.insert(start, end);
     }
 
+    /// Whether any of the memory file's bytes `offset..offset + len`,
+    /// mapped to guest memory by `regions`, were given back.
+    fn overlaps(&self, regions: &[Region], offset: u64, len: u64) -> bool {
+        regions.iter().any(|r| {
+            let from = offset.max(r.offset);
+            let to = (offset + len).min(r.offset + r.size);
+            let (start, end) = (r.base + (from - r.offset), r.base + (to - r.offset));
+            from < to
+                && self
+                    .0
+                    .range(..end)
+                    .next_back()
+                    .is_some_and(|(_, &e)| e > start)
+        })
+    }
+
     fn contains(&self, at: u64) -> bool {
         self.0
             .range(..=at)
@@ -277,8 +396,8 @@ impl Removed {
     }
 }
 
-/// Receives the regions and the userfaultfd.
-fn handshake(socket: RawFd) -> Result<(Vec<Region>, OwnedFd)> {
+/// Receives the regions, their page size and the userfaultfd.
+fn handshake(socket: RawFd) -> Result<(Vec<Region>, u64, OwnedFd)> {
     let mut buf = vec![0u8; 64 * 1024];
     let mut space = nix::cmsg_space!(RawFd);
     let (bytes, fds) = {
@@ -312,9 +431,14 @@ fn handshake(socket: RawFd) -> Result<(Vec<Region>, OwnedFd)> {
             .with_context(|| format!("memory region has no {name}"))
     };
     let mut regions = Vec::new();
+    let mut page = None;
     for v in json.as_array().context("memory regions are not a list")? {
-        if field(v, "page_size")? != PAGE {
-            bail!("only {PAGE}-byte pages are supported");
+        let size = field(v, "page_size")?;
+        if size != PAGE && size != HUGE_PAGE {
+            bail!("{size}-byte pages are not supported");
+        }
+        if *page.get_or_insert(size) != size {
+            bail!("memory regions have different page sizes");
         }
         regions.push(Region {
             base: field(v, "base_host_virt_addr")?,
@@ -322,7 +446,7 @@ fn handshake(socket: RawFd) -> Result<(Vec<Region>, OwnedFd)> {
             offset: field(v, "offset")?,
         });
     }
-    Ok((regions, uffd))
+    Ok((regions, page.unwrap_or(PAGE), uffd))
 }
 
 #[repr(C)]
@@ -353,29 +477,49 @@ nix::ioctl_readwrite!(uffdio_zeropage, 0xAA, 0x04, UffdioZeropage);
 
 /// Fills `len` bytes of guest memory at `dst` with `src`, or zeros, and
 /// wakes the threads waiting there. Pages that are already there are kept.
-fn fill(fd: RawFd, dst: u64, len: u64, src: Option<&[u8]>) -> Result<()> {
+/// Fills guest memory and wakes the guest. Unless `wait`, returns `false`
+/// instead of waiting while the guest's memory is changing.
+fn fill(mem: &Mem, dst: u64, len: u64, src: Option<&[u8]>, wait: bool) -> Result<bool> {
+    let fd = mem.fd;
+    if mem.page != PAGE && src.is_none() {
+        // Huge pages are copied from zeros one at a time.
+        for at in (0..len).step_by(usize::try_from(mem.page)?) {
+            if !fill(mem, dst + at, mem.page, Some(&mem.zeros), wait)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
     if fill_once(fd, dst, len, src).is_ok() {
-        return Ok(());
+        return Ok(true);
     }
     // Some pages are there already, or memory changed meanwhile: go page by
     // page.
-    let page_len = usize::try_from(PAGE)?;
+    let page_len = usize::try_from(mem.page)?;
     for at in (0..len).step_by(page_len) {
         let from = usize::try_from(at)?;
         let page = src.map(|s| &s[from..from + page_len]);
-        let mut tries = 0;
+        let deadline = Instant::now() + SETTLE_WAIT;
         loop {
-            match fill_once(fd, dst + at, PAGE, page) {
+            match fill_once(fd, dst + at, mem.page, page) {
                 Ok(()) | Err(nix::errno::Errno::EEXIST) => break,
-                Err(nix::errno::Errno::EAGAIN) if tries < 100 => {
-                    tries += 1;
+                // The guest's memory is changing, for example the balloon
+                // gives pages back, and the kernel refuses copies until
+                // that event is read.
+                Err(nix::errno::Errno::EAGAIN) if !wait => {
+                    mem.read_events()?;
+                    return Ok(false);
+                }
+                Err(nix::errno::Errno::EAGAIN) if Instant::now() < deadline => {
+                    mem.read_events()?;
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(errno) => bail!("fill guest memory at {:#x}: {errno}", dst + at),
             }
         }
     }
-    wake(fd, dst, len)
+    wake(fd, dst, len)?;
+    Ok(true)
 }
 
 fn fill_once(fd: RawFd, dst: u64, len: u64, src: Option<&[u8]>) -> nix::Result<()> {
@@ -415,7 +559,7 @@ fn wake(fd: RawFd, start: u64, len: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Removed;
+    use super::{Region, Removed};
 
     #[test]
     fn removed_ranges_merge() {
@@ -431,5 +575,27 @@ mod tests {
         assert!(removed.contains(0x8000) && !removed.contains(0x9000));
         removed.add(0x0, 0x10000);
         assert_eq!(removed.0.len(), 1);
+    }
+
+    #[test]
+    fn removed_ranges_overlap_file_parts() {
+        let regions = [
+            Region {
+                base: 0x10_0000,
+                size: 0x2000,
+                offset: 0,
+            },
+            Region {
+                base: 0x50_0000,
+                size: 0x2000,
+                offset: 0x2000,
+            },
+        ];
+        let mut removed = Removed::default();
+        removed.add(0x50_1000, 0x50_1800);
+        assert!(!removed.overlaps(&regions, 0, 0x2000));
+        assert!(!removed.overlaps(&regions, 0x2000, 0x1000));
+        assert!(removed.overlaps(&regions, 0x3000, 0x1000));
+        assert!(removed.overlaps(&regions, 0, 0x4000));
     }
 }

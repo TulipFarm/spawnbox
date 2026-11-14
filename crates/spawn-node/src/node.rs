@@ -870,6 +870,20 @@ impl Node {
     ) -> Result<Restored, ResumeError> {
         let begin = Instant::now();
         let own_disk = matches!(from, LoadFrom::Paused);
+        // Huge pages need the pager, so a memory file is served by it too.
+        let huge = self
+            .host
+            .huge_pages
+            .as_ref()
+            .and_then(|pool| pool.lease(u64::from(build.limits.memory_mib)));
+        let from = match from {
+            LoadFrom::Build | LoadFrom::Paused if huge.is_some() => {
+                let file = LocalFile::open(&build.file("vm.mem")).map_err(ResumeError::Before)?;
+                // The guest would wait for each 2 MiB page it first touches.
+                LoadFrom::Pages(Arc::new(file.copy_ahead()))
+            }
+            other => other,
+        };
         let jail = Jail::new(&self.host, id, index).map_err(ResumeError::Before)?;
         let net = async {
             jail.link(&build.rootfs(), ROOTFS)?;
@@ -904,6 +918,12 @@ impl Node {
             .map_err(ResumeError::Before)?;
         let spawn = ms(started.elapsed());
         let from_file = !matches!(from, LoadFrom::Pages(_));
+        let huge_pages = if let Some(lease) = huge {
+            vm.set_huge_pages(lease);
+            "2M"
+        } else {
+            "None"
+        };
         let backend = match from {
             LoadFrom::Pages(pages) => {
                 let sock = vm.root().join("uffd.sock");
@@ -932,7 +952,9 @@ impl Node {
                     "snapshot_path": "/vm.state",
                     "mem_backend": backend,
                     // So a pause can write only the pages written since.
+                    // Huge pages never come from a file.
                     "track_dirty_pages": from_file,
+                    "huge_pages": huge_pages,
                     "resume_vm": !pin_first,
                 }),
             )
