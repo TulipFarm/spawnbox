@@ -69,7 +69,7 @@ const RESERVED_HEADERS: &[&str] = &[
 
 /// `POST /v1/sandboxes`. Unknown fields are rejected so that spec fields
 /// that are not built yet fail instead of being ignored.
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSandbox {
     pub template: Option<String>,

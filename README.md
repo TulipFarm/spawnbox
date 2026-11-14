@@ -787,8 +787,18 @@ are gone. Its ID, env, secrets, network rules, volumes and published
 ports are the same.
 
 A tenant needs the `persistent_sandboxes` quota. It is `0` by default.
-Persistent sandboxes are created on the primary. `:migrate` cannot copy
-them to another host with their memory (`409`). In a fleet, a cold
+The primary admits each persistent sandbox and keeps its quota and its
+start record. By default it also runs the first VM. With
+`--persistent-placement any` on the primary, the first VM starts on a
+worker that ranks above the primary and has a build of the template's
+current spec. Only workers of this version or later take a first start.
+The primary never builds a template on a worker for this. If no worker
+can start it for sure, the primary starts it. If the primary cannot know
+whether the worker started it, the create gives `503 node_unreachable`
+with the sandbox ID in the message. The sandbox is kept: it is `cold`, or
+it runs on the worker, and the next call to it starts it or reaches it.
+`:migrate` cannot copy a persistent sandbox to another host with its
+memory (`409`). In a fleet, a cold
 sandbox can start again on any worker that has its template build.
 Refer to [Fence lost hosts](#fence-lost-hosts). To run one on another
 host, let it become cold: it then starts on the host that takes the next
@@ -1986,7 +1996,8 @@ deleted. The files of `outdated` and `removed` builds are deleted.
   `tenant`.
 - `"persistent": true` keeps the sandbox until it is deleted. Do not send
   `timeout_s`. `idle_pause_s` must be more than 0 (default 600). On a
-  fleet, the primary runs it. Refer to
+  fleet, the primary runs it, or a worker with
+  `--persistent-placement any`. Refer to
   [Keep a sandbox until you delete it](#keep-a-sandbox-until-you-delete-it).
 - The create response has `timings_ms` and `started_from`. The value of
   `started_from` is `warm_pool` or `build`.
@@ -2760,6 +2771,7 @@ To see all the flags, type `/opt/spawnbox/bin/spawn-api serve --help`.
 | `--self-fence` | Off | Worker: stop persistent VMs after `--fence-after-s` without the primary. Use it on every worker. A leader always stops them when it loses its lease. Refer to [Fence lost hosts](#fence-lost-hosts). |
 | `--fence-after-s` | 60 | Seconds without the primary before a worker with `--self-fence` stops its persistent VMs. A new leader waits this time plus `--fence-margin-s` before the old leader's persistent sandboxes become `cold`. |
 | `--fence-margin-s` | 30 | Primary: seconds added to the fence time of a worker before its persistent sandboxes become `cold` |
+| `--persistent-placement` | `primary` | Primary: where the first VM of a new persistent sandbox starts. `primary`, or `any` for a worker that has a build of its template, else the primary |
 | `--autoscale-hook` | None | Primary: program (absolute path) or webhook URL that adds and removes workers. Refer to [Add and remove workers automatically](#add-and-remove-workers-automatically). |
 | `--autoscale-secret` | None | Key to sign webhook requests. You can also use `SPAWNBOX_AUTOSCALE_SECRET`. |
 | `--autoscale-min-workers` | 0 | Minimum number of workers |
@@ -2940,7 +2952,7 @@ scripts/soak.py --dry-run --api http://10.0.0.5:8080 --key "$KEY" \
   - The memory and open files of `spawn-api` do not grow beyond
     `--max-rss-growth-mib` and `--max-fd-growth`.
 - The failover mode puts persistent sandboxes on one host, then cuts the
-  host off. New persistent sandboxes start on the primary, so the script
+  host off. New persistent sandboxes start on the primary by default, so the script
   moves each one to the worker by cold starts: it kills the VM and wakes
   the sandbox until placement picks that worker, up to `--place-tries`
   times (default 12). A cold start prefers the host that holds the

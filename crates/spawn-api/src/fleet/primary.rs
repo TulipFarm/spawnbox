@@ -19,6 +19,7 @@ use rustls::ClientConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spawn_egress::Policy;
+use spawn_node::firecracker::Limits;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tower::ServiceExt;
@@ -35,7 +36,8 @@ use super::{
     SUSPECT_AFTER_MS, SecretPush, SyncReply, TemplateCopy, UsageBatch, check_node_url, hex,
 };
 use crate::db::{
-    self, NodeRow, Retirement, VolumeRef, node_kind, node_state, retire_origin, retire_state, state,
+    self, Db, NodeRow, Retirement, VolumeRef, node_kind, node_state, retire_origin, retire_state,
+    state,
 };
 use crate::events::Origin;
 use crate::ids;
@@ -50,6 +52,12 @@ use crate::traces::{self, Traced};
 /// How much longer than a cold start may take the primary waits for a
 /// worker's, and its claim lasts.
 const COLD_START_SLACK: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a sandbox admitted for a first start may wait for its claim
+/// before it is deleted to free its tenant's quota: as long as a claim
+/// lasts. Its start runs to the end in its own task, so only a primary that
+/// stopped mid-start leaves one waiting longer.
+const UNSTARTED_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(COLD_START_CLAIM.as_secs() + 2 * COLD_START_SLACK.as_secs());
 /// Most hosts a create is tried on.
 const PLACE_TRIES: usize = 3;
 /// Largest body on fleet calls: heartbeats list every sandbox.
@@ -81,7 +89,7 @@ pub struct Primary {
     pub moves: Moves,
     /// Held to read while a create uses volumes already on one host; held
     /// to write while volumes get a home or move.
-    pub volume_lock: tokio::sync::RwLock<()>,
+    pub volume_lock: Arc<tokio::sync::RwLock<()>>,
     /// The egress CA's certificate and key, which every host uses.
     egress_ca: EgressCa,
     /// Set when the primary runs with `--autoscale-hook`.
@@ -91,6 +99,8 @@ pub struct Primary {
     pub retirer: Retirer,
     pub drain_passes: migrate::DrainPasses,
     failed_builds: FailedBuilds,
+    /// New persistent sandboxes may first start on workers, not only here.
+    pub persistent_anywhere: bool,
     /// Storage keys of the secrets pushed to each node since this primary
     /// started. A node's config sync gets values only for these and the
     /// secrets its sandboxes and templates attach.
@@ -126,6 +136,7 @@ impl Primary {
         dir: &Path,
         sbox: &crate::secretbox::SecretBox,
         egress_ca: EgressCa,
+        persistent_anywhere: bool,
     ) -> Result<Self> {
         let ca = FleetCa::load_or_create(dir, sbox)?;
         let identity = ca.primary_identity(&dir.join("primary"))?;
@@ -136,13 +147,14 @@ impl Primary {
             version: AtomicU64::new(u64::try_from(now_ms()).unwrap_or(1)),
             live: Mutex::default(),
             moves: Moves::default(),
-            volume_lock: tokio::sync::RwLock::new(()),
+            volume_lock: Arc::default(),
             egress_ca,
             autoscaler: OnceLock::new(),
             busy: Busy::default(),
             retirer: Retirer::default(),
             drain_passes: migrate::DrainPasses::default(),
             failed_builds: FailedBuilds::default(),
+            persistent_anywhere,
             pushed: Mutex::default(),
         })
     }
@@ -659,12 +671,16 @@ async fn usage(
 
 /// Marks nodes suspect, then down, when their heartbeats stop, and makes
 /// cold the persistent sandboxes of lost nodes once their copies are
-/// known to be gone. `margin` is added to a worker's fence time.
+/// known to be gone. `margin` is added to a worker's fence time. Also
+/// deletes sandboxes whose first start was cut off, at once and then on
+/// each check.
 pub fn watch(app: AppState, margin: std::time::Duration) -> tokio::task::JoinHandle<()> {
     let margin_ms = i64::try_from(margin.as_millis()).unwrap_or(i64::MAX);
     tokio::spawn(async move {
+        sweep(&app);
         loop {
             tokio::time::sleep(super::HEARTBEAT_EVERY).await;
+            sweep(&app);
             if let Err(error) = check_nodes(&app) {
                 eprintln!("fleet: check nodes: {error:#}");
             }
@@ -673,6 +689,30 @@ pub fn watch(app: AppState, margin: std::time::Duration) -> tokio::task::JoinHan
             }
         }
     })
+}
+
+fn sweep(app: &App) {
+    match sweep_unstarted(&app.db, now_ms()) {
+        Ok(deleted) => {
+            for id in deleted {
+                eprintln!("{id} never started: deleted after its first start was cut off");
+            }
+        }
+        Err(error) => eprintln!("fleet: sweep unstarted sandboxes: {error:#}"),
+    }
+}
+
+/// Deletes the sandboxes admitted for a first start that no claim took
+/// within `UNSTARTED_GRACE` of `now`, and returns their IDs.
+fn sweep_unstarted(db: &Db, now: i64) -> Result<Vec<String>> {
+    let grace = i64::try_from(UNSTARTED_GRACE.as_millis()).unwrap_or(i64::MAX);
+    let mut deleted = Vec::new();
+    for id in db.unstarted_before(now.saturating_sub(grace))? {
+        if db.delete_unstarted(&id)? {
+            deleted.push(id);
+        }
+    }
+    Ok(deleted)
 }
 
 /// Records that a persistent sandbox is cold again.
@@ -787,7 +827,9 @@ struct Candidate {
     memory_mib: u32,
 }
 
-/// Hosts that can take a sandbox of template `key`, best first.
+/// Hosts that can take a sandbox of template `key`, best first. `cold`:
+/// the sandbox starts from a start record, so a worker needs a build of the
+/// template's current spec, also for `base`, and warm VMs do not help.
 fn candidates(
     app: &App,
     p: &Primary,
@@ -795,8 +837,9 @@ fn candidates(
     key: &str,
     network: &str,
     need: Option<&Need>,
+    cold: bool,
 ) -> Vec<Candidate> {
-    let wanted = (key != BASE_TEMPLATE)
+    let wanted = (cold || key != BASE_TEMPLATE)
         .then(|| app.db.get_template(key).ok().flatten())
         .flatten()
         .map(|t| super::build_hash(&t.spec));
@@ -842,9 +885,9 @@ fn candidates(
             let near = need.map_or(0.0, |need| 1000.0 * need.gib_on(id) as f64);
             let template = capacity.template(key)?;
             let current = node.is_none()
-                || key == BASE_TEMPLATE
+                || (key == BASE_TEMPLATE && !cold)
                 || wanted.as_deref() == Some(template.spec_sha256.as_str());
-            let warm = capacity.warm_ready(key, network) > 0;
+            let warm = !cold && capacity.warm_ready(key, network) > 0;
             let room = capacity.free_slots.saturating_sub(placing) > 0;
             // A warm VM already holds its memory, but it is not reserved yet.
             let asked = u64::from(template.memory_mib);
@@ -922,6 +965,7 @@ impl Created {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         })
     }
 }
@@ -979,7 +1023,7 @@ pub async fn wake_cold(app: &App, id: &str, here: bool) -> Result<(), ApiError> 
                         .and_then(|l| l.capacity.template(&key).cloned())
                         .is_some_and(|t| t.spec_sha256 == wanted)
                 };
-                candidates(app, p, &tenant, &key, network, need.as_ref())
+                candidates(app, p, &tenant, &key, network, need.as_ref(), true)
                     .into_iter()
                     .find(|c| {
                         c.node.as_ref().is_none_or(|n| {
@@ -1165,6 +1209,200 @@ fn certain(failure: &Failure) -> bool {
     }
 }
 
+/// Whether a host with `capacity` can take the first start of a new
+/// persistent sandbox of template `key`, whose current spec hashes to
+/// `wanted`. That build becomes a root the sandbox may use all its life.
+fn takes_first_start(capacity: &Capacity, key: &str, wanted: &str) -> bool {
+    capacity.first_starts
+        && capacity
+            .template(key)
+            .is_some_and(|t| t.spec_sha256 == wanted)
+}
+
+/// Admits persistent sandbox `req` and starts it on the first worker in
+/// `candidates` that has a build of its template's current spec, as a cold
+/// start at generation 1. `None` when this host should create it instead:
+/// it ranks above every such worker, or each one surely did not start it.
+async fn first_start(
+    app: &AppState,
+    tenant: &Tenant,
+    req: &CreateSandbox,
+    key: &str,
+    candidates: &[Candidate],
+    need: Option<&Need>,
+    volumes: Option<&Arc<VolumeGuard>>,
+) -> Result<Option<Response>, ApiError> {
+    let p = primary(app)?;
+    let Some(template) = app.db.get_template(key)? else {
+        return Ok(None);
+    };
+    let wanted = super::build_hash(&template.spec);
+    let workers: Vec<(NodeRow, Limits, String)> = {
+        let live = p.live();
+        candidates
+            .iter()
+            .map_while(|c| c.node.as_ref().map(|node| (node, c)))
+            .filter(|(node, _)| {
+                live.get(&node.id)
+                    .is_some_and(|l| takes_first_start(&l.capacity, key, &wanted))
+                    && !p.failed_builds.recent(&node.id, &wanted)
+            })
+            .map(|(node, c)| {
+                let limits = Limits {
+                    vcpus: c.vcpus,
+                    memory_mib: c.memory_mib,
+                };
+                (node.clone(), limits, c.backend.clone())
+            })
+            .collect()
+    };
+    let Some((_, limits, _)) = workers.first() else {
+        return Ok(None);
+    };
+    let build = app
+        .db
+        .latest_build(key)?
+        .filter(|b| b.state == db::build_state::READY)
+        .map(|b| b.id)
+        .unwrap_or_default();
+    let (sandbox, start) =
+        app.sandboxes
+            .admit_first_start(tenant, req.clone(), template.spec, &build, *limits)?;
+    let id = sandbox.id.clone();
+    let admitted = Arc::new(Admitted {
+        app: Arc::clone(app),
+        p: Arc::clone(p),
+        tenant: tenant.clone(),
+        sandbox,
+        start,
+        need: need.cloned(),
+        wanted,
+        _volumes: volumes.cloned(),
+    });
+    let workers = workers
+        .into_iter()
+        .map(|(node, _, backend)| (node, backend))
+        .collect();
+    let started = start_admitted(
+        app.db.clone(),
+        id.clone(),
+        workers,
+        move |(node, backend)| {
+            let (admitted, node, backend) = (Arc::clone(&admitted), node.clone(), backend.clone());
+            async move { admitted.on(&node, &backend).await }
+        },
+    )
+    .await?;
+    match started {
+        FirstStart::On(_, Ok(())) | FirstStart::Claimed => first_started(app, &id).map(Some),
+        FirstStart::On((node, _), Err(failure)) => Err(ApiError::new(
+            Code::NodeUnreachable,
+            format!(
+                "sandbox {id} may have started on node {}: {:#}; get it to see",
+                node.id,
+                failure.error()
+            ),
+        )),
+        FirstStart::Deleted => Ok(None),
+    }
+}
+
+/// What became of an admitted sandbox's first start.
+enum FirstStart<W> {
+    /// `W` started it, or may have if the start failed.
+    On(W, Result<(), Failure>),
+    /// No worker started it, and its row is gone.
+    Deleted,
+    /// No worker started it, and something else claimed it since.
+    Claimed,
+}
+
+/// Tries `start` on each of `workers` in turn until one starts admitted
+/// sandbox `id` or may have, and deletes the sandbox if none did. This runs
+/// in its own task: a client that disconnects must not leave the sandbox
+/// unstarted, holding the tenant's quota.
+async fn start_admitted<W, S, F>(
+    db: Db,
+    id: String,
+    workers: Vec<W>,
+    mut start: S,
+) -> Result<FirstStart<W>, ApiError>
+where
+    W: Send + 'static,
+    S: FnMut(&W) -> F + Send + 'static,
+    F: Future<Output = Result<(), Failure>> + Send,
+{
+    crate::server::finish(async move {
+        for worker in workers {
+            match start(&worker).await {
+                Err(failure) if certain(&failure) => {}
+                outcome => return Ok(FirstStart::On(worker, outcome)),
+            }
+        }
+        Ok(if db.delete_unstarted(&id)? {
+            FirstStart::Deleted
+        } else {
+            FirstStart::Claimed
+        })
+    })
+    .await
+}
+
+/// A sandbox admitted for its first start on a worker, and what starting
+/// it needs.
+struct Admitted {
+    app: AppState,
+    p: Arc<Primary>,
+    tenant: Tenant,
+    sandbox: db::Sandbox,
+    start: db::StartRecord,
+    need: Option<Need>,
+    /// The hash of its template's spec.
+    wanted: String,
+    /// Keeps the create's volumes in place until the start ends.
+    _volumes: Option<Arc<VolumeGuard>>,
+}
+
+impl Admitted {
+    /// Starts it on `node`, whose volumes use `backend`.
+    async fn on(&self, node: &NodeRow, backend: &str) -> Result<(), Failure> {
+        let (app, p) = (&self.app, &self.p);
+        let need = self.need.as_ref();
+        let id = &self.sandbox.id;
+        let sandbox = self.sandbox.clone();
+        match start_on(app, p, node, &self.tenant, sandbox, &self.start, need).await {
+            Err(failure) if certain(&failure) => {
+                if let Failure::Refused { error, .. } = &failure
+                    && error.code == Code::BuildFailed
+                {
+                    p.failed_builds.note(&node.id, &self.wanted);
+                }
+                let error = failure.error();
+                eprintln!("create {id} on node {}: {error:#}", node.id);
+                Err(Failure::Unreachable(error))
+            }
+            outcome => {
+                for volume in need.iter().flat_map(|n| &n.unplaced) {
+                    app.db
+                        .set_volume_home(volume, Some(&node.id), backend)
+                        .map_err(|e| {
+                            Failure::Broken(anyhow::anyhow!("record the home of {volume}: {e}"))
+                        })?;
+                }
+                outcome
+            }
+        }
+    }
+}
+
+/// The create reply for persistent sandbox `id`, started by `first_start`.
+fn first_started(app: &App, id: &str) -> Result<Response, ApiError> {
+    let sandbox = app.db.get_sandbox(id)?.ok_or_else(ApiError::not_found)?;
+    let mut view = crate::server::view(sandbox, None);
+    view.started_from = Some("build");
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
 /// Creates a sandbox on this host or a worker.
 pub async fn create(
     app: &AppState,
@@ -1224,34 +1462,53 @@ async fn place_any(
     } else {
         Some(Need::of(app, &refs)?)
     };
-    let mut _volumes = None;
+    let mut volumes = None;
     if let Some(first) = &need {
         if first.is_simple() {
-            let guard = p.volume_lock.read().await;
+            let guard = Arc::clone(&p.volume_lock).read_owned().await;
             // Read again under the lock: a copy may have moved them.
             let now = Need::of(app, &refs)?;
             if now.is_simple() {
-                _volumes = Some(VolumeGuard::Read(guard));
+                volumes = Some(Arc::new(VolumeGuard::Read(guard)));
                 need = Some(now);
             } else {
                 drop(guard);
             }
         }
-        if _volumes.is_none() {
-            _volumes = Some(VolumeGuard::Write(p.volume_lock.write().await));
+        if volumes.is_none() {
+            let guard = Arc::clone(&p.volume_lock).write_owned().await;
+            volumes = Some(Arc::new(VolumeGuard::Write(guard)));
             need = Some(Need::of(app, &refs)?);
         }
     }
-    let mut candidates = candidates(app, p, &tenant, &key, network, need.as_ref());
+    let candidates = candidates(
+        app,
+        p,
+        &tenant,
+        &key,
+        network,
+        need.as_ref(),
+        req.persistent,
+    );
     if req.persistent {
-        // Persistent sandboxes stay on this host: they cannot move yet.
-        candidates.retain(|c| c.node.is_none());
-        if candidates.is_empty() {
-            if let Some(need) = &need {
-                need.gather(app, p, None).await?;
-            }
-            return crate::server::create_here(Arc::clone(app), tenant, req, origin).await;
+        if p.persistent_anywhere
+            && let Some(created) = first_start(
+                app,
+                &tenant,
+                &req,
+                &key,
+                &candidates,
+                need.as_ref(),
+                volumes.as_ref(),
+            )
+            .await?
+        {
+            return Ok(created);
         }
+        if let Some(need) = &need {
+            need.gather(app, p, None).await?;
+        }
+        return crate::server::create_here(Arc::clone(app), tenant, req, origin).await;
     }
     let mut local = Some(req);
     let mut last = None;
@@ -1313,9 +1570,9 @@ async fn place_any(
 }
 
 #[expect(dead_code, reason = "held only to keep the lock")]
-enum VolumeGuard<'a> {
-    Read(tokio::sync::RwLockReadGuard<'a, ()>),
-    Write(tokio::sync::RwLockWriteGuard<'a, ()>),
+enum VolumeGuard {
+    Read(tokio::sync::OwnedRwLockReadGuard<()>),
+    Write(tokio::sync::OwnedRwLockWriteGuard<()>),
 }
 
 enum Placed {
@@ -2124,6 +2381,124 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::ReadyTemplate;
+
+    fn admit(db: &Db, id: &str, created_at: i64) -> Result<(), db::Refused> {
+        let row = db::Sandbox {
+            generation: 0,
+            first_start: true,
+            created_at,
+            ..db::tests::persistent(id, state::COLD)
+        };
+        db.insert_persistent(&row, &db::tests::start_record(id, "b1"), Some(3))
+            .unwrap()
+    }
+
+    /// The state and node of `id` once it is no longer cold, or `None`
+    /// once it is gone. Gives up after 5 seconds.
+    async fn settled(db: &Db, id: &str) -> Option<(String, Option<String>)> {
+        for _ in 0..500 {
+            match db.get_sandbox(id).unwrap() {
+                Some(s) if s.state == state::COLD => {}
+                found => return found.map(|s| (s.state, s.node)),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let s = db.get_sandbox(id).unwrap().unwrap();
+        Some((s.state, s.node))
+    }
+
+    #[tokio::test]
+    async fn a_first_start_whose_caller_goes_away_still_ends() {
+        let db = Db::memory().unwrap();
+        for (id, starts) in [("sbx_refused", false), ("sbx_started", true)] {
+            admit(&db, id, 1).unwrap();
+            let (began, has_begun) = tokio::sync::oneshot::channel();
+            let (go, wait) = tokio::sync::oneshot::channel::<()>();
+            let mut gates = Some((began, wait));
+            let worker_db = db.clone();
+            let start = move |node: &&'static str| {
+                let (began, wait) = gates.take().unwrap();
+                let (db, node) = (worker_db.clone(), *node);
+                async move {
+                    began.send(()).unwrap();
+                    let _ = wait.await;
+                    if !starts {
+                        return Err(Failure::Unreachable(anyhow::anyhow!("no room")));
+                    }
+                    let generation = db.claim_cold(id, Some(node), "c1", i64::MAX).unwrap();
+                    assert_eq!(generation, Some(1));
+                    assert!(db.finish_cold_start(id, Some(node), 1, "c1", 5).unwrap());
+                    Ok(())
+                }
+            };
+            let call = tokio::spawn(start_admitted(db.clone(), id.into(), vec!["nod_w"], start));
+            has_begun.await.unwrap();
+            call.abort();
+            let _ = go.send(());
+            let expected = starts.then(|| (state::RUNNING.to_owned(), Some("nod_w".to_owned())));
+            assert_eq!(settled(&db, id).await, expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_deletes_only_first_starts_left_unclaimed_too_long() {
+        let db = Db::memory().unwrap();
+        let now = 1_800_000_000_000;
+        let minute = 60_000;
+        admit(&db, "sbx_old", now - 10 * minute).unwrap();
+        admit(&db, "sbx_young", now - 1000).unwrap();
+        // Told to the client as maybe started: its claim was given up.
+        admit(&db, "sbx_told", now - 10 * minute).unwrap();
+        assert_eq!(
+            db.claim_cold("sbx_told", Some("nod_w"), "c1", 0).unwrap(),
+            Some(1)
+        );
+        assert!(
+            db.abandon_claim("sbx_told", Some("nod_w"), 1, "c1")
+                .unwrap()
+        );
+        assert_eq!(admit(&db, "sbx_new", now), Err(db::Refused::Persistent(3)));
+
+        assert_eq!(sweep_unstarted(&db, now).unwrap(), ["sbx_old"]);
+        assert_eq!(db.get_sandbox("sbx_old").unwrap(), None);
+        assert_eq!(db.get_start_record("sbx_old").unwrap(), None);
+        let kept = |id| db.get_sandbox(id).unwrap().map(|s| (s.state, s.generation));
+        assert_eq!(kept("sbx_young"), Some((state::COLD.to_owned(), 0)));
+        assert_eq!(kept("sbx_told"), Some((state::COLD.to_owned(), 1)));
+        assert_eq!(admit(&db, "sbx_new", now), Ok(()));
+        assert_eq!(sweep_unstarted(&db, now).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_first_start_needs_a_build_of_the_current_spec_and_a_new_enough_host() {
+        let host = |first_starts, spec: &str| Capacity {
+            first_starts,
+            templates: vec![ReadyTemplate {
+                key: BASE_TEMPLATE.into(),
+                spec_sha256: spec.into(),
+                vcpus: 1,
+                memory_mib: 512,
+            }],
+            ..Capacity::default()
+        };
+        assert!(takes_first_start(&host(true, "s1"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(true, "s0"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(false, "s1"), BASE_TEMPLATE, "s1"));
+        assert!(!takes_first_start(&host(true, "s1"), "py", "s1"));
+    }
+
+    #[test]
+    fn hosts_from_before_first_starts_do_not_take_them() {
+        let old: Capacity = serde_json::from_value(json!({
+            "free_slots": 4,
+            "memory_available_mib": 4096,
+            "templates": [],
+            "warm": [],
+        }))
+        .unwrap();
+        assert!(!old.first_starts);
+    }
 
     #[test]
     fn only_refusals_before_the_start_release_a_claim() {

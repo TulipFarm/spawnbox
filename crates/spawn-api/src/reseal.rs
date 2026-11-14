@@ -155,6 +155,7 @@ pub(crate) mod tests {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         }
     }
 
@@ -392,13 +393,14 @@ pub(crate) mod tests {
              ALTER TABLE nodes DROP COLUMN fenced_at;
              ALTER TABLE nodes DROP COLUMN fenced_by;
              ALTER TABLE builds DROP COLUMN guest;
-             ALTER TABLE builds DROP COLUMN root;",
+             ALTER TABLE builds DROP COLUMN root;
+             ALTER TABLE sandboxes DROP COLUMN first_start;",
         )
         .unwrap();
         let version: i64 = old
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        old.pragma_update(None, "user_version", version - 4)
+        old.pragma_update(None, "user_version", version - 5)
             .unwrap();
         let json = serde_json::json!({
             "env": { "TOKEN": "sandbox-secret-env" }, "ports": {}, "secrets": [],

@@ -374,8 +374,18 @@ lost. A cold sandbox has no VM.
 - **Generations.** Calls in progress and lifecycle updates carry the
   generation they started with. An update from an older generation does
   nothing.
-- **Placement.** Creates place persistent sandboxes on the primary.
-  Moving one gives `409 conflict`; a drain makes it cold instead (see
+- **Placement.** The primary admits a persistent sandbox: it writes the
+  row `cold`, with its start record, under the quota. Then the first
+  start runs on the primary, or, with `--persistent-placement any`, by
+  the cold start path on a worker that ranks above it and has a build of
+  the current spec; the worker must report `first_starts`. That start is
+  not counted as a cold start and emits `sandbox.created`. A refusal or
+  an unreachable worker before the start tries the next worker; when none
+  is left the row is deleted and the primary runs it. An unknown outcome
+  keeps the row and gives `503`. The start runs to the end when the
+  client disconnects. The primary deletes an admitted row that no claim
+  has taken 150 s after the create, at startup and every 5 s, to free the
+  quota of a start cut off by a primary that stopped. Moving one gives `409 conflict`; a drain makes it cold instead (see
   [More than one host](#more-than-one-host)). In a fleet, a cold start
   can run on any worker; see [Lost hosts and fencing](#lost-hosts-and-fencing).
   So a persistent sandbox changes host, including to a host with another

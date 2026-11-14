@@ -399,6 +399,7 @@ impl Sandboxes {
             generation: 1,
             cold_starts: 0,
             last_cold_start_at: None,
+            first_start: false,
         };
         if !matches!(self.db.insert_sandbox(&sandbox), Ok(Ok(()))) {
             eprintln!("fork {}: could not record copy {id}", row.id);
