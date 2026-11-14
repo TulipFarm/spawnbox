@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use spawn_egress::{Activity, Ca, Egress, Policy, SecretStore};
-use spawn_node::firecracker::{CpuPins, Host, IoEngine};
+use spawn_node::firecracker::{CpuPins, Host, HugePages, IoEngine};
 use spawn_node::gvisor::Runsc;
 use spawn_node::net::{self, HostNet};
 use spawn_node::{Backend, Node, absolute};
@@ -347,6 +347,13 @@ pub struct Args {
     /// their engine.
     #[arg(long, value_enum, default_value_t = DiskIoEngineArg::Sync)]
     disk_io_engine: DiskIoEngineArg,
+    /// Backs Firecracker sandboxes' memory with 2 MiB pages from the
+    /// host's hugetlbfs pool (`vm.nr_hugepages`), which makes memory heavy
+    /// work faster. Each sandbox takes its whole memory size from the pool
+    /// when it starts; once the pool is full, sandboxes use normal pages.
+    /// Pausing such a sandbox saves all its memory, not only the changes.
+    #[arg(long)]
+    huge_pages: bool,
     /// Percent of host memory that warm VMs may use: VMs restored ahead of
     /// time so creates are faster. 0 turns warm pools off.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=50))]
@@ -632,6 +639,7 @@ pub async fn serve(args: Args) -> Result<()> {
             DiskIoEngineArg::Sync => IoEngine::Sync,
             DiskIoEngineArg::Async => IoEngine::Async,
         },
+        huge_pages: None,
     };
     let (runsc, inputs) = match backend {
         Backend::Firecracker => {
@@ -645,6 +653,14 @@ pub async fn serve(args: Args) -> Result<()> {
             if pin {
                 host.pins = Some(Arc::new(CpuPins::new()?));
                 eprintln!("each vCPU stays on one host CPU");
+            }
+            if args.huge_pages {
+                let mib = HugePages::total_mib();
+                if mib == 0 {
+                    bail!("--huge-pages needs 2 MiB pages set aside: set vm.nr_hugepages");
+                }
+                host.huge_pages = Some(Arc::default());
+                eprintln!("sandbox memory uses 2 MiB pages from a {mib} MiB pool");
             }
             let inputs = Inputs {
                 kernel: need(&args.kernel, "kernel")?,

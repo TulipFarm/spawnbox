@@ -77,6 +77,7 @@ pub async fn run(args: Args) -> Result<()> {
         ksm: false,
         pins: None,
         io_engine: IoEngine::Sync,
+        huge_pages: None,
     };
     net::remove_stale_namespaces().await?;
     host.remove_all().await;

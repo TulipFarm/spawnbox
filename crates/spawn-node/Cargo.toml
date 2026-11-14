@@ -18,7 +18,7 @@ bytes = "1.12.1"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
-nix = { version = "0.31.3", features = ["ioctl", "poll", "sched", "signal", "socket", "uio"] }
+nix = { version = "0.31.3", features = ["fs", "ioctl", "poll", "sched", "signal", "socket", "uio"] }
 serde_json = "1.0.154"
 spawn-proto = { path = "../spawn-proto" }
 tokio = { version = "1.54.1", features = ["process", "net", "io-util", "fs", "time", "sync"] }

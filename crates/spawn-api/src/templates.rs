@@ -2316,6 +2316,7 @@ mod tests {
                 ksm: false,
                 pins: None,
                 io_engine: IoEngine::Sync,
+                huge_pages: None,
             },
             runsc: None,
             dns: std::net::Ipv4Addr::LOCALHOST,

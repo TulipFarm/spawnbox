@@ -50,6 +50,75 @@ pub struct Host {
     /// How Firecracker does disk IO for drives it boots with. Snapshots
     /// keep the engine of the VM they were taken from.
     pub io_engine: IoEngine,
+    /// Backs restored VMs' memory with 2 MiB pages from the host's
+    /// hugetlbfs pool, while it has room.
+    pub huge_pages: Option<Arc<HugePages>>,
+}
+
+/// The host's pool of 2 MiB pages (`vm.nr_hugepages`), shared by the VMs
+/// restored with it. A guest maps every 2 MiB of memory with one entry
+/// instead of 512, so programs that touch a lot of memory (compilers,
+/// garbage collectors) wait less on address translation. The pool is
+/// memory set aside for this alone. Firecracker takes pages only when the
+/// guest first touches them, and a VM is killed if the pool is empty
+/// then, so VMs get their whole size up front: one that does not fit uses
+/// normal pages instead.
+#[derive(Default)]
+pub struct HugePages {
+    used_mib: Mutex<u64>,
+}
+
+impl HugePages {
+    const MEMINFO: &'static str = "/proc/meminfo";
+
+    /// The pool's size in MiB. 0 if it is empty or its pages are not
+    /// 2 MiB.
+    pub fn total_mib() -> u64 {
+        std::fs::read_to_string(Self::MEMINFO)
+            .ok()
+            .and_then(|info| pool_mib(&info))
+            .unwrap_or(0)
+    }
+
+    /// Sets aside `mib` for one VM until the lease is dropped. `None` if
+    /// the pool does not have room.
+    pub fn lease(self: &Arc<Self>, mib: u64) -> Option<HugeLease> {
+        let total = Self::total_mib();
+        let mut used = self.used_mib.lock().unwrap_or_else(|e| e.into_inner());
+        if *used + mib > total {
+            return None;
+        }
+        *used += mib;
+        Some(HugeLease {
+            pool: Arc::clone(self),
+            mib,
+        })
+    }
+}
+
+/// The MiB in the hugetlbfs pool, if its pages are 2 MiB.
+fn pool_mib(meminfo: &str) -> Option<u64> {
+    let value = |name: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    (value("Hugepagesize:")? == 2048).then_some(value("HugePages_Total:")? * 2)
+}
+
+/// 2 MiB pages set aside for one VM.
+pub struct HugeLease {
+    pool: Arc<HugePages>,
+    mib: u64,
+}
+
+impl Drop for HugeLease {
+    fn drop(&mut self) {
+        let mut used = self.pool.used_mib.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.mib);
+    }
 }
 
 /// Firecracker's block device IO engine.
@@ -402,6 +471,7 @@ pub struct Vm {
     pager: Option<Box<Pager>>,
     dirty: AtomicBool,
     lease: Option<Box<CpuLease>>,
+    huge: Option<HugeLease>,
 }
 
 #[derive(Default)]
@@ -509,6 +579,7 @@ impl Vm {
             pager: None,
             dirty: AtomicBool::new(false),
             lease,
+            huge: None,
         };
         vm.wait_for_api().await?;
         Ok(vm)
@@ -609,6 +680,11 @@ impl Vm {
     /// Serves the VM's memory with `pager` until the VM stops.
     pub fn set_pager(&mut self, pager: Pager) {
         self.pager = Some(Box::new(pager));
+    }
+
+    /// Keeps `lease` until the VM is dropped.
+    pub fn set_huge_pages(&mut self, lease: HugeLease) {
+        self.huge = Some(lease);
     }
 
     pub fn pager(&self) -> Option<&Pager> {
@@ -767,6 +843,18 @@ mod tests {
             ),
             all: nix::sched::CpuSet::new(),
         })
+    }
+
+    #[test]
+    fn huge_page_pool_counts_only_2_mib_pages() {
+        let info = |total, size| {
+            format!(
+                "MemTotal: 1 kB\nHugePages_Total:    {total}\nHugePages_Free: 0\nHugepagesize:  {size} kB\n"
+            )
+        };
+        assert_eq!(super::pool_mib(&info(512, 2048)), Some(1024));
+        assert_eq!(super::pool_mib(&info(0, 2048)), Some(0));
+        assert_eq!(super::pool_mib(&info(4, 1_048_576)), None);
     }
 
     #[test]
