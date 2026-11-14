@@ -25,6 +25,8 @@ mod warm;
 #[cfg(target_os = "linux")]
 mod egress;
 #[cfg(target_os = "linux")]
+mod endpoints;
+#[cfg(target_os = "linux")]
 mod fleet;
 #[cfg(target_os = "linux")]
 mod gateway;

@@ -278,6 +278,10 @@ pub struct Args {
     /// seconds.
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=86_400))]
     forward_max_response_s: u64,
+    /// After an endpoint switch, how long the old target keeps taking
+    /// requests before its drain starts, so every host has read the switch.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(0..=60))]
+    endpoint_propagation_s: u64,
     /// Preview URL of a port; `{label}` becomes `<port>-<sandbox>`. With an
     /// https:// URL, token cookies are marked Secure.
     #[arg(long, default_value = "http://{label}.localhost:8081", value_parser = parse_preview_url)]
@@ -488,6 +492,8 @@ pub struct App {
     /// Signs and checks browser session tokens.
     pub sessions: crate::session::Sessions,
     pub gateway: crate::gateway::Gateway,
+    /// `--endpoint-propagation-s`
+    pub endpoint_propagation: Duration,
 }
 
 pub type AppState = Arc<App>;
@@ -933,6 +939,7 @@ async fn run(
             max_in_flight: args.forward_max_in_flight,
             max_response: Duration::from_secs(args.forward_max_response_s),
         }),
+        endpoint_propagation: Duration::from_secs(args.endpoint_propagation_s),
     });
     let paused = app
         .sandboxes
@@ -1353,6 +1360,17 @@ pub fn router(app: AppState) -> Router {
             "/v1/sandboxes/{id}/ports/{port}",
             axum::routing::delete(preview::unpublish),
         )
+        .route("/v1/sandboxes/{id}/ports/{port}/ready", get(port_ready))
+        .route(
+            "/v1/endpoints",
+            post(crate::endpoints::create).get(crate::endpoints::list),
+        )
+        .route(
+            "/v1/endpoints/{name}",
+            get(crate::endpoints::get_one)
+                .put(crate::endpoints::switch)
+                .delete(crate::endpoints::delete),
+        )
         .route("/v1/sandboxes/{id}/services", get(services::list))
         .route("/v1/sandboxes/{id}/services/{name}", post(services::action))
         .route(
@@ -1472,7 +1490,7 @@ async fn auth(State(app): State<AppState>, mut req: Request, next: Next) -> Resp
     if matches!(app.role, Role::Primary(_))
         && let Some(id) = tenancy::sandbox_in_path(req.uri().path())
         && ids::is_valid_id("sbx", id)
-        && wakes(req.method(), req.uri().path(), id)
+        && wakes(req.method(), req.uri(), id)
     {
         let id = id.to_owned();
         if let Err(error) = primary::wake_cold(&app, &id, false).await {
@@ -1499,7 +1517,7 @@ async fn replayable(id: &str, req: Request) -> Result<(Request, Option<Request>)
         None if headers.contains_key(header::TRANSFER_ENCODING) => None,
         None => Some(0),
     };
-    if !wakes(req.method(), req.uri().path(), id)
+    if !wakes(req.method(), req.uri(), id)
         || headers.contains_key(header::UPGRADE)
         || length.is_none_or(|n| n > REPLAY_BODY)
     {
@@ -1529,14 +1547,24 @@ async fn cold_reply(reply: Response) -> (Response, bool) {
 }
 
 /// Whether a call for sandbox `id` needs its VM, so starts it if cold.
-fn wakes(method: &axum::http::Method, path: &str, id: &str) -> bool {
-    let Some(rest) = path
+fn wakes(method: &axum::http::Method, uri: &axum::http::Uri, id: &str) -> bool {
+    let Some(rest) = uri
+        .path()
         .strip_prefix("/v1/sandboxes/")
         .and_then(|rest| rest.strip_prefix(id))
     else {
         return false;
     };
+    // A readiness call wakes only when it waits.
+    let waits = || {
+        uri.query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.starts_with("wait_s=") && pair != "wait_s=0")
+        })
+    };
     (method == axum::http::Method::POST && rest == ":resume")
+        || (rest.starts_with("/ports/") && rest.ends_with("/ready") && waits())
         || ["/exec", "/pty", "/files", "/git:clone", "/services"]
             .iter()
             .any(|under| rest.starts_with(under))
@@ -1712,13 +1740,13 @@ async fn session_token(
 }
 
 #[derive(Deserialize)]
-struct TenantQuery {
-    tenant: Option<String>,
+pub(crate) struct TenantQuery {
+    pub tenant: Option<String>,
 }
 
 /// The tenant a call works in (`None`: org-wide). Fails with 404 if it does
 /// not exist or the caller may not see it.
-fn namespace(
+pub(crate) fn namespace(
     app: &App,
     caller: &Caller,
     requested: Option<&str>,
@@ -1775,6 +1803,7 @@ fn view(sandbox: db::Sandbox, timings_ms: Option<Timings>) -> SandboxView {
         generation: sandbox.generation,
         cold_starts: sandbox.cold_starts,
         last_cold_start_at: sandbox.last_cold_start_at.map(rfc3339_ms),
+        drain: None,
         started_from: timings_ms.map(|t| if t.warm { "warm_pool" } else { "build" }),
         timings_ms,
     }
@@ -1880,7 +1909,32 @@ async fn get_one(
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SandboxView>, ApiError> {
-    Ok(Json(view(app.sandboxes.get(&id)?, None)))
+    let mut sandbox = view(app.sandboxes.get(&id)?, None);
+    sandbox.drain = app.gateway.drain_view(&id);
+    Ok(Json(sandbox))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadyQuery {
+    wait_s: Option<u64>,
+}
+
+/// `GET /v1/sandboxes/{id}/ports/{port}/ready`
+async fn port_ready(
+    State(app): State<AppState>,
+    Extension(origin): Extension<Origin>,
+    Path((id, port)): Path<(String, u16)>,
+    Query(query): Query<ReadyQuery>,
+) -> Result<Json<crate::gateway::Readiness>, ApiError> {
+    let wait_s = query.wait_s.unwrap_or(0);
+    if wait_s > 120 {
+        return Err(ApiError::invalid("wait_s must be 0 to 120"));
+    }
+    let wait = Duration::from_secs(wait_s);
+    crate::gateway::readiness(&app, &id, port, wait, &origin)
+        .await
+        .map(Json)
 }
 
 async fn delete(
@@ -1919,6 +1973,21 @@ async fn pause_or_resume(
     }
     let id = id.to_owned();
     match action {
+        "drain" => {
+            let req: crate::gateway::DrainRequest = parse(&body)?;
+            app.sandboxes.get(&id)?;
+            crate::gateway::drain(&app, &id, &req, &origin)?;
+            let mut sandbox = view(app.sandboxes.get(&id)?, None);
+            sandbox.drain = app.gateway.drain_view(&id);
+            return Ok((StatusCode::ACCEPTED, Json(sandbox)).into_response());
+        }
+        "undrain" => {
+            let sandbox = view(app.sandboxes.get(&id)?, None);
+            if !app.gateway.undrain(&id) {
+                return Err(ApiError::new(Code::Conflict, "the sandbox is not draining"));
+            }
+            return Ok(Json(sandbox).into_response());
+        }
         "snapshot" => {
             let req: SnapshotSandbox = parse(&body)?;
             let sandboxes = app.sandboxes.clone();
@@ -3072,6 +3141,7 @@ mod tests {
     #[test]
     fn only_calls_that_need_the_vm_wake_a_cold_sandbox() {
         let id = "sbx_0123456789abcdef";
+        let wakes = |method, path: &str, id| wakes(method, &path.parse().unwrap(), id);
         let post = axum::http::Method::POST;
         let get = axum::http::Method::GET;
         for (method, tail) in [
@@ -3081,6 +3151,7 @@ mod tests {
             (&get, "/files?path=/x"),
             (&post, "/git:clone"),
             (&get, "/services"),
+            (&get, "/ports/8000/ready?wait_s=30"),
         ] {
             assert!(
                 wakes(method, &format!("/v1/sandboxes/{id}{tail}"), id),
@@ -3092,6 +3163,12 @@ mod tests {
             (&get, format!("/v1/sandboxes/{id}:resume")),
             (&post, format!("/v1/sandboxes/{id}:pause")),
             (&get, format!("/v1/sandboxes/{id}/events")),
+            (&get, format!("/v1/sandboxes/{id}/ports/8000/ready")),
+            (
+                &get,
+                format!("/v1/sandboxes/{id}/ports/8000/ready?wait_s=0"),
+            ),
+            (&post, format!("/v1/sandboxes/{id}:drain")),
             (&post, "/v1/sandboxes/sbx_other/exec".to_owned()),
         ] {
             assert!(!wakes(method, &path, id), "{path}");

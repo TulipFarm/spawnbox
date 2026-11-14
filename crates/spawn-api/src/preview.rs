@@ -145,6 +145,12 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
             }
         }
     }
+    // Counted like forwarded requests, so a drain waits for previews too,
+    // and a draining sandbox does not wake.
+    let in_flight = match app.gateway.admit(&id) {
+        Ok(in_flight) => in_flight,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.message),
+    };
     // Only now, so that requests without access cannot wake a sandbox.
     // Preview visitors have no API key, so their wakes have no actor. On a
     // primary, a cold sandbox starts here: its volumes are gathered first.
@@ -172,9 +178,15 @@ async fn proxy(State(app): State<AppState>, mut req: Request) -> Response {
     }
     let proto = if https { "https" } else { "http" };
     scrub(&mut req, |token| app.sessions.signed(token));
-    forward(opened.channel, opened.busy, port, req, Some((&host, proto)))
-        .await
-        .unwrap_or_else(|error| plain(StatusCode::BAD_GATEWAY, &error.message))
+    forward(
+        opened.channel,
+        (opened.busy, in_flight),
+        port,
+        req,
+        Some((&host, proto)),
+    )
+    .await
+    .unwrap_or_else(|error| plain(StatusCode::BAD_GATEWAY, &error.message))
 }
 
 /// A private port takes an API key with `sandboxes:read`, or a browser
@@ -387,7 +399,7 @@ fn take_cookie(req: &mut Request, name: &str) -> Option<String> {
 }
 
 /// Opens a tunnel to `port` in the guest.
-async fn dial(
+pub(crate) async fn dial(
     channel: Channel,
     port: u16,
 ) -> Result<(mpsc::Sender<PortInput>, Streaming<PortOutput>), ApiError> {
