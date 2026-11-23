@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install Rust
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install Rust
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Install backup tools
         run: sudo apt-get update -q && sudo apt-get install -yq postgresql-client-16 gnupg sqlite3
       - name: Build
