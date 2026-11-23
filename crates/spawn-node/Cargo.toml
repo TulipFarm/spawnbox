@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Runs Spawnbox sandboxes in Firecracker microVMs, or gVisor without KVM, on one Linux host"
 publish = false
 
